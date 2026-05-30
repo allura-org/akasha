@@ -539,38 +539,6 @@ impl eframe::App for AkashaApp {
         self.poll_viewer_images(ctx);
         self.load_missing_thumbnails();
 
-        if self.viewer_open {
-            if let Some(idx) = self.viewer_index {
-                if let Some(media) = self.media_items.get(idx).cloned() {
-                    let resp = crate::ui::viewer::show(
-                        ctx,
-                        &media,
-                        &self.viewer_texture,
-                        self.viewer_zoom_to_fit,
-                    );
-                    if resp.close {
-                        self.close_viewer();
-                    }
-                    if resp.prev {
-                        self.navigate_viewer(-1);
-                    }
-                    if resp.next {
-                        self.navigate_viewer(1);
-                    }
-                    if resp.toggle_zoom {
-                        self.viewer_zoom_to_fit = !self.viewer_zoom_to_fit;
-                    }
-                } else {
-                    self.close_viewer();
-                }
-            } else {
-                self.close_viewer();
-            }
-
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            return;
-        }
-
         // Top bar
         egui::TopBottomPanel::top("top_bar")
             .frame(egui::Frame::new()
@@ -695,6 +663,36 @@ impl eframe::App for AkashaApp {
                 });
             }
         });
+
+        // Viewer overlay (drawn on top of browser)
+        if self.viewer_open {
+            if let Some(idx) = self.viewer_index {
+                if let Some(media) = self.media_items.get(idx).cloned() {
+                    let resp = crate::ui::viewer::show(
+                        ctx,
+                        &media,
+                        &self.viewer_texture,
+                        self.viewer_zoom_to_fit,
+                    );
+                    if resp.close {
+                        self.close_viewer();
+                    }
+                    if resp.prev {
+                        self.navigate_viewer(-1);
+                    }
+                    if resp.next {
+                        self.navigate_viewer(1);
+                    }
+                    if resp.toggle_zoom {
+                        self.viewer_zoom_to_fit = !self.viewer_zoom_to_fit;
+                    }
+                } else {
+                    self.close_viewer();
+                }
+            } else {
+                self.close_viewer();
+            }
+        }
 
         if self.settings_open {
             self.show_settings(ctx);
