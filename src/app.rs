@@ -1,11 +1,13 @@
 use eframe::egui;
 use sqlx::SqlitePool;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
 use crate::config::{Config, FolderConfig};
 use crate::db;
+use crate::thumbnailer::{CacheMode, Thumbnailer};
 
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
@@ -19,14 +21,19 @@ pub struct AkashaApp {
     pub config: Config,
     pub pool: Arc<Mutex<SqlitePool>>,
     pub rt: Arc<Runtime>,
+    pub thumbnailer: Thumbnailer,
 
     // UI state
     pub folders: Vec<db::folder::Folder>,
     pub selected_folder: Option<usize>,
     pub media_items: Vec<db::media::MediaFile>,
+    pub textures: HashMap<String, egui::TextureHandle>,
+    pub pending_thumbnails: HashSet<String>,
     pub scan_status: String,
     pub is_scanning: bool,
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
+    pub thumbnail_tx: std::sync::mpsc::Sender<(String, Result<Vec<u8>, String>)>,
+    pub thumbnail_rx: std::sync::mpsc::Receiver<(String, Result<Vec<u8>, String>)>,
 }
 
 impl AkashaApp {
@@ -42,11 +49,18 @@ impl AkashaApp {
             cc.egui_ctx.set_visuals(egui::Visuals::light());
         }
 
+        let cache_mode = CacheMode::from_config(
+            &config.thumbnails.cache_mode,
+            &config.thumbnails.custom_path,
+        );
+        let thumbnailer = Thumbnailer::new(config.ui.thumbnail_size, cache_mode);
+
         let pool_arc = Arc::new(Mutex::new(pool));
         let rt_arc = Arc::new(rt);
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
+        let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, Result<Vec<u8>, String>)>();
 
-        // Clone for background task
+        // Clone for background scan task
         let pool_clone = Arc::clone(&pool_arc);
         let rt_clone = Arc::clone(&rt_arc);
         let folders_config: Vec<FolderConfig> = config.folders.clone();
@@ -105,12 +119,17 @@ impl AkashaApp {
             config,
             pool: pool_arc,
             rt: rt_arc,
+            thumbnailer,
             folders: Vec::new(),
             selected_folder: None,
             media_items: Vec::new(),
+            textures: HashMap::new(),
+            pending_thumbnails: HashSet::new(),
             scan_status: "Initializing...".to_string(),
             is_scanning: true,
             scan_rx,
+            thumbnail_tx: thumb_tx,
+            thumbnail_rx,
         };
 
         app.refresh_folders_blocking();
@@ -137,7 +156,11 @@ impl AkashaApp {
                     let p = pool.lock().await;
                     db::media::list_by_folder(&*p, folder_id).await
                 }) {
-                    Ok(items) => self.media_items = items,
+                    Ok(items) => {
+                        self.media_items = items;
+                        // Clear pending for items no longer visible
+                        self.pending_thumbnails.clear();
+                    }
                     Err(e) => self.scan_status = format!("Failed to load media: {e}"),
                 }
             }
@@ -165,6 +188,61 @@ impl AkashaApp {
                     self.is_scanning = false;
                 }
             }
+        }
+    }
+
+    fn poll_thumbnail_events(&mut self, ctx: &egui::Context) {
+        while let Ok((hash, result)) = self.thumbnail_rx.try_recv() {
+            self.pending_thumbnails.remove(&hash);
+            match result {
+                Ok(bytes) => {
+                    if let Ok(image) = image::load_from_memory(&bytes) {
+                        let size = [image.width() as usize, image.height() as usize];
+                        let rgba = image.to_rgba8();
+                        let color_image =
+                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                        let texture = ctx.load_texture(
+                            &hash,
+                            color_image,
+                            egui::TextureOptions::default(),
+                        );
+                        self.textures.insert(hash, texture);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Thumbnail failed for {}: {}", hash, e);
+                }
+            }
+        }
+    }
+
+    fn load_missing_thumbnails(&mut self) {
+        for media in &self.media_items {
+            if self.textures.contains_key(&media.blake3_hash)
+                || self.pending_thumbnails.contains(&media.blake3_hash)
+            {
+                continue;
+            }
+
+            self.pending_thumbnails.insert(media.blake3_hash.clone());
+
+            let source = std::path::PathBuf::from(&media.absolute_path);
+            let hash = media.blake3_hash.clone();
+            let size = self.thumbnailer.size;
+            let cache_mode = self.thumbnailer.cache_mode.clone();
+            let tx = self.thumbnail_tx.clone();
+
+            self.rt.spawn_blocking(move || {
+                let thumbnailer = Thumbnailer::new(size, cache_mode);
+                match thumbnailer.load_thumbnail_bytes(&source, &hash, None) {
+                    Ok(bytes) => {
+                        let _ = tx.send((hash, Ok(bytes)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send((hash, Err(e.to_string())));
+                    }
+                }
+            });
         }
     }
 
@@ -236,6 +314,8 @@ impl AkashaApp {
 impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
+        self.poll_thumbnail_events(ctx);
+        self.load_missing_thumbnails();
 
         // Top bar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -299,9 +379,8 @@ impl eframe::App for AkashaApp {
                 ui.heading(format!("{} images", self.media_items.len()));
                 ui.separator();
 
-                // Simple grid of filenames (thumbnails come in Phase 3)
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let cols = (ui.available_width() / 200.0).max(1.0) as usize;
+                    let cols = (ui.available_width() / 220.0).max(1.0) as usize;
                     egui::Grid::new("media_grid")
                         .num_columns(cols)
                         .spacing([16.0, 16.0])
@@ -311,10 +390,23 @@ impl eframe::App for AkashaApp {
                                     ui.end_row();
                                 }
                                 ui.vertical(|ui| {
-                                    ui.label(format!("{}x{}",
-                                        media.width.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
-                                        media.height.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
-                                    ));
+                                    let thumb_size = egui::vec2(200.0, 200.0);
+                                    if let Some(texture) = self.textures.get(&media.blake3_hash) {
+                                        let mut size = thumb_size;
+                                        let tex_w = texture.size()[0] as f32;
+                                        let tex_h = texture.size()[1] as f32;
+                                        if tex_w > 0.0 && tex_h > 0.0 {
+                                            let aspect = tex_w / tex_h;
+                                            if aspect > 1.0 {
+                                                size.y = size.x / aspect;
+                                            } else {
+                                                size.x = size.y * aspect;
+                                            }
+                                        }
+                                        ui.image((texture.id(), size));
+                                    } else {
+                                        ui.add_sized(thumb_size, egui::Spinner::new());
+                                    }
                                     ui.label(
                                         std::path::Path::new(&media.relative_path)
                                             .file_name()

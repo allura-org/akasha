@@ -4,4 +4,5 @@ Cargo.lock
 *.db-wal
 *.db-shm
 .akasha_thumbs/
+test_imgs/
 .DS_Store
