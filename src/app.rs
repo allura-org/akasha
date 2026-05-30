@@ -55,6 +55,7 @@ pub struct AkashaApp {
     pub viewer_zoom_to_fit: bool,
     pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
     pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
+    pub viewer_just_opened: bool,
 
     // Polish
     pub toasts: Vec<Toast>,
@@ -158,6 +159,7 @@ impl AkashaApp {
             viewer_zoom_to_fit: true,
             viewer_image_tx: viewer_img_tx,
             viewer_image_rx: viewer_img_rx,
+            viewer_just_opened: false,
             toasts: Vec::new(),
             settings_open: false,
         };
@@ -280,6 +282,7 @@ impl AkashaApp {
 
     fn open_viewer(&mut self, index: usize) {
         self.viewer_open = true;
+        self.viewer_just_opened = true;
         self.viewer_index = Some(index);
         self.viewer_zoom_to_fit = true;
         self.viewer_texture = None;
@@ -674,7 +677,7 @@ impl eframe::App for AkashaApp {
                         &self.viewer_texture,
                         self.viewer_zoom_to_fit,
                     );
-                    if resp.close {
+                    if resp.close && !self.viewer_just_opened {
                         self.close_viewer();
                     }
                     if resp.prev {
@@ -692,6 +695,7 @@ impl eframe::App for AkashaApp {
             } else {
                 self.close_viewer();
             }
+            self.viewer_just_opened = false;
         }
 
         if self.settings_open {
