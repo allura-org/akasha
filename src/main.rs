@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod db;
 mod scanner;
+mod theme;
 mod thumbnailer;
 mod ui;
 

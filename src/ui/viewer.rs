@@ -1,6 +1,37 @@
 use eframe::egui;
 use crate::db::media::MediaFile;
 
+fn draw_checkerboard(painter: &egui::Painter, rect: egui::Rect) {
+    let square_size = 16.0;
+    let light = egui::Color32::from_rgb(210, 210, 210);
+    let dark = egui::Color32::from_rgb(180, 180, 180);
+
+    let start_x = (rect.min.x / square_size).floor() * square_size;
+    let start_y = (rect.min.y / square_size).floor() * square_size;
+    let end_x = rect.max.x;
+    let end_y = rect.max.y;
+
+    let mut y = start_y;
+    while y < end_y {
+        let mut x = start_x;
+        while x < end_x {
+            let row = (y / square_size) as i32;
+            let col = (x / square_size) as i32;
+            let color = if (row + col) % 2 == 0 { light } else { dark };
+            let square_rect = egui::Rect::from_min_size(
+                egui::pos2(x, y),
+                egui::vec2(square_size, square_size),
+            );
+            let clipped = rect.intersect(square_rect);
+            if clipped.is_positive() {
+                painter.rect_filled(clipped, 0.0, color);
+            }
+            x += square_size;
+        }
+        y += square_size;
+    }
+}
+
 pub struct ViewerResponse {
     pub close: bool,
     pub prev: bool,
@@ -35,7 +66,7 @@ pub fn show(
     });
 
     egui::CentralPanel::default()
-        .frame(egui::Frame::none().fill(egui::Color32::from_black_alpha(245)))
+        .frame(egui::Frame::new().fill(egui::Color32::from_black_alpha(245)))
         .show(ctx, |ui| {
             let full_rect = ui.max_rect();
 
@@ -105,7 +136,16 @@ pub fn show(
                             } else {
                                 egui::vec2(tex_w, tex_h)
                             };
-                            let img_resp = ui.add(
+
+                            // Center the image and draw checkerboard behind it
+                            let img_rect = ui
+                                .allocate_space(display_size)
+                                .1
+                                .translate(ui.min_rect().min.to_vec2());
+                            draw_checkerboard(ui.painter(), img_rect);
+
+                            let img_resp = ui.put(
+                                img_rect,
                                 egui::Image::new((texture.id(), display_size))
                                     .fit_to_exact_size(display_size),
                             );

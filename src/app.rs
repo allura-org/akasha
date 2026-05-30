@@ -17,6 +17,19 @@ pub enum ScanEvent {
     Error(String, String),
 }
 
+pub struct Toast {
+    pub message: String,
+    pub level: ToastLevel,
+    pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastLevel {
+    Info,
+    Warning,
+    Error,
+}
+
 pub struct AkashaApp {
     pub config: Config,
     pub pool: Arc<Mutex<SqlitePool>>,
@@ -42,6 +55,10 @@ pub struct AkashaApp {
     pub viewer_zoom_to_fit: bool,
     pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
     pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
+
+    // Polish
+    pub toasts: Vec<Toast>,
+    pub settings_open: bool,
 }
 
 impl AkashaApp {
@@ -51,11 +68,7 @@ impl AkashaApp {
         pool: SqlitePool,
         rt: Runtime,
     ) -> Self {
-        if config.ui.theme == "dark" {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        } else {
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
-        }
+        crate::theme::apply(&cc.egui_ctx, config.ui.theme == "dark");
 
         let cache_mode = CacheMode::from_config(
             &config.thumbnails.cache_mode,
@@ -145,6 +158,8 @@ impl AkashaApp {
             viewer_zoom_to_fit: true,
             viewer_image_tx: viewer_img_tx,
             viewer_image_rx: viewer_img_rx,
+            toasts: Vec::new(),
+            settings_open: false,
         };
 
         app.refresh_folders_blocking();
@@ -201,6 +216,7 @@ impl AkashaApp {
                 ScanEvent::Error(path, err) => {
                     self.scan_status = format!("Error scanning {path}: {err}");
                     self.is_scanning = false;
+                    self.push_toast(format!("Scan error in {path}: {err}"), ToastLevel::Error);
                 }
             }
         }
@@ -226,6 +242,7 @@ impl AkashaApp {
                 }
                 Err(e) => {
                     tracing::warn!("Thumbnail failed for {}: {}", hash, e);
+                    self.push_toast(format!("Thumbnail failed: {}", e), ToastLevel::Warning);
                 }
             }
         }
@@ -334,9 +351,120 @@ impl AkashaApp {
                 }
                 Err(e) => {
                     tracing::warn!("Viewer image failed for {}: {}", hash, e);
+                    self.push_toast(format!("Failed to load image: {}", e), ToastLevel::Error);
                 }
             }
         }
+    }
+
+    fn push_toast(&mut self, message: String, level: ToastLevel) {
+        self.toasts.push(Toast {
+            message,
+            level,
+            created_at: std::time::Instant::now(),
+        });
+    }
+
+    fn prune_toasts(&mut self) {
+        let now = std::time::Instant::now();
+        self.toasts.retain(|t| now.duration_since(t.created_at).as_secs() < 5);
+    }
+
+    fn show_toasts(&mut self, ctx: &egui::Context) {
+        self.prune_toasts();
+        if self.toasts.is_empty() {
+            return;
+        }
+
+        let screen = ctx.screen_rect();
+        let margin = 16.0;
+        let toast_width = 320.0;
+        let toast_height = 48.0;
+        let spacing = 8.0;
+
+        let mut y = screen.max.y - margin;
+
+        for toast in self.toasts.iter().rev() {
+            y -= toast_height;
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(screen.max.x - margin - toast_width, y),
+                egui::vec2(toast_width, toast_height - spacing),
+            );
+
+            let (bg, fg) = match toast.level {
+                ToastLevel::Info => (egui::Color32::from_rgb(40, 80, 120), egui::Color32::WHITE),
+                ToastLevel::Warning => (egui::Color32::from_rgb(140, 110, 40), egui::Color32::WHITE),
+                ToastLevel::Error => (egui::Color32::from_rgb(140, 50, 50), egui::Color32::WHITE),
+            };
+
+            egui::Area::new(egui::Id::new(("toast", toast.created_at)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.min)
+                .show(ctx, |ui| {
+                    let frame = egui::Frame::none()
+                        .fill(bg)
+                        .rounding(8.0)
+                        .inner_margin(12.0);
+                    frame.show(ui, |ui| {
+                        ui.set_min_size(rect.size());
+                        ui.colored_label(fg, &toast.message);
+                    });
+                });
+
+            y -= spacing;
+        }
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                ui.heading("Appearance");
+                ui.separator();
+
+                let mut dark = self.config.ui.theme == "dark";
+                if ui.checkbox(&mut dark, "Dark theme").changed() {
+                    self.config.ui.theme = if dark { "dark".to_string() } else { "light".to_string() };
+                    crate::theme::apply(ctx, dark);
+                    if let Err(e) = self.config.save() {
+                        self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
+                    }
+                }
+
+                ui.add_space(16.0);
+                ui.heading("Thumbnails");
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Size:");
+                    let mut size = self.config.ui.thumbnail_size as f32;
+                    if ui.add(egui::Slider::new(&mut size, 64.0..=512.0).step_by(16.0)).changed() {
+                        self.config.ui.thumbnail_size = size as u32;
+                        self.thumbnailer.size = size as u32;
+                        self.textures.clear();
+                        self.pending_thumbnails.clear();
+                        if let Err(e) = self.config.save() {
+                            self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
+                        }
+                    }
+                });
+
+                ui.add_space(16.0);
+                ui.heading("Folders");
+                ui.separator();
+                ui.label("Edit ~/.config/akasha/config.toml to add or remove folders.");
+                ui.label("Changes require a restart to take full effect.");
+
+                ui.add_space(8.0);
+                for folder in &self.config.folders {
+                    ui.label(format!("• {}", folder.path));
+                }
+            });
+        self.settings_open = open;
     }
 
     fn trigger_rescan(&mut self) {
@@ -444,10 +572,15 @@ impl eframe::App for AkashaApp {
         }
 
         // Top bar
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top_bar")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::same(12)))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Akasha");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙ Settings").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
                     if ui.button("⟳ Rescan").clicked() && !self.is_scanning {
                         self.trigger_rescan();
                     }
@@ -460,6 +593,7 @@ impl eframe::App for AkashaApp {
         egui::SidePanel::left("folders")
             .resizable(true)
             .default_width(250.0)
+            .frame(egui::Frame::new().inner_margin(egui::Margin::same(12)))
             .show(ctx, |ui| {
                 ui.heading("Folders");
                 ui.separator();
@@ -557,6 +691,11 @@ impl eframe::App for AkashaApp {
                 });
             }
         });
+
+        if self.settings_open {
+            self.show_settings(ctx);
+        }
+        self.show_toasts(ctx);
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
