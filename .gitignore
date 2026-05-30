@@ -1,0 +1,7 @@
+/target
+Cargo.lock
+*.db
+*.db-wal
+*.db-shm
+.akasha_thumbs/
+.DS_Store

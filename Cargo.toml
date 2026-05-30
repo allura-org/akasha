@@ -1,0 +1,54 @@
+[package]
+name = "akasha"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# UI
+eframe = { version = "0.31", features = ["default"] }
+egui_extras = { version = "0.31", features = ["image"] }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+# Database
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono", "json"] }
+
+# Config & serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# egui is re-exported by eframe, but we use it directly in some modules
+egui = "0.31"
+
+# Image processing
+image = { version = "0.25", default-features = false, features = [
+    "png", "jpeg", "webp", "gif", "bmp", "tiff"
+] }
+
+# File hashing
+blake3 = "1.5"
+
+# Directory traversal
+walkdir = "2"
+
+# Blacklist glob patterns
+globset = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+
+# XDG directories
+directories = "6"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# File system watching (Phase 2)
+notify = "8"
+notify-debouncer-full = "0.5"
