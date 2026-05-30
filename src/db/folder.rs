@@ -40,6 +40,23 @@ pub async fn insert(
     Ok(id)
 }
 
+pub async fn insert_or_get(
+    pool: &SqlitePool,
+    path: &str,
+    recursive: bool,
+    blacklist: &[String],
+    cache_mode: Option<&str>,
+) -> anyhow::Result<i64> {
+    if let Some(row) = sqlx::query_as::<_, (i64,)>("SELECT id FROM folders WHERE path = ?1")
+        .bind(path)
+        .fetch_optional(pool)
+        .await?
+    {
+        return Ok(row.0);
+    }
+    insert(pool, path, recursive, blacklist, cache_mode).await
+}
+
 #[derive(sqlx::FromRow)]
 struct FolderRow {
     id: i64,
