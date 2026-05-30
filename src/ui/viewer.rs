@@ -38,25 +38,33 @@ pub fn show(
     let top_height = 40.0;
     let bottom_height = 48.0;
 
-    let mut consumed_click = false;
+    let top_rect = egui::Rect::from_min_size(
+        screen.min,
+        egui::vec2(screen.width(), top_height),
+    );
+    let bottom_rect = egui::Rect::from_min_size(
+        egui::pos2(screen.min.x, screen.max.y - bottom_height),
+        egui::vec2(screen.width(), bottom_height),
+    );
+    let content_rect = egui::Rect::from_min_max(
+        egui::pos2(screen.min.x, screen.min.y + top_height),
+        egui::pos2(screen.max.x, screen.max.y - bottom_height),
+    );
+    let mut img_rect: Option<egui::Rect> = None;
 
     egui::Area::new(egui::Id::new("viewer_overlay"))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
+            // Translucent backdrop
+            ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+
             // Top bar
-            let top_rect = egui::Rect::from_min_size(
-                screen.min,
-                egui::vec2(screen.width(), top_height),
-            );
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(top_rect), |ui| {
                 ui.horizontal(|ui| {
                     ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
-                    let close = ui.button("✕  Close");
-                    if close.clicked() {
+                    if ui.button("✕  Close").clicked() {
                         resp.close = true;
                     }
-                    consumed_click |= close.clicked();
-
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
                             "{}  •  {}x{}  •  {}",
@@ -70,43 +78,26 @@ pub fn show(
             });
 
             // Bottom bar
-            let bottom_rect = egui::Rect::from_min_size(
-                egui::pos2(screen.min.x, screen.max.y - bottom_height),
-                egui::vec2(screen.width(), bottom_height),
-            );
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
                 ui.horizontal_centered(|ui| {
-                    let prev = ui.button("← Previous");
-                    if prev.clicked() {
+                    if ui.button("← Previous").clicked() {
                         resp.prev = true;
                     }
-                    consumed_click |= prev.clicked();
-
-                    let zoom = ui.button(if zoom_to_fit { "🔍 1:1" } else { "🔍 Fit" });
-                    if zoom.clicked() {
+                    if ui.button(if zoom_to_fit { "🔍 1:1" } else { "🔍 Fit" }).clicked() {
                         resp.toggle_zoom = true;
                     }
-                    consumed_click |= zoom.clicked();
-
-                    let next = ui.button("Next →");
-                    if next.clicked() {
+                    if ui.button("Next →").clicked() {
                         resp.next = true;
                     }
-                    consumed_click |= next.clicked();
                 });
             });
 
-            // Image area
-            let image_rect = egui::Rect::from_min_max(
-                egui::pos2(screen.min.x, screen.min.y + top_height),
-                egui::pos2(screen.max.x, screen.max.y - bottom_height),
-            );
-
+            // Image
             if let Some(texture) = texture {
                 let tex_w = texture.size()[0] as f32;
                 let tex_h = texture.size()[1] as f32;
                 if tex_w > 0.0 && tex_h > 0.0 {
-                    let avail = image_rect.size();
+                    let avail = content_rect.size();
                     let display_size = if zoom_to_fit {
                         let scale = (avail.x / tex_w).min(avail.y / tex_h);
                         egui::vec2(tex_w * scale, tex_h * scale)
@@ -114,20 +105,20 @@ pub fn show(
                         egui::vec2(tex_w, tex_h)
                     };
 
-                    let img_rect = egui::Rect::from_center_size(image_rect.center(), display_size);
+                    let img_r = egui::Rect::from_center_size(content_rect.center(), display_size);
+                    img_rect = Some(img_r);
                     let img_resp = ui.put(
-                        img_rect,
+                        img_r,
                         egui::Image::new((texture.id(), display_size))
                             .sense(egui::Sense::click()),
                     );
                     if img_resp.double_clicked() {
                         resp.toggle_zoom = true;
                     }
-                    consumed_click |= img_resp.clicked() || img_resp.double_clicked();
                 }
             } else {
                 let spinner_rect = egui::Rect::from_center_size(
-                    image_rect.center(),
+                    content_rect.center(),
                     egui::vec2(100.0, 100.0),
                 );
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(spinner_rect), |ui| {
@@ -139,9 +130,19 @@ pub fn show(
             }
         });
 
-    // Close viewer when clicking on empty space (not on any widget)
-    if !consumed_click && ctx.input(|i| i.pointer.primary_clicked()) {
-        resp.close = true;
+    // Close viewer when clicking on empty space (not on image, top bar, or bottom bar)
+    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+        if ctx.input(|i| i.pointer.primary_clicked()) {
+            let on_image = img_rect.map_or_else(
+                || content_rect.contains(pos),
+                |r| r.contains(pos),
+            );
+            let on_top = top_rect.contains(pos);
+            let on_bottom = bottom_rect.contains(pos);
+            if !on_image && !on_top && !on_bottom {
+                resp.close = true;
+            }
+        }
     }
 
     resp
