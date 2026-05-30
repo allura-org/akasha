@@ -573,7 +573,9 @@ impl eframe::App for AkashaApp {
 
         // Top bar
         egui::TopBottomPanel::top("top_bar")
-            .frame(egui::Frame::new().inner_margin(egui::Margin::same(12)))
+            .frame(egui::Frame::new()
+                .fill(ctx.style().visuals.panel_fill)
+                .inner_margin(egui::Margin::same(12)))
             .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Akasha");
@@ -593,7 +595,9 @@ impl eframe::App for AkashaApp {
         egui::SidePanel::left("folders")
             .resizable(true)
             .default_width(250.0)
-            .frame(egui::Frame::new().inner_margin(egui::Margin::same(12)))
+            .frame(egui::Frame::new()
+                .fill(ctx.style().visuals.panel_fill)
+                .inner_margin(egui::Margin::same(12)))
             .show(ctx, |ui| {
                 ui.heading("Folders");
                 ui.separator();
