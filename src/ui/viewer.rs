@@ -35,7 +35,7 @@ pub fn show(
     });
 
     let screen = ctx.screen_rect();
-    let bottom_height = 64.0;
+    let bottom_height = 80.0;
 
     let bottom_rect = egui::Rect::from_min_size(
         egui::pos2(screen.min.x, screen.max.y - bottom_height),
@@ -97,27 +97,52 @@ pub fn show(
                     });
                 }
 
-                // Bottom bar: Close (left) | Prev/Zoom/Next (center) | Info (right)
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bottom_rect), |ui| {
-                    ui.horizontal(|ui| {
+                // Bottom bar split into three sections
+                let left_w = bottom_rect.width() * 0.15;
+                let center_w = bottom_rect.width() * 0.30;
+                let right_w = bottom_rect.width() * 0.55;
+
+                // Left: Close
+                let left_rect = egui::Rect::from_min_size(
+                    bottom_rect.min,
+                    egui::vec2(left_w, bottom_rect.height()),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::BOTTOM), |ui| {
                         if ui.button("Close").clicked() {
                             resp.close = true;
                         }
+                    });
+                });
 
-                        ui.add_space(ui.available_width() * 0.25);
+                // Center: Prev / Fit / Next
+                let center_rect = egui::Rect::from_min_size(
+                    egui::pos2(bottom_rect.min.x + left_w, bottom_rect.min.y),
+                    egui::vec2(center_w, bottom_rect.height()),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(center_rect), |ui| {
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                        ui.horizontal_centered(|ui| {
+                            if ui.button("< Previous").clicked() {
+                                resp.prev = true;
+                            }
+                            if ui.button(if zoom_to_fit { "1:1" } else { "Fit" }).clicked() {
+                                resp.toggle_zoom = true;
+                            }
+                            if ui.button("Next >").clicked() {
+                                resp.next = true;
+                            }
+                        });
+                    });
+                });
 
-                        if ui.button("< Previous").clicked() {
-                            resp.prev = true;
-                        }
-                        if ui.button(if zoom_to_fit { "1:1" } else { "Fit" }).clicked() {
-                            resp.toggle_zoom = true;
-                        }
-                        if ui.button("Next >").clicked() {
-                            resp.next = true;
-                        }
-
-                        ui.add_space(ui.available_width());
-
+                // Right: info
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(bottom_rect.min.x + left_w + center_w, bottom_rect.min.y),
+                    egui::vec2(right_w, bottom_rect.height()),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
                         ui.label(format!(
                             "{}  \u{2022}  {}x{}  \u{2022}  {}",
                             media.format.as_deref().unwrap_or("unknown"),
