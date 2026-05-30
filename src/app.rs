@@ -34,6 +34,14 @@ pub struct AkashaApp {
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
     pub thumbnail_tx: std::sync::mpsc::Sender<(String, Result<Vec<u8>, String>)>,
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, Result<Vec<u8>, String>)>,
+
+    // Viewer state
+    pub viewer_open: bool,
+    pub viewer_index: Option<usize>,
+    pub viewer_texture: Option<egui::TextureHandle>,
+    pub viewer_zoom_to_fit: bool,
+    pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
+    pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
 }
 
 impl AkashaApp {
@@ -59,6 +67,7 @@ impl AkashaApp {
         let rt_arc = Arc::new(rt);
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, Result<Vec<u8>, String>)>();
+        let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
 
         // Clone for background scan task
         let pool_clone = Arc::clone(&pool_arc);
@@ -130,6 +139,12 @@ impl AkashaApp {
             scan_rx,
             thumbnail_tx: thumb_tx,
             thumbnail_rx,
+            viewer_open: false,
+            viewer_index: None,
+            viewer_texture: None,
+            viewer_zoom_to_fit: true,
+            viewer_image_tx: viewer_img_tx,
+            viewer_image_rx: viewer_img_rx,
         };
 
         app.refresh_folders_blocking();
@@ -246,6 +261,84 @@ impl AkashaApp {
         }
     }
 
+    fn open_viewer(&mut self, index: usize) {
+        self.viewer_open = true;
+        self.viewer_index = Some(index);
+        self.viewer_zoom_to_fit = true;
+        self.viewer_texture = None;
+        self.load_viewer_image();
+    }
+
+    fn close_viewer(&mut self) {
+        self.viewer_open = false;
+        self.viewer_index = None;
+        self.viewer_texture = None;
+    }
+
+    fn navigate_viewer(&mut self, delta: isize) {
+        if let Some(idx) = self.viewer_index {
+            let len = self.media_items.len();
+            if len == 0 {
+                self.close_viewer();
+                return;
+            }
+            let new_idx = if delta > 0 {
+                (idx + delta as usize) % len
+            } else {
+                let d = (-delta) as usize;
+                (idx + len - (d % len)) % len
+            };
+            self.viewer_index = Some(new_idx);
+            self.viewer_texture = None;
+            self.load_viewer_image();
+        }
+    }
+
+    fn load_viewer_image(&mut self) {
+        if let Some(idx) = self.viewer_index {
+            if let Some(media) = self.media_items.get(idx) {
+                let source = std::path::PathBuf::from(&media.absolute_path);
+                let hash = media.blake3_hash.clone();
+                let tx = self.viewer_image_tx.clone();
+
+                self.rt.spawn_blocking(move || {
+                    match image::open(&source) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let size = [rgba.width() as usize, rgba.height() as usize];
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                size,
+                                rgba.as_raw(),
+                            );
+                            let _ = tx.send((hash, Ok(color_image)));
+                        }
+                        Err(e) => {
+                            let _ = tx.send((hash, Err(e.to_string())));
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn poll_viewer_images(&mut self, ctx: &egui::Context) {
+        while let Ok((hash, result)) = self.viewer_image_rx.try_recv() {
+            match result {
+                Ok(color_image) => {
+                    let texture = ctx.load_texture(
+                        &format!("viewer-{}", hash),
+                        color_image,
+                        egui::TextureOptions::default(),
+                    );
+                    self.viewer_texture = Some(texture);
+                }
+                Err(e) => {
+                    tracing::warn!("Viewer image failed for {}: {}", hash, e);
+                }
+            }
+        }
+    }
+
     fn trigger_rescan(&mut self) {
         if self.is_scanning {
             return;
@@ -315,7 +408,40 @@ impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
         self.poll_thumbnail_events(ctx);
+        self.poll_viewer_images(ctx);
         self.load_missing_thumbnails();
+
+        if self.viewer_open {
+            if let Some(idx) = self.viewer_index {
+                if let Some(media) = self.media_items.get(idx).cloned() {
+                    let resp = crate::ui::viewer::show(
+                        ctx,
+                        &media,
+                        &self.viewer_texture,
+                        self.viewer_zoom_to_fit,
+                    );
+                    if resp.close {
+                        self.close_viewer();
+                    }
+                    if resp.prev {
+                        self.navigate_viewer(-1);
+                    }
+                    if resp.next {
+                        self.navigate_viewer(1);
+                    }
+                    if resp.toggle_zoom {
+                        self.viewer_zoom_to_fit = !self.viewer_zoom_to_fit;
+                    }
+                } else {
+                    self.close_viewer();
+                }
+            } else {
+                self.close_viewer();
+            }
+
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
 
         // Top bar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -385,13 +511,14 @@ impl eframe::App for AkashaApp {
                         .num_columns(cols)
                         .spacing([16.0, 16.0])
                         .show(ui, |ui| {
+                            let mut clicked_index = None;
                             for (i, media) in self.media_items.iter().enumerate() {
                                 if i > 0 && i % cols == 0 {
                                     ui.end_row();
                                 }
-                                ui.vertical(|ui| {
+                                let clicked = ui.vertical(|ui| {
                                     let thumb_size = egui::vec2(200.0, 200.0);
-                                    if let Some(texture) = self.textures.get(&media.blake3_hash) {
+                                    let response = if let Some(texture) = self.textures.get(&media.blake3_hash) {
                                         let mut size = thumb_size;
                                         let tex_w = texture.size()[0] as f32;
                                         let tex_h = texture.size()[1] as f32;
@@ -403,17 +530,28 @@ impl eframe::App for AkashaApp {
                                                 size.x = size.y * aspect;
                                             }
                                         }
-                                        ui.image((texture.id(), size));
+                                        ui.add(
+                                            egui::Image::new((texture.id(), size))
+                                                .fit_to_exact_size(size)
+                                                .sense(egui::Sense::click()),
+                                        )
                                     } else {
-                                        ui.add_sized(thumb_size, egui::Spinner::new());
-                                    }
+                                        ui.add_sized(thumb_size, egui::Spinner::new())
+                                    };
                                     ui.label(
                                         std::path::Path::new(&media.relative_path)
                                             .file_name()
                                             .and_then(|n| n.to_str())
                                             .unwrap_or(&media.relative_path),
                                     );
-                                });
+                                    response.clicked()
+                                }).inner;
+                                if clicked {
+                                    clicked_index = Some(i);
+                                }
+                            }
+                            if let Some(i) = clicked_index {
+                                self.open_viewer(i);
                             }
                         });
                 });
