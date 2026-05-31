@@ -97,63 +97,85 @@ impl AkashaApp {
         let (media_tx, media_rx) = std::sync::mpsc::channel::<Result<Vec<db::media::MediaFile>, String>>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
 
-        // Clone for background scan task
+        // On startup: scan any configured folders that are new or incomplete
         let pool_clone = Arc::clone(&pool_arc);
-        let rt_clone = Arc::clone(&rt_arc);
         let folders_config: Vec<FolderConfig> = config.folders.clone();
 
-        rt_clone.spawn(async move {
+        let incomplete_folders: Vec<FolderConfig> = rt_arc.block_on(async {
+            let mut incomplete = Vec::new();
             for folder_cfg in &folders_config {
-                let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
-
-                let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
-                match db::folder::get_or_create(
-                    &pool_clone,
-                    None,
-                    &folder_cfg.path,
-                    folder_cfg.recursive,
-                    folder_cfg.show_recursive,
-                    &folder_cfg.blacklist,
-                    cache_mode,
-                )
-                .await
-                {
-                    Ok(folder_id) => {
-                        let path = std::path::Path::new(&folder_cfg.path);
-                        match crate::scanner::scan_folder(
-                            &pool_clone,
-                            folder_id,
-                            path,
-                            folder_cfg.recursive,
-                            folder_cfg.show_recursive,
-                            &folder_cfg.blacklist,
-                            Some(&scan_tx),
-                        )
-                        .await
-                        {
-                            Ok(count) => {
-                                let _ = scan_tx.send(ScanEvent::Complete(
-                                    folder_cfg.path.clone(),
-                                    count,
-                                ));
-                            }
-                            Err(e) => {
-                                let _ = scan_tx.send(ScanEvent::Error(
-                                    folder_cfg.path.clone(),
-                                    e.to_string(),
-                                ));
-                            }
-                        }
+                match db::folder::get_by_path(&pool_clone, &folder_cfg.path).await {
+                    Ok(Some(folder)) if folder.scan_complete => {
+                        // Already fully scanned, skip
                     }
-                    Err(e) => {
-                        let _ = scan_tx.send(ScanEvent::Error(
-                            folder_cfg.path.clone(),
-                            e.to_string(),
-                        ));
+                    _ => {
+                        // New or incomplete — needs scanning
+                        incomplete.push(folder_cfg.clone());
                     }
                 }
             }
+            incomplete
         });
+
+        if incomplete_folders.is_empty() {
+            let _ = scan_tx.send(ScanEvent::Complete("Existing data loaded".to_string(), 0));
+        } else {
+            let rt_clone = Arc::clone(&rt_arc);
+            let pool_clone = Arc::clone(&pool_arc);
+            rt_clone.spawn(async move {
+                for folder_cfg in &incomplete_folders {
+                    let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
+
+                    let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
+                    match db::folder::get_or_create(
+                        &pool_clone,
+                        None,
+                        &folder_cfg.path,
+                        folder_cfg.recursive,
+                        folder_cfg.show_recursive,
+                        false,
+                        &folder_cfg.blacklist,
+                        cache_mode,
+                    )
+                    .await
+                    {
+                        Ok(folder_id) => {
+                            let path = std::path::Path::new(&folder_cfg.path);
+                            match crate::scanner::scan_folder(
+                                &pool_clone,
+                                folder_id,
+                                path,
+                                folder_cfg.recursive,
+                                folder_cfg.show_recursive,
+                                &folder_cfg.blacklist,
+                                Some(&scan_tx),
+                            )
+                            .await
+                            {
+                                Ok(count) => {
+                                    let _ = scan_tx.send(ScanEvent::Complete(
+                                        folder_cfg.path.clone(),
+                                        count,
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = scan_tx.send(ScanEvent::Error(
+                                        folder_cfg.path.clone(),
+                                        e.to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = scan_tx.send(ScanEvent::Error(
+                                folder_cfg.path.clone(),
+                                e.to_string(),
+                            ));
+                        }
+                    }
+                }
+            });
+        }
 
         let mut app = Self {
             config,
@@ -682,12 +704,15 @@ impl AkashaApp {
                     &folder_cfg.path,
                     folder_cfg.recursive,
                     folder_cfg.show_recursive,
+                    false,
                     &folder_cfg.blacklist,
                     cache_mode,
                 )
                 .await
                 {
                     Ok(folder_id) => {
+                        // Mark entire tree as incomplete before scanning so interruption is recoverable
+                        let _ = db::folder::update_scan_complete_recursive(&pool_clone, folder_id, false).await;
                         match crate::scanner::scan_folder(
                             &pool_clone,
                             folder_id,

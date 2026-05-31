@@ -67,9 +67,32 @@ pub async fn scan_folder(
     let mut folder_ids: HashMap<std::path::PathBuf, i64> = HashMap::new();
     folder_ids.insert(folder_path.to_path_buf(), root_folder_id);
 
-    // Bulk-load existing files for the ENTIRE tree under this root
+    // Query complete subfolders to skip during walk
+    let complete_subfolders: std::collections::HashSet<std::path::PathBuf> =
+        sqlx::query_scalar::<_, String>(
+            "WITH RECURSIVE subtree(id) AS (
+                SELECT ?1
+                UNION ALL
+                SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+            )
+            SELECT path FROM folders WHERE scan_complete = 1 AND id IN (SELECT id FROM subtree) AND id != ?1"
+        )
+        .bind(root_folder_id)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|p| std::path::PathBuf::from(p))
+        .collect();
+    info!("Found {} complete subfolders to skip", complete_subfolders.len());
+
+    // Bulk-load existing files for the ENTIRE tree under this root (recursive CTE)
     let existing: HashMap<String, (String, i64)> = sqlx::query_as::<_, (String, String, i64)>(
-        "SELECT relative_path, blake3_hash, file_size FROM media_files WHERE folder_id IN (SELECT id FROM folders WHERE id = ?1 OR parent_id = ?1)"
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+        )
+        SELECT relative_path, blake3_hash, file_size FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
     )
     .bind(root_folder_id)
     .fetch_all(pool)
@@ -78,16 +101,27 @@ pub async fn scan_folder(
     .map(|(path, hash, size)| (path, (hash, size)))
     .collect();
 
-    let mut existing_paths: Vec<String> = Vec::new();
+    let mut folder_paths: HashMap<i64, Vec<String>> = HashMap::new();
     let mut scanned_count = 0usize;
     let mut batch_count = 0usize;
     const BATCH_SIZE: usize = 1000;
+
+    // Track directories currently being walked; mark them complete when we leave them
+    let mut dir_stack: Vec<(std::path::PathBuf, i64)> = Vec::new();
+    let mut completed_dirs: Vec<i64> = Vec::new();
 
     for entry in walker.into_iter().filter_entry(|e| {
         if e.depth() == 0 {
             return true;
         }
-        !check_blacklist(e, &blacklist_set)
+        if check_blacklist(e, &blacklist_set) {
+            return false;
+        }
+        if e.file_type().is_dir() && complete_subfolders.contains(e.path()) {
+            info!("Skipping complete subfolder: {}", e.path().display());
+            return false;
+        }
+        true
     }) {
         let entry = match entry {
             Ok(e) => e,
@@ -99,9 +133,26 @@ pub async fn scan_folder(
 
         let path = entry.path();
 
-        // Ensure the folder entry exists for this directory
-        if path.is_dir() && recursive {
-            if !folder_ids.contains_key(path) {
+        // Pop directories we've left
+        while let Some((top_path, _)) = dir_stack.last() {
+            if path.starts_with(top_path) {
+                break;
+            }
+            let (_, id) = dir_stack.pop().unwrap();
+            completed_dirs.push(id);
+        }
+
+        // Flush completions periodically
+        if completed_dirs.len() >= 10 {
+            let count = completed_dirs.len();
+            for id in completed_dirs.drain(..) {
+                let _ = crate::db::folder::update_scan_complete(pool, id, true).await;
+            }
+            info!("Marked {} directories complete during scan", count);
+        }
+
+        if path.is_dir() {
+            if recursive && !folder_ids.contains_key(path) {
                 let parent_path = path.parent().unwrap_or(folder_path);
                 let parent_id = folder_ids.get(parent_path).copied();
                 match crate::db::folder::get_or_create(
@@ -110,6 +161,7 @@ pub async fn scan_folder(
                     &path.to_string_lossy(),
                     false,       // subfolders are non-recursive by default
                     show_recursive,
+                    false,       // not known to be complete until walker leaves it
                     blacklist,
                     None,        // inherit cache mode
                 )
@@ -122,6 +174,11 @@ pub async fn scan_folder(
                         warn!("Failed to create folder entry for {}: {}", path.display(), e);
                         continue;
                     }
+                }
+            }
+            if let Some(&id) = folder_ids.get(path) {
+                if dir_stack.last().map(|(p, _)| p != path).unwrap_or(true) {
+                    dir_stack.push((path.to_path_buf(), id));
                 }
             }
             continue;
@@ -139,11 +196,11 @@ pub async fn scan_folder(
             }
         };
 
-        existing_paths.push(relative_path.clone());
-
         // Determine which folder this file belongs to
         let parent_dir = path.parent().unwrap_or(folder_path);
         let folder_id = *folder_ids.get(parent_dir).unwrap_or(&root_folder_id);
+
+        folder_paths.entry(folder_id).or_default().push(relative_path.clone());
 
         let absolute_path = path.to_string_lossy().to_string();
         let metadata = match tokio::fs::metadata(path).await {
@@ -242,15 +299,28 @@ pub async fn scan_folder(
         }
     }
 
-    // Delete orphans across the entire tree under this root
-    let deleted = crate::db::media::delete_orphans_for_root(pool, root_folder_id, &existing_paths).await?;
-    if deleted > 0 {
-        info!("Deleted {} orphan records from root {}", deleted, root_folder_id);
+    // Pop remaining directories
+    let mut final_completions = 0usize;
+    while let Some((_, id)) = dir_stack.pop() {
+        completed_dirs.push(id);
+        final_completions += 1;
+    }
+    for id in completed_dirs.drain(..) {
+        let _ = crate::db::folder::update_scan_complete(pool, id, true).await;
+    }
+    info!("Marked {} directories complete at end of scan", final_completions);
+
+    // Delete orphans per visited folder (avoids deleting files in skipped complete subtrees)
+    for (folder_id, paths) in &folder_paths {
+        let deleted = crate::db::media::delete_orphans(pool, *folder_id, paths).await?;
+        if deleted > 0 {
+            info!("Deleted {} orphan records from folder {}", deleted, folder_id);
+        }
     }
 
     info!(
-        "Scan complete: {} files processed, {} orphans removed",
-        scanned_count, deleted
+        "Scan complete: {} files processed",
+        scanned_count
     );
     Ok(scanned_count)
 }

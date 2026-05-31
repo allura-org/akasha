@@ -7,6 +7,7 @@ pub struct Folder {
     pub path: String,
     pub recursive: bool,
     pub show_recursive: bool,
+    pub scan_complete: bool,
     pub blacklist: Vec<String>,
     pub thumbnail_cache_mode: Option<String>,
 }
@@ -55,18 +56,20 @@ pub async fn insert(
     path: &str,
     recursive: bool,
     show_recursive: bool,
+    scan_complete: bool,
     blacklist: &[String],
     cache_mode: Option<&str>,
 ) -> anyhow::Result<i64> {
     let blacklist_json = serde_json::to_string(blacklist)?;
     let id = sqlx::query(
-        "INSERT INTO folders (parent_id, path, recursive, show_recursive, blacklist, thumbnail_cache_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT INTO folders (parent_id, path, recursive, show_recursive, scan_complete, blacklist, thumbnail_cache_mode)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     )
     .bind(parent_id)
     .bind(path)
     .bind(recursive)
     .bind(show_recursive)
+    .bind(scan_complete)
     .bind(blacklist_json)
     .bind(cache_mode)
     .execute(pool)
@@ -82,13 +85,47 @@ pub async fn get_or_create(
     path: &str,
     recursive: bool,
     show_recursive: bool,
+    scan_complete: bool,
     blacklist: &[String],
     cache_mode: Option<&str>,
 ) -> anyhow::Result<i64> {
     if let Some(folder) = get_by_path(pool, path).await? {
         return Ok(folder.id);
     }
-    insert(pool, parent_id, path, recursive, show_recursive, blacklist, cache_mode).await
+    insert(pool, parent_id, path, recursive, show_recursive, scan_complete, blacklist, cache_mode).await
+}
+
+pub async fn update_scan_complete(
+    pool: &SqlitePool,
+    folder_id: i64,
+    scan_complete: bool,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE folders SET scan_complete = ?1 WHERE id = ?2")
+        .bind(scan_complete)
+        .bind(folder_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_scan_complete_recursive(
+    pool: &SqlitePool,
+    folder_id: i64,
+    scan_complete: bool,
+) -> anyhow::Result<u64> {
+    let result = sqlx::query(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+         )
+         UPDATE folders SET scan_complete = ?2 WHERE id IN (SELECT id FROM subtree)"
+    )
+    .bind(folder_id)
+    .bind(scan_complete)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn update_show_recursive(
@@ -111,6 +148,7 @@ struct FolderRow {
     path: String,
     recursive: i64,
     show_recursive: i64,
+    scan_complete: i64,
     blacklist: String,
     thumbnail_cache_mode: Option<String>,
 }
@@ -122,6 +160,7 @@ fn into_folder(row: FolderRow) -> Folder {
         path: row.path,
         recursive: row.recursive != 0,
         show_recursive: row.show_recursive != 0,
+        scan_complete: row.scan_complete != 0,
         blacklist: serde_json::from_str(&row.blacklist).unwrap_or_default(),
         thumbnail_cache_mode: row.thumbnail_cache_mode,
     }
