@@ -54,7 +54,7 @@ directories = "6"
 chrono = { version = "0.4", features = ["serde"] }
 
 # HEIF/HEIC support (optional, requires libheif-dev and libde265-dev)
-libheif-rs = { version = "2.7", optional = true }
+libheif-rs = { version = "2.7", optional = true, features = ["image"] }
 
 # File system watching (Phase 2)
 notify = "8"

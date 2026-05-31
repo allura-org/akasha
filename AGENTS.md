@@ -93,7 +93,6 @@ src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~950 lines)
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailConfig`, `FolderConfig`
-  image_loader.rs — Unified image open helper; falls back to `libheif-rs` for HEIF/HEIC when the `heif` feature is enabled
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom)
   theme.rs       — Custom flat egui theme

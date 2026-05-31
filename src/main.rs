@@ -1,7 +1,6 @@
 mod app;
 mod config;
 mod db;
-mod image_loader;
 mod scanner;
 mod theme;
 mod thumbnailer;
@@ -11,6 +10,9 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "heif")]
+    libheif_rs::integration::image::register_all_decoding_hooks();
+
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();

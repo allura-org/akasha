@@ -340,11 +340,9 @@ fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>
     let hash = hasher.finalize().to_hex().to_string();
 
     // Dimensions & format
-    let format = crate::image_loader::image_format(path);
-    let (width, height) = match crate::image_loader::image_dimensions(path) {
-        Ok((w, h)) => (Some(w), Some(h)),
-        Err(_) => (None, None),
-    };
+    let reader = image::ImageReader::open(path)?;
+    let format = reader.format().map(|f| format!("{:?}", f).to_lowercase());
+    let (width, height) = reader.into_dimensions().ok().unzip();
 
     Ok((hash, width, height, format))
 }
