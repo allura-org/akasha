@@ -11,7 +11,14 @@ fn is_supported(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| {
             let ext = ext.to_lowercase();
-            SUPPORTED_EXTENSIONS.contains(&ext.as_str())
+            if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+                return true;
+            }
+            #[cfg(feature = "heif")]
+            if matches!(ext.as_str(), "heif" | "heic") {
+                return true;
+            }
+            false
         })
         .unwrap_or(false)
 }
@@ -333,9 +340,11 @@ fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>
     let hash = hasher.finalize().to_hex().to_string();
 
     // Dimensions & format
-    let reader = image::ImageReader::open(path)?;
-    let format = reader.format().map(|f| format!("{:?}", f).to_lowercase());
-    let (width, height) = reader.into_dimensions().ok().unzip();
+    let format = crate::image_loader::image_format(path);
+    let (width, height) = match crate::image_loader::image_dimensions(path) {
+        Ok((w, h)) => (Some(w), Some(h)),
+        Err(_) => (None, None),
+    };
 
     Ok((hash, width, height, format))
 }

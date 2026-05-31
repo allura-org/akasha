@@ -33,7 +33,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Database | `sqlx` 0.8 (sqlite, runtime-tokio, chrono, json) |
 | Migrations | `sqlx::migrate!()` (embedded in binary) |
 | Serialization | `serde`, `serde_json`, `toml` |
-| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff) |
+| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEIF/HEIC) |
 | File hashing | `blake3` |
 | Directory traversal | `walkdir` |
 | Glob blacklists | `globset` |
@@ -63,6 +63,14 @@ cargo build --release
 cargo test
 ```
 
+### Feature flags
+
+- `heif` — Enables HEIF/HEIC image support via `libheif-rs`. Requires system libraries:
+  - `libheif-dev` >= 1.17.0 (and its dependency `libde265-dev` for HEVC decoding)
+  - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
+  - Build with the feature: `cargo build --features heif`
+  - If the libraries are missing, disable the feature: `cargo build --no-default-features` (or remove `heif` from `default` in `Cargo.toml`)
+
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
 ### Runtime Startup Flow
@@ -85,6 +93,7 @@ src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~950 lines)
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailConfig`, `FolderConfig`
+  image_loader.rs — Unified image open helper; falls back to `libheif-rs` for HEIF/HEIC when the `heif` feature is enabled
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom)
   theme.rs       — Custom flat egui theme
@@ -170,6 +179,13 @@ Per-folder config can override `thumbnail_cache_mode`. Blacklists are glob patte
 - Convert between `u32`/`u64` and `i64` at the DB boundary (schema stores integers as SQLite `INTEGER`, which maps to `i64`).
 - `Arc<SqlitePool>` is used to share the pool across async tasks.
 - Keep DB logic in `db/` modules. Business logic (scanning, thumbnailing) stays at the crate root.
+
+---
+
+## Git Workflow
+
+- **Commit often** — commits are useful for rolling back bad edits.
+- **Do not push unless explicitly instructed** — pushes should be deferred until a feature, fix, or rework is actually done.
 
 ---
 

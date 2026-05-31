@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod db;
+mod image_loader;
 mod scanner;
 mod theme;
 mod thumbnailer;

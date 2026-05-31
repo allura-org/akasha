@@ -77,7 +77,7 @@ impl Thumbnailer {
 }
 
 fn generate_in_memory(source: &Path, size: u32) -> anyhow::Result<Vec<u8>> {
-    let img = image::open(source)?;
+    let img = crate::image_loader::open_image(source)?;
     let thumb = img.resize(size, size, image::imageops::FilterType::Lanczos3);
     let mut bytes = Vec::new();
     // Use PNG as fallback if WebP encoding fails

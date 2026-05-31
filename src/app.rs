@@ -528,7 +528,7 @@ impl AkashaApp {
                 let tx = self.viewer_image_tx.clone();
 
                 self.rt.spawn_blocking(move || {
-                    match image::open(&source) {
+                    match crate::image_loader::open_image(&source) {
                         Ok(img) => {
                             let rgba = img.to_rgba8();
                             let size = [rgba.width() as usize, rgba.height() as usize];

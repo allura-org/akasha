@@ -3,6 +3,10 @@ name = "akasha"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+heif = ["dep:libheif-rs"]
+
 [dependencies]
 # UI
 eframe = { version = "0.31", features = ["default"] }
@@ -48,6 +52,9 @@ directories = "6"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
+
+# HEIF/HEIC support (optional, requires libheif-dev and libde265-dev)
+libheif-rs = { version = "2.7", optional = true }
 
 # File system watching (Phase 2)
 notify = "8"
