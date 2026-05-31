@@ -45,13 +45,14 @@ pub struct AkashaApp {
     pub queued_indices: HashSet<usize>,
     pub scroll_offset: f32,
     pub thumbnail_epoch: u64,
+    pub media_epoch: u64,
     pub scan_status: String,
     pub is_scanning: bool,
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
     pub thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
-    pub media_tx: std::sync::mpsc::Sender<Result<Vec<db::media::MediaFile>, String>>,
-    pub media_rx: std::sync::mpsc::Receiver<Result<Vec<db::media::MediaFile>, String>>,
+    pub media_tx: std::sync::mpsc::Sender<(u64, Result<Vec<db::media::MediaFile>, String>)>,
+    pub media_rx: std::sync::mpsc::Receiver<(u64, Result<Vec<db::media::MediaFile>, String>)>,
     pub folders_tx: std::sync::mpsc::Sender<Result<Vec<db::folder::Folder>, String>>,
     pub folders_rx: std::sync::mpsc::Receiver<Result<Vec<db::folder::Folder>, String>>,
     pub last_refresh: std::time::Instant,
@@ -94,7 +95,7 @@ impl AkashaApp {
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
-        let (media_tx, media_rx) = std::sync::mpsc::channel::<Result<Vec<db::media::MediaFile>, String>>();
+        let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, Result<Vec<db::media::MediaFile>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
 
         // On startup: scan any configured folders that are new or incomplete
@@ -191,6 +192,7 @@ impl AkashaApp {
             queued_indices: HashSet::new(),
             scroll_offset: 0.0,
             thumbnail_epoch: 0,
+            media_epoch: 0,
             scan_status: "Initializing...".to_string(),
             is_scanning: true,
             scan_rx,
@@ -312,6 +314,7 @@ impl AkashaApp {
         let show_recursive = folder.show_recursive;
 
         if hard_reset {
+            self.media_epoch += 1;
             self.scan_status = "Loading images...".to_string();
             self.media_items.clear();
             self.textures.clear();
@@ -321,18 +324,28 @@ impl AkashaApp {
             self.scroll_offset = 0.0;
         }
 
+        let epoch = self.media_epoch;
         self.rt.spawn(async move {
             let result = if show_recursive {
                 db::media::list_by_folder_recursive(&pool, folder_id).await
             } else {
                 db::media::list_by_folder(&pool, folder_id).await
             };
-            let _ = tx.send(result.map_err(|e| e.to_string()));
+            let _ = tx.send((epoch, result.map_err(|e| e.to_string())));
         });
     }
 
     fn poll_media_events(&mut self) {
-        if let Ok(result) = self.media_rx.try_recv() {
+        // Drain the channel and keep only the latest result matching the current epoch.
+        // This prevents stale async results (e.g. from periodic refreshes spawned before
+        // a folder switch) from overwriting the current folder's data.
+        let mut latest: Option<Result<Vec<db::media::MediaFile>, String>> = None;
+        while let Ok((epoch, result)) = self.media_rx.try_recv() {
+            if epoch == self.media_epoch {
+                latest = Some(result);
+            }
+        }
+        if let Some(result) = latest {
             match result {
                 Ok(items) => {
                     // Prune textures for hashes no longer in the current folder
@@ -549,6 +562,14 @@ impl AkashaApp {
 
     fn poll_viewer_images(&mut self, ctx: &egui::Context) {
         while let Ok((hash, result)) = self.viewer_image_rx.try_recv() {
+            // Ignore viewer image loads for a media item that is no longer
+            // the one being viewed (e.g. user navigated away while load was in flight).
+            let current_hash = self.viewer_index
+                .and_then(|idx| self.media_items.get(idx))
+                .map(|m| m.blake3_hash.as_str());
+            if current_hash != Some(hash.as_str()) {
+                continue;
+            }
             match result {
                 Ok(color_image) => {
                     let texture = ctx.load_texture(
