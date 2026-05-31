@@ -1,8 +1,10 @@
 # akasha - a Linux-native image gallery for data hoarders
 
+<img width="1692" height="1356" alt="image" src="https://github.com/user-attachments/assets/487cffaf-4d05-42c4-8dc2-2833763971bb" />
+
 akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gallery written in Rust with (currently) egui-based GUI. Built to handle hundreds of thousands of images in a single import.
 
-⚠️ akasha is in pre-alpha and is not suitable to daily-drive yet.
+⚠️  akasha is in pre-alpha and is not suitable to daily-drive yet.
 
 ## features
 
