@@ -54,7 +54,8 @@ directories = "6"
 chrono = { version = "0.4", features = ["serde"] }
 
 # HEIF/HEIC support (optional, requires libheif-dev and libde265-dev)
-libheif-rs = { version = "2.7", optional = true, features = ["image"] }
+# Use v1_17 instead of latest for maximum distro compatibility.
+libheif-rs = { version = "2.7", optional = true, default-features = false, features = ["v1_17", "image"] }
 
 # File system watching (Phase 2)
 notify = "8"
