@@ -12,12 +12,12 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 - **Language:** Rust (edition 2024)
 - **Platform:** Linux desktop (optimized for desktops, not homelabs or servers)
 - **Architecture:** Single-threaded GUI (eframe/egui) with a multi-threaded Tokio runtime for async I/O and database work
-- **Database:** SQLite, managed via `sqlx` with embedded migrations
+- **Database:** SQLite (WAL mode, 5s busy timeout), managed via `sqlx` with embedded migrations
 - **Config format:** TOML, human-readable, stored in XDG directories
 
 ### Key Goals (from `concept.md`)
 - Keep media in-place; use hashes to avoid duplicates within the app
-- Browse by folder tree
+- Browse by folder tree (recursive or flat per-folder)
 - Add folders to watch (recursive or not) with blacklist glob patterns
 - Modular "Searchables" abstraction for AI classification (classifiers, embeddings, VLMs, etc.)
 - Extensible, backwards-compatible schema
@@ -63,12 +63,18 @@ cargo build --release
 cargo test
 ```
 
+**Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
+
 ### Runtime Startup Flow
 1. Initialize `tracing` subscriber at `INFO` level.
 2. Load `Config` from TOML (or create defaults and persist them).
 3. Create a Tokio runtime.
 4. Initialize the SQLite pool and run migrations via `sqlx::migrate!()`.
 5. Launch the native eframe window (`1280x800`, titled "Akasha").
+6. On startup, check each configured folder:
+   - If missing or `scan_complete = false` → scan it
+   - If `scan_complete = true` → skip
+7. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
 
 ---
 
@@ -77,52 +83,65 @@ cargo test
 ```
 src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
-  app.rs         — `AkashaApp` implements `eframe::App`; owns `Config`, `Arc<Mutex<SqlitePool>>`, `Arc<Runtime>`
+  app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~950 lines)
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailConfig`, `FolderConfig`
-  scanner.rs     — Directory scanning logic (hash, dimensions, format). Mostly TODO.
-  thumbnailer.rs — Thumbnail generation and cache path resolution. Mostly TODO.
+  scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
+  thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom)
+  theme.rs       — Custom flat egui theme
   db/
-    mod.rs       — `init_pool()` creates SQLite pool and runs migrations
-    folder.rs    — Folder CRUD: `list_all`, `insert`
-    media.rs     — Media file CRUD: `list_by_folder`, `upsert`, `delete_orphans`
+    mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
+    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `update_show_recursive`
+    media.rs     — Media file CRUD: `list_by_folder`, `list_by_folder_recursive`, `upsert`, `delete_orphans`, `delete_orphans_for_root`
   ui/
     mod.rs       — Re-exports `browser`, `viewer`, `widgets`
-    browser.rs   — `BrowserPanel` (folder tree / grid browser). Placeholder.
-    viewer.rs    — `ViewerPanel` (single media view). Placeholder.
-    widgets.rs   — Shared UI helpers (currently a single placeholder fn).
+    browser.rs   — `BrowserPanel` placeholder (unused; browser UI is inline in `app.rs`)
+    viewer.rs    — Full-screen viewer overlay: zoom fit/1:1, prev/next, info ticker, keyboard shortcuts (Escape, ArrowLeft, ArrowRight)
+    widgets.rs   — Shared UI helpers (currently a single placeholder fn)
 ```
 
 ### Module Relationships
 - `main.rs` depends on all top-level modules.
-- `app.rs` is the orchestrator: it holds references to config, DB pool, and Tokio runtime so UI panels can spawn async DB work.
+- `app.rs` is the orchestrator: holds config, DB pool, Tokio runtime, thumbnailer, and all UI state.
 - `db::folder` and `db::media` are the only DB access layers.
-- `scanner` and `thumbnailer` are intended to be called from async tasks (e.g., triggered by UI or file watchers).
+- `scanner` and `thumbnailer` are called from async tasks spawned by `app.rs`.
+- `ui::viewer` is a pure function called from `app.rs` viewer state; `ui::browser` is unused.
 
 ---
 
 ## Database Schema
 
-Migrations live in `migrations/001_initial.sql` and are embedded at compile time.
+Migrations live in `migrations/` and are embedded at compile time.
 
 ### `folders`
-- `id`, `path` (unique), `recursive`, `blacklist` (JSON array string), `thumbnail_cache_mode`, `created_at`
+- `id`, `parent_id` (FK, self-referencing, cascade delete)
+- `path` (unique, absolute)
+- `recursive` (bool), `show_recursive` (bool)
+- `scan_complete` (bool, DEFAULT 0) — per-subfolder completion tracking
+- `blacklist` (JSON array string)
+- `thumbnail_cache_mode` (optional string: 'disabled', 'global', 'per_folder', 'custom')
+- `created_at`
+- Index: `idx_folder_parent` on `parent_id`
 
 ### `media_files`
-- `id`, `folder_id` (FK, cascade delete), `relative_path`, `absolute_path`, `blake3_hash`, `width`, `height`, `format`, `file_size`, `modified_at`, `created_at`
+- `id`, `folder_id` (FK, cascade delete)
+- `relative_path`, `absolute_path`
+- `blake3_hash`, `width`, `height`, `format`, `file_size`, `modified_at`
+- `created_at`
 - Unique on `(folder_id, relative_path)`
 - Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id)
 
 ### Notes
 - `blacklist` is stored as a JSON string and deserialized via `serde_json`.
 - `media_files` uses `UPSERT` (`ON CONFLICT ... DO UPDATE SET`) in `db::media::upsert`.
-- Orphan cleanup is done with `json_each()` for batch path comparison.
+- Orphan cleanup uses `json_each()` for batch path comparison.
+- Recursive CTEs are used for tree queries (e.g., `list_by_folder_recursive`, `update_scan_complete_recursive`).
 
 ---
 
 ## Configuration
 
-Config path: `~/.config/akasha/config.toml`  
-Database path: `~/.local/share/akasha/akasha.db`  
+Config path: `~/.config/akasha/config.toml`
+Database path: `~/.local/share/akasha/akasha.db`
 Cache path: `~/.cache/akasha/`
 
 ### Default Config
@@ -149,8 +168,8 @@ Per-folder config can override `thumbnail_cache_mode`. Blacklists are glob patte
 - Use `tracing::info!` (and appropriate levels) for operational logging.
 - Use `sqlx::query` / `sqlx::query_as` with explicit parameter binding (`?1`, `?2`, ...).
 - Convert between `u32`/`u64` and `i64` at the DB boundary (schema stores integers as SQLite `INTEGER`, which maps to `i64`).
-- `Arc<Mutex<SqlitePool>>` is used to share the pool across UI panels; the runtime is similarly `Arc`-wrapped.
-- Keep DB logic in `db/` modules. Keep UI logic in `ui/` modules. Business logic (scanning, thumbnailing) stays at the crate root.
+- `Arc<SqlitePool>` is used to share the pool across async tasks.
+- Keep DB logic in `db/` modules. Business logic (scanning, thumbnailing) stays at the crate root.
 
 ---
 
@@ -176,13 +195,12 @@ There are currently no tests in the repository. When adding tests:
 
 ## Known Gaps / TODOs
 
-Many modules are still scaffolding:
-- `scanner.rs` — directory walking, hashing, and metadata extraction are unimplemented.
-- `thumbnailer.rs` — image resize and WebP encoding are unimplemented; `PerFolder` cache path resolution is stubbed.
-- `ui/browser.rs` and `ui/viewer.rs` — UI panels are placeholders.
+- `ui/browser.rs` — `BrowserPanel` is a placeholder; the actual browser UI (folder tree + grid) is inline in `app.rs`.
 - `ui/widgets.rs` — only contains a placeholder label helper.
 - File system watching (`notify`) is listed as a dependency but not yet integrated.
 - AI/ONNX "Searchables" abstraction is described in `concept.md` but not yet present in code.
+- `delete_orphans_for_root` in `db/media.rs` is no longer called (replaced by per-folder cleanup) and has a bug (only matches direct children, not all descendants).
+- No tests exist yet.
 
 ---
 
@@ -191,9 +209,14 @@ Many modules are still scaffolding:
 | File | Purpose |
 |------|---------|
 | `Cargo.toml` | Dependencies and package metadata |
-| `migrations/001_initial.sql` | Database schema (source of truth) |
+| `migrations/*.sql` | Database schema evolution (source of truth) |
 | `concept.md` | High-level product vision and planned features |
+| `SESSION_NOTES.md` | Session-by-session progress and next-steps |
+| `viewer_and_gallery_tweaks.md` | UI polish backlog |
 | `src/config.rs` | Config serialization, defaults, and XDG paths |
 | `src/db/media.rs` | Media file queries and `MediaFile` struct |
 | `src/db/folder.rs` | Folder queries and `Folder` struct |
 | `src/app.rs` | Central app state and `eframe::App` implementation |
+| `src/scanner.rs` | Directory scanning with per-subfolder resume |
+| `src/thumbnailer.rs` | Thumbnail generation and cache path resolution |
+| `src/ui/viewer.rs` | Full-screen image viewer overlay |
