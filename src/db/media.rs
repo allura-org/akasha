@@ -26,6 +26,24 @@ pub async fn list_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result
     Ok(rows.into_iter().map(into_media).collect())
 }
 
+pub async fn list_by_folder_recursive(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<Vec<MediaFile>> {
+    let rows = sqlx::query_as::<_, MediaFileRow>(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+         )
+         SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
+                width, height, format, file_size
+         FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
+    )
+    .bind(folder_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(into_media).collect())
+}
+
 pub async fn upsert(
     pool: &SqlitePool,
     folder_id: i64,
@@ -75,6 +93,21 @@ pub async fn delete_orphans(pool: &SqlitePool, folder_id: i64, existing_paths: &
            AND relative_path NOT IN (SELECT value FROM json_each(?2))"
     )
     .bind(folder_id)
+    .bind(paths_json)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+pub async fn delete_orphans_for_root(pool: &SqlitePool, root_folder_id: i64, existing_paths: &[String]) -> anyhow::Result<u64> {
+    let paths_json = serde_json::to_string(existing_paths)?;
+    let result = sqlx::query(
+        "DELETE FROM media_files
+         WHERE folder_id IN (SELECT id FROM folders WHERE id = ?1 OR parent_id = ?1)
+           AND relative_path NOT IN (SELECT value FROM json_each(?2))"
+    )
+    .bind(root_folder_id)
     .bind(paths_json)
     .execute(pool)
     .await?;

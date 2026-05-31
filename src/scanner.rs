@@ -41,15 +41,18 @@ fn check_blacklist(entry: &walkdir::DirEntry, blacklist: &globset::GlobSet) -> b
 
 pub async fn scan_folder(
     pool: &sqlx::SqlitePool,
-    folder_id: i64,
+    root_folder_id: i64,
     folder_path: &Path,
     recursive: bool,
+    show_recursive: bool,
     blacklist: &[String],
+    progress_tx: Option<&std::sync::mpsc::Sender<crate::app::ScanEvent>>,
 ) -> anyhow::Result<usize> {
     info!(
-        "Scanning folder: {} (recursive={}, blacklist={:?})",
+        "Scanning folder: {} (recursive={}, show_recursive={}, blacklist={:?})",
         folder_path.display(),
         recursive,
+        show_recursive,
         blacklist
     );
 
@@ -60,11 +63,15 @@ pub async fn scan_folder(
         walkdir::WalkDir::new(folder_path).max_depth(1)
     };
 
-    // Bulk-load existing files for this folder — one query instead of 70k
+    // Map absolute path -> folder_id for directories we've seen
+    let mut folder_ids: HashMap<std::path::PathBuf, i64> = HashMap::new();
+    folder_ids.insert(folder_path.to_path_buf(), root_folder_id);
+
+    // Bulk-load existing files for the ENTIRE tree under this root
     let existing: HashMap<String, (String, i64)> = sqlx::query_as::<_, (String, String, i64)>(
-        "SELECT relative_path, blake3_hash, file_size FROM media_files WHERE folder_id = ?1"
+        "SELECT relative_path, blake3_hash, file_size FROM media_files WHERE folder_id IN (SELECT id FROM folders WHERE id = ?1 OR parent_id = ?1)"
     )
-    .bind(folder_id)
+    .bind(root_folder_id)
     .fetch_all(pool)
     .await?
     .into_iter()
@@ -91,6 +98,35 @@ pub async fn scan_folder(
         };
 
         let path = entry.path();
+
+        // Ensure the folder entry exists for this directory
+        if path.is_dir() && recursive {
+            if !folder_ids.contains_key(path) {
+                let parent_path = path.parent().unwrap_or(folder_path);
+                let parent_id = folder_ids.get(parent_path).copied();
+                match crate::db::folder::get_or_create(
+                    pool,
+                    parent_id,
+                    &path.to_string_lossy(),
+                    false,       // subfolders are non-recursive by default
+                    show_recursive,
+                    blacklist,
+                    None,        // inherit cache mode
+                )
+                .await
+                {
+                    Ok(id) => {
+                        folder_ids.insert(path.to_path_buf(), id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to create folder entry for {}: {}", path.display(), e);
+                        continue;
+                    }
+                }
+            }
+            continue;
+        }
+
         if !path.is_file() || !is_supported(path) {
             continue;
         }
@@ -104,6 +140,10 @@ pub async fn scan_folder(
         };
 
         existing_paths.push(relative_path.clone());
+
+        // Determine which folder this file belongs to
+        let parent_dir = path.parent().unwrap_or(folder_path);
+        let folder_id = *folder_ids.get(parent_dir).unwrap_or(&root_folder_id);
 
         let absolute_path = path.to_string_lossy().to_string();
         let metadata = match tokio::fs::metadata(path).await {
@@ -185,6 +225,16 @@ pub async fn scan_folder(
         scanned_count += 1;
         batch_count += 1;
 
+        // Send progress every 5000 files
+        if scanned_count % 5000 == 0 {
+            if let Some(tx) = progress_tx {
+                let _ = tx.send(crate::app::ScanEvent::Progress(
+                    folder_path.to_string_lossy().to_string(),
+                    scanned_count,
+                ));
+            }
+        }
+
         // Yield every batch to let other DB operations through
         if batch_count >= BATCH_SIZE {
             batch_count = 0;
@@ -192,10 +242,10 @@ pub async fn scan_folder(
         }
     }
 
-    // Delete orphans using the pool (single query)
-    let deleted = crate::db::media::delete_orphans(pool, folder_id, &existing_paths).await?;
+    // Delete orphans across the entire tree under this root
+    let deleted = crate::db::media::delete_orphans_for_root(pool, root_folder_id, &existing_paths).await?;
     if deleted > 0 {
-        info!("Deleted {} orphan records from folder {}", deleted, folder_id);
+        info!("Deleted {} orphan records from root {}", deleted, root_folder_id);
     }
 
     info!(

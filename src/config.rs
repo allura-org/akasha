@@ -29,6 +29,8 @@ pub struct FolderConfig {
     #[serde(default = "default_true")]
     pub recursive: bool,
     #[serde(default)]
+    pub show_recursive: bool,
+    #[serde(default)]
     pub blacklist: Vec<String>,
     pub thumbnail_cache_mode: Option<String>,
 }

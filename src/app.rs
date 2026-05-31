@@ -37,7 +37,7 @@ pub struct AkashaApp {
 
     // UI state
     pub folders: Vec<db::folder::Folder>,
-    pub selected_folder: Option<usize>,
+    pub selected_folder_id: Option<i64>,
     pub media_items: Vec<db::media::MediaFile>,
     pub textures: HashMap<String, egui::TextureHandle>,
     pub pending_thumbnails: HashSet<String>,
@@ -52,6 +52,10 @@ pub struct AkashaApp {
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
     pub media_tx: std::sync::mpsc::Sender<Result<Vec<db::media::MediaFile>, String>>,
     pub media_rx: std::sync::mpsc::Receiver<Result<Vec<db::media::MediaFile>, String>>,
+    pub folders_tx: std::sync::mpsc::Sender<Result<Vec<db::folder::Folder>, String>>,
+    pub folders_rx: std::sync::mpsc::Receiver<Result<Vec<db::folder::Folder>, String>>,
+    pub last_refresh: std::time::Instant,
+    pub expanded_folders: HashSet<i64>,
 
     // Viewer state
     pub viewer_open: bool,
@@ -91,6 +95,7 @@ impl AkashaApp {
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
         let (media_tx, media_rx) = std::sync::mpsc::channel::<Result<Vec<db::media::MediaFile>, String>>();
+        let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
 
         // Clone for background scan task
         let pool_clone = Arc::clone(&pool_arc);
@@ -102,10 +107,12 @@ impl AkashaApp {
                 let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
 
                 let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
-                match db::folder::insert_or_get(
+                match db::folder::get_or_create(
                     &pool_clone,
+                    None,
                     &folder_cfg.path,
                     folder_cfg.recursive,
+                    folder_cfg.show_recursive,
                     &folder_cfg.blacklist,
                     cache_mode,
                 )
@@ -118,7 +125,9 @@ impl AkashaApp {
                             folder_id,
                             path,
                             folder_cfg.recursive,
+                            folder_cfg.show_recursive,
                             &folder_cfg.blacklist,
+                            Some(&scan_tx),
                         )
                         .await
                         {
@@ -152,7 +161,7 @@ impl AkashaApp {
             rt: rt_arc,
             thumbnailer,
             folders: Vec::new(),
-            selected_folder: None,
+            selected_folder_id: None,
             media_items: Vec::new(),
             textures: HashMap::new(),
             pending_thumbnails: HashSet::new(),
@@ -167,6 +176,10 @@ impl AkashaApp {
             thumbnail_rx,
             media_tx,
             media_rx,
+            folders_tx,
+            folders_rx,
+            last_refresh: std::time::Instant::now(),
+            expanded_folders: HashSet::new(),
             viewer_open: false,
             viewer_index: None,
             viewer_texture: None,
@@ -178,44 +191,134 @@ impl AkashaApp {
             settings_open: false,
         };
 
-        app.refresh_folders_blocking();
+        app.refresh_folders_async();
         app
     }
 
-    fn refresh_folders_blocking(&mut self) {
+    fn folder_depth(&self, folder: &db::folder::Folder) -> usize {
+        let mut depth = 0;
+        let mut current = folder.parent_id;
+        while let Some(pid) = current {
+            depth += 1;
+            current = self.folders.iter().find(|f| f.id == pid).and_then(|f| f.parent_id);
+        }
+        depth
+    }
+
+    fn refresh_folders_async(&mut self) {
         let pool = Arc::clone(&self.pool);
-        match self.rt.block_on(async move {
-            db::folder::list_all(&pool).await
-        }) {
-            Ok(folders) => self.folders = folders,
-            Err(e) => self.scan_status = format!("Failed to load folders: {e}"),
+        let tx = self.folders_tx.clone();
+        self.rt.spawn(async move {
+            let result = db::folder::list_all(&pool).await;
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+    }
+
+    fn poll_folders_events(&mut self) {
+        if let Ok(result) = self.folders_rx.try_recv() {
+            match result {
+                Ok(folders) => {
+                    // Auto-expand root folders
+                    for folder in &folders {
+                        if folder.parent_id.is_none() {
+                            self.expanded_folders.insert(folder.id);
+                        }
+                    }
+                    self.folders = folders;
+                }
+                Err(e) => self.scan_status = format!("Failed to load folders: {e}"),
+            }
         }
     }
 
-    fn refresh_media_async(&mut self) {
-        if let Some(idx) = self.selected_folder {
-            if let Some(folder) = self.folders.get(idx) {
-                let folder_id = folder.id;
-                let pool = Arc::clone(&self.pool);
-                let tx = self.media_tx.clone();
-                self.scan_status = "Loading images...".to_string();
-                self.media_items.clear();
-                self.pending_thumbnails.clear();
-                self.thumbnail_queue.clear();
-                self.queued_indices.clear();
-                self.scroll_offset = 0.0;
-                self.rt.spawn(async move {
-                    let result = db::media::list_by_folder(&pool, folder_id).await;
-                    let _ = tx.send(result.map_err(|e| e.to_string()));
-                });
+    fn render_folder_tree(&mut self, ui: &mut egui::Ui, folder_id: i64, depth: usize, clicked_id: &mut Option<i64>) {
+        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return; };
+        let selected = self.selected_folder_id == Some(folder.id);
+        let has_children = self.folders.iter().any(|f| f.parent_id == Some(folder.id));
+        let is_root = folder.parent_id.is_none();
+
+        ui.horizontal(|ui| {
+            ui.add_space(depth as f32 * 16.0);
+
+            if has_children {
+                let arrow = if self.expanded_folders.contains(&folder.id) { "▼" } else { "▶" };
+                if ui.small_button(arrow).clicked() {
+                    if self.expanded_folders.contains(&folder.id) {
+                        self.expanded_folders.remove(&folder.id);
+                    } else {
+                        self.expanded_folders.insert(folder.id);
+                    }
+                }
+            } else {
+                ui.add_space(24.0);
+            }
+
+            let name = std::path::Path::new(&folder.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&folder.path);
+
+            let label = if is_root {
+                egui::RichText::new(name).strong()
+            } else {
+                egui::RichText::new(name)
+            };
+
+            if ui.selectable_label(selected, label).clicked() && !selected {
+                *clicked_id = Some(folder.id);
+            }
+        });
+
+        if self.expanded_folders.contains(&folder.id) {
+            let children: Vec<i64> = self.folders
+                .iter()
+                .filter(|f| f.parent_id == Some(folder.id))
+                .map(|f| f.id)
+                .collect();
+            for child_id in children {
+                self.render_folder_tree(ui, child_id, depth + 1, clicked_id);
             }
         }
+    }
+
+    fn refresh_media_async(&mut self, hard_reset: bool) {
+        let Some(folder_id) = self.selected_folder_id else { return; };
+        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return; };
+
+        let pool = Arc::clone(&self.pool);
+        let tx = self.media_tx.clone();
+        let show_recursive = folder.show_recursive;
+
+        if hard_reset {
+            self.scan_status = "Loading images...".to_string();
+            self.media_items.clear();
+            self.textures.clear();
+            self.pending_thumbnails.clear();
+            self.thumbnail_queue.clear();
+            self.queued_indices.clear();
+            self.scroll_offset = 0.0;
+        }
+
+        self.rt.spawn(async move {
+            let result = if show_recursive {
+                db::media::list_by_folder_recursive(&pool, folder_id).await
+            } else {
+                db::media::list_by_folder(&pool, folder_id).await
+            };
+            let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
     }
 
     fn poll_media_events(&mut self) {
         if let Ok(result) = self.media_rx.try_recv() {
             match result {
                 Ok(items) => {
+                    // Prune textures for hashes no longer in the current folder
+                    let needed: HashSet<String> = items.iter().map(|m| m.blake3_hash.clone()).collect();
+                    self.textures.retain(|hash, _| needed.contains(hash));
+                    self.pending_thumbnails.retain(|hash| needed.contains(hash));
+                    self.thumbnail_queue.retain(|(idx, _)| items.get(*idx).is_some());
+                    self.queued_indices.retain(|idx| items.get(*idx).is_some());
                     self.media_items = items;
                     self.scan_status = format!("{} images", self.media_items.len());
                 }
@@ -239,8 +342,16 @@ impl AkashaApp {
                 ScanEvent::Complete(path, count) => {
                     self.scan_status = format!("Done scanning {path}: {count} files");
                     self.is_scanning = false;
-                    self.refresh_folders_blocking();
-                    self.refresh_media_async();
+                    self.refresh_folders_async();
+                    if self.selected_folder_id.is_none() {
+                        // Select first root folder if nothing selected
+                        if let Some(root) = self.folders.iter().find(|f| f.parent_id.is_none()) {
+                            self.selected_folder_id = Some(root.id);
+                            self.refresh_media_async(true);
+                        }
+                    } else {
+                        self.refresh_media_async(false);
+                    }
                 }
                 ScanEvent::Error(path, err) => {
                     self.scan_status = format!("Error scanning {path}: {err}");
@@ -565,10 +676,12 @@ impl AkashaApp {
                 let path = std::path::Path::new(&folder_cfg.path);
                 let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
 
-                match db::folder::insert_or_get(
+                match db::folder::get_or_create(
                     &pool_clone,
+                    None,
                     &folder_cfg.path,
                     folder_cfg.recursive,
+                    folder_cfg.show_recursive,
                     &folder_cfg.blacklist,
                     cache_mode,
                 )
@@ -580,7 +693,9 @@ impl AkashaApp {
                             folder_id,
                             path,
                             folder_cfg.recursive,
+                            folder_cfg.show_recursive,
                             &folder_cfg.blacklist,
+                            Some(&scan_tx),
                         )
                         .await
                         {
@@ -613,10 +728,20 @@ impl AkashaApp {
 impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
+        self.poll_folders_events();
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
         self.process_thumbnail_queue();
+
+        // Periodic refresh while scanning so the tree populates and counts update live
+        if self.is_scanning && self.last_refresh.elapsed() > std::time::Duration::from_secs(2) {
+            self.last_refresh = std::time::Instant::now();
+            self.refresh_folders_async();
+            if self.selected_folder_id.is_some() {
+                self.refresh_media_async(false);
+            }
+        }
 
         // Top bar
         egui::TopBottomPanel::top("top_bar")
@@ -638,7 +763,7 @@ impl eframe::App for AkashaApp {
             });
         });
 
-        // Left sidebar: folders
+        // Left sidebar: folder tree
         egui::SidePanel::left("folders")
             .resizable(true)
             .default_width(250.0)
@@ -653,38 +778,38 @@ impl eframe::App for AkashaApp {
                     ui.label("No folders configured.");
                     ui.label("Add folders in config.toml");
                 } else {
-                    let mut clicked_idx = None;
-                    for (idx, folder) in self.folders.iter().enumerate() {
-                        let selected = self.selected_folder == Some(idx);
-                        let response = ui.selectable_label(
-                            selected,
-                            format!("{}", std::path::Path::new(&folder.path).file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or(&folder.path)),
-                        );
-                        if response.clicked() && !selected {
-                            clicked_idx = Some(idx);
+                    let mut clicked_id = None;
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        let roots: Vec<i64> = self.folders
+                            .iter()
+                            .filter(|f| f.parent_id.is_none())
+                            .map(|f| f.id)
+                            .collect();
+                        for root_id in roots {
+                            self.render_folder_tree(ui, root_id, 0, &mut clicked_id);
                         }
-                        response.on_hover_text(&folder.path);
-                    }
-                    if let Some(idx) = clicked_idx {
-                        self.selected_folder = Some(idx);
-                        self.refresh_media_async();
+                    });
+                    if let Some(id) = clicked_id {
+                        self.selected_folder_id = Some(id);
+                        self.refresh_media_async(true);
                     }
                 }
             });
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.is_scanning && self.media_items.is_empty() {
+            if self.is_scanning && self.media_items.is_empty() && self.selected_folder_id.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.heading("Scanning...");
                     ui.label(&self.scan_status);
                 });
             } else if self.media_items.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.heading("No images found");
-                    ui.label("Add a folder in config.toml and restart, or click Rescan.");
+                    if self.selected_folder_id.is_some() {
+                        ui.heading("No images in this folder");
+                    } else {
+                        ui.heading("Select a folder");
+                    }
                 });
             } else {
                 ui.heading(format!("{} images", self.media_items.len()));
