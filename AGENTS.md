@@ -193,6 +193,24 @@ There are currently no tests in the repository. When adding tests:
 
 ---
 
+## Development Phases (from original plan)
+
+| Phase | Deliverable | Status |
+|-------|-------------|--------|
+| 1 | Scaffold Cargo project, config loading, SQLite + migrations | ✅ Complete |
+| 2 | Folder scanner (walk, hash, insert) | ✅ Complete |
+| 3 | Thumbnailer + cache | ✅ Complete |
+| 4 | egui browser UI (folder tree + thumbnail grid) | ✅ Complete |
+| 5 | Image viewer + keyboard nav | ✅ Complete |
+| 6 | Polish: theme, error toasts, settings UI | ✅ Complete |
+| — | **MVP Complete** — usable gallery | ✅ Complete |
+| 7 | `notify` file watcher, incremental updates | ❌ Not started |
+| 8 | Searchables trait + ONNX scaffolding | ❌ Not started |
+| 9 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
+| 10 | Unified search UI | ❌ Not started |
+
+The full original plan (database evaluation, Searchables trait definition, extensibility hooks, open questions) lives in `SESSION_NOTES.md` under "Full Architectural Roadmap".
+
 ## Known Gaps / TODOs
 
 - `ui/browser.rs` — `BrowserPanel` is a placeholder; the actual browser UI (folder tree + grid) is inline in `app.rs`.
