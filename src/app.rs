@@ -1,6 +1,6 @@
 use eframe::egui;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -42,11 +42,14 @@ pub struct AkashaApp {
     pub media_items: Vec<db::media::MediaFile>,
     pub textures: HashMap<String, egui::TextureHandle>,
     pub pending_thumbnails: HashSet<String>,
+    pub thumbnail_queue: VecDeque<String>,
+    pub scroll_offset: f32,
+    pub thumbnail_epoch: u64,
     pub scan_status: String,
     pub is_scanning: bool,
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
-    pub thumbnail_tx: std::sync::mpsc::Sender<(String, Result<Vec<u8>, String>)>,
-    pub thumbnail_rx: std::sync::mpsc::Receiver<(String, Result<Vec<u8>, String>)>,
+    pub thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
+    pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
 
     // Viewer state
     pub viewer_open: bool,
@@ -61,6 +64,9 @@ pub struct AkashaApp {
     pub toasts: Vec<Toast>,
     pub settings_open: bool,
 }
+
+const MAX_CONCURRENT_THUMBNAILS: usize = 8;
+const THUMB_CELL_HEIGHT: f32 = 230.0;
 
 impl AkashaApp {
     pub fn new(
@@ -80,7 +86,7 @@ impl AkashaApp {
         let pool_arc = Arc::new(Mutex::new(pool));
         let rt_arc = Arc::new(rt);
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
-        let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, Result<Vec<u8>, String>)>();
+        let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
 
         // Clone for background scan task
@@ -148,6 +154,9 @@ impl AkashaApp {
             media_items: Vec::new(),
             textures: HashMap::new(),
             pending_thumbnails: HashSet::new(),
+            thumbnail_queue: VecDeque::new(),
+            scroll_offset: 0.0,
+            thumbnail_epoch: 0,
             scan_status: "Initializing...".to_string(),
             is_scanning: true,
             scan_rx,
@@ -192,6 +201,8 @@ impl AkashaApp {
                         self.media_items = items;
                         // Clear pending for items no longer visible
                         self.pending_thumbnails.clear();
+                        self.thumbnail_queue.clear();
+                        self.scroll_offset = 0.0;
                     }
                     Err(e) => self.scan_status = format!("Failed to load media: {e}"),
                 }
@@ -225,22 +236,19 @@ impl AkashaApp {
     }
 
     fn poll_thumbnail_events(&mut self, ctx: &egui::Context) {
-        while let Ok((hash, result)) = self.thumbnail_rx.try_recv() {
+        while let Ok((hash, epoch, result)) = self.thumbnail_rx.try_recv() {
             self.pending_thumbnails.remove(&hash);
+            if epoch != self.thumbnail_epoch {
+                continue; // stale result from before a size change
+            }
             match result {
-                Ok(bytes) => {
-                    if let Ok(image) = image::load_from_memory(&bytes) {
-                        let size = [image.width() as usize, image.height() as usize];
-                        let rgba = image.to_rgba8();
-                        let color_image =
-                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                        let texture = ctx.load_texture(
-                            &hash,
-                            color_image,
-                            egui::TextureOptions::default(),
-                        );
-                        self.textures.insert(hash, texture);
-                    }
+                Ok(color_image) => {
+                    let texture = ctx.load_texture(
+                        &hash,
+                        color_image,
+                        egui::TextureOptions::default(),
+                    );
+                    self.textures.insert(hash, texture);
                 }
                 Err(e) => {
                     tracing::warn!("Thumbnail failed for {}: {}", hash, e);
@@ -250,32 +258,91 @@ impl AkashaApp {
         }
     }
 
-    fn load_missing_thumbnails(&mut self) {
-        for media in &self.media_items {
-            if self.textures.contains_key(&media.blake3_hash)
-                || self.pending_thumbnails.contains(&media.blake3_hash)
+    fn queue_visible_thumbnails(&mut self, viewport_height: f32, cols: usize) {
+        if cols == 0 || self.media_items.is_empty() {
+            return;
+        }
+        let rows = (self.media_items.len() + cols - 1) / cols;
+        let first_visible_row = (self.scroll_offset / THUMB_CELL_HEIGHT).floor() as usize;
+        let last_visible_row = ((self.scroll_offset + viewport_height) / THUMB_CELL_HEIGHT).ceil() as usize;
+        let first_visible = first_visible_row.saturating_sub(1) * cols;
+        let last_visible = ((last_visible_row + 1) * cols).min(self.media_items.len());
+
+        // Build a prioritized list: visible first, then nearby, then rest
+        let mut to_queue = Vec::new();
+        for i in first_visible..last_visible {
+            let hash = &self.media_items[i].blake3_hash;
+            if !self.textures.contains_key(hash)
+                && !self.pending_thumbnails.contains(hash)
+                && !self.thumbnail_queue.contains(hash)
             {
+                to_queue.push((i, hash.clone(), 0usize)); // priority 0 = visible
+            }
+        }
+        // Nearby items (one screen worth above and below)
+        let nearby_start = first_visible.saturating_sub(rows * cols);
+        let nearby_end = (last_visible + rows * cols).min(self.media_items.len());
+        for i in nearby_start..nearby_end {
+            if i >= first_visible && i < last_visible {
+                continue; // already queued
+            }
+            let hash = &self.media_items[i].blake3_hash;
+            if !self.textures.contains_key(hash)
+                && !self.pending_thumbnails.contains(hash)
+                && !self.thumbnail_queue.contains(hash)
+            {
+                let dist = if i < first_visible {
+                    first_visible - i
+                } else {
+                    i - last_visible
+                };
+                to_queue.push((i, hash.clone(), dist));
+            }
+        }
+
+        to_queue.sort_by_key(|(_, _, dist)| *dist);
+        for (_, hash, _) in to_queue {
+            self.thumbnail_queue.push_back(hash);
+        }
+    }
+
+    fn process_thumbnail_queue(&mut self) {
+        let can_spawn = MAX_CONCURRENT_THUMBNAILS.saturating_sub(self.pending_thumbnails.len());
+        if can_spawn == 0 {
+            return;
+        }
+
+        for _ in 0..can_spawn {
+            let Some(hash) = self.thumbnail_queue.pop_front() else {
+                break;
+            };
+            // Double-check it's still needed
+            if self.textures.contains_key(&hash) || self.pending_thumbnails.contains(&hash) {
                 continue;
             }
 
-            self.pending_thumbnails.insert(media.blake3_hash.clone());
+            let Some(media) = self.media_items.iter().find(|m| m.blake3_hash == hash) else {
+                continue;
+            };
 
+            self.pending_thumbnails.insert(hash.clone());
             let source = std::path::PathBuf::from(&media.absolute_path);
-            let hash = media.blake3_hash.clone();
             let size = self.thumbnailer.size;
             let cache_mode = self.thumbnailer.cache_mode.clone();
             let tx = self.thumbnail_tx.clone();
+            let epoch = self.thumbnail_epoch;
 
             self.rt.spawn_blocking(move || {
                 let thumbnailer = Thumbnailer::new(size, cache_mode);
-                match thumbnailer.load_thumbnail_bytes(&source, &hash, None) {
-                    Ok(bytes) => {
-                        let _ = tx.send((hash, Ok(bytes)));
-                    }
-                    Err(e) => {
-                        let _ = tx.send((hash, Err(e.to_string())));
-                    }
-                }
+                let result = thumbnailer.load_thumbnail_bytes(&source, &hash, None)
+                    .and_then(|bytes| {
+                        let img = image::load_from_memory(&bytes)
+                            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+                        let rgba = img.to_rgba8();
+                        let sz = [rgba.width() as usize, rgba.height() as usize];
+                        Ok(egui::ColorImage::from_rgba_unmultiplied(sz, rgba.as_raw()))
+                    });
+                let _ = tx.send((hash, epoch, result.map_err(|e| e.to_string())));
             });
         }
     }
@@ -450,6 +517,8 @@ impl AkashaApp {
                         self.thumbnailer.size = size as u32;
                         self.textures.clear();
                         self.pending_thumbnails.clear();
+                        self.thumbnail_queue.clear();
+                        self.thumbnail_epoch += 1;
                         if let Err(e) = self.config.save() {
                             self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
                         }
@@ -540,7 +609,7 @@ impl eframe::App for AkashaApp {
         self.poll_scan_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
-        self.load_missing_thumbnails();
+        self.process_thumbnail_queue();
 
         // Top bar
         egui::TopBottomPanel::top("top_bar")
@@ -614,56 +683,70 @@ impl eframe::App for AkashaApp {
                 ui.heading(format!("{} images", self.media_items.len()));
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let cols = (ui.available_width() / 220.0).max(1.0) as usize;
-                    egui::Grid::new("media_grid")
-                        .num_columns(cols)
-                        .spacing([16.0, 16.0])
-                        .show(ui, |ui| {
-                            let mut clicked_index = None;
-                            for (i, media) in self.media_items.iter().enumerate() {
-                                if i > 0 && i % cols == 0 {
-                                    ui.end_row();
-                                }
-                                let clicked = ui.vertical(|ui| {
-                                    let thumb_size = egui::vec2(200.0, 200.0);
-                                    let response = if let Some(texture) = self.textures.get(&media.blake3_hash) {
-                                        let mut size = thumb_size;
-                                        let tex_w = texture.size()[0] as f32;
-                                        let tex_h = texture.size()[1] as f32;
-                                        if tex_w > 0.0 && tex_h > 0.0 {
-                                            let aspect = tex_w / tex_h;
-                                            if aspect > 1.0 {
-                                                size.y = size.x / aspect;
+                let cols = (ui.available_width() / 220.0).max(1.0) as usize;
+                let rows = (self.media_items.len() + cols - 1) / cols;
+                let item_size = egui::vec2(200.0, 200.0);
+                let label_h = 30.0;
+                let row_height = item_size.y + label_h;
+
+                let scroll = egui::ScrollArea::vertical()
+                    .show_rows(ui, row_height, rows, |ui, row_range| {
+                        let mut clicked_index = None;
+                        for row in row_range {
+                            ui.horizontal(|ui| {
+                                for col in 0..cols {
+                                    let idx = row * cols + col;
+                                    if idx >= self.media_items.len() {
+                                        break;
+                                    }
+                                    let media = &self.media_items[idx];
+
+                                    let clicked = ui.allocate_ui_with_layout(
+                                        egui::vec2(item_size.x, row_height),
+                                        egui::Layout::top_down(egui::Align::Center),
+                                        |ui| {
+                                            let response = if let Some(texture) = self.textures.get(&media.blake3_hash) {
+                                                let mut size = item_size;
+                                                let tex_w = texture.size()[0] as f32;
+                                                let tex_h = texture.size()[1] as f32;
+                                                if tex_w > 0.0 && tex_h > 0.0 {
+                                                    let aspect = tex_w / tex_h;
+                                                    if aspect > 1.0 {
+                                                        size.y = size.x / aspect;
+                                                    } else {
+                                                        size.x = size.y * aspect;
+                                                    }
+                                                }
+                                                ui.add(
+                                                    egui::Image::new((texture.id(), size))
+                                                        .fit_to_exact_size(size)
+                                                        .sense(egui::Sense::click()),
+                                                )
                                             } else {
-                                                size.x = size.y * aspect;
-                                            }
-                                        }
-                                        ui.add(
-                                            egui::Image::new((texture.id(), size))
-                                                .fit_to_exact_size(size)
-                                                .sense(egui::Sense::click()),
-                                        )
-                                    } else {
-                                        ui.add_sized(thumb_size, egui::Spinner::new())
-                                    };
-                                    ui.label(
-                                        std::path::Path::new(&media.relative_path)
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or(&media.relative_path),
-                                    );
-                                    response.clicked()
-                                }).inner;
-                                if clicked {
-                                    clicked_index = Some(i);
+                                                ui.add_sized(item_size, egui::Spinner::new())
+                                            };
+                                            ui.label(
+                                                std::path::Path::new(&media.relative_path)
+                                                    .file_name()
+                                                    .and_then(|n| n.to_str())
+                                                    .unwrap_or(&media.relative_path),
+                                            );
+                                            response.clicked()
+                                        },
+                                    ).inner;
+                                    if clicked {
+                                        clicked_index = Some(idx);
+                                    }
                                 }
-                            }
-                            if let Some(i) = clicked_index {
-                                self.open_viewer(i);
-                            }
-                        });
-                });
+                            });
+                        }
+                        if let Some(i) = clicked_index {
+                            self.open_viewer(i);
+                        }
+                    });
+                self.scroll_offset = scroll.state.offset.y;
+                let viewport_h = scroll.inner_rect.height();
+                self.queue_visible_thumbnails(viewport_h, cols);
             }
         });
 

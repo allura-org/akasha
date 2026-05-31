@@ -97,51 +97,47 @@ pub fn show(
                     });
                 }
 
-                // Bottom bar split into three sections
-                let left_w = bottom_rect.width() * 0.15;
-                let center_w = bottom_rect.width() * 0.30;
-                let right_w = bottom_rect.width() * 0.55;
+                // Bottom bar layout — exact positioning
+                let pad = 12.0;
+                let button_h = 48.0;
+                let y = bottom_rect.max.y - button_h - pad;
 
-                // Left: Close
-                let left_rect = egui::Rect::from_min_size(
-                    bottom_rect.min,
-                    egui::vec2(left_w, bottom_rect.height()),
+                // Close — snapped to bottom-left
+                let close_rect = egui::Rect::from_min_size(
+                    egui::pos2(bottom_rect.min.x + pad, y),
+                    egui::vec2(100.0, button_h),
                 );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(left_rect), |ui| {
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::BOTTOM), |ui| {
-                        if ui.button("Close").clicked() {
-                            resp.close = true;
+                if ui.put(close_rect, egui::Button::new("Close")).clicked() {
+                    resp.close = true;
+                }
+
+                // Nav cluster — exactly centered on screen
+                let nav_w = 320.0;
+                let nav_rect = egui::Rect::from_min_size(
+                    egui::pos2(bottom_rect.center().x - nav_w / 2.0, y),
+                    egui::vec2(nav_w, button_h),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
+                    ui.horizontal_centered(|ui| {
+                        if ui.button("< Previous").clicked() {
+                            resp.prev = true;
+                        }
+                        if ui.button(if zoom_to_fit { "1:1" } else { "Fit" }).clicked() {
+                            resp.toggle_zoom = true;
+                        }
+                        if ui.button("Next >").clicked() {
+                            resp.next = true;
                         }
                     });
                 });
 
-                // Center: Prev / Fit / Next
-                let center_rect = egui::Rect::from_min_size(
-                    egui::pos2(bottom_rect.min.x + left_w, bottom_rect.min.y),
-                    egui::vec2(center_w, bottom_rect.height()),
+                // Info — snapped to bottom-right
+                let info_left = bottom_rect.center().x + nav_w / 2.0 + 20.0;
+                let info_rect = egui::Rect::from_min_size(
+                    egui::pos2(info_left, y),
+                    egui::vec2(bottom_rect.max.x - info_left - pad, button_h),
                 );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(center_rect), |ui| {
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                        ui.horizontal_centered(|ui| {
-                            if ui.button("< Previous").clicked() {
-                                resp.prev = true;
-                            }
-                            if ui.button(if zoom_to_fit { "1:1" } else { "Fit" }).clicked() {
-                                resp.toggle_zoom = true;
-                            }
-                            if ui.button("Next >").clicked() {
-                                resp.next = true;
-                            }
-                        });
-                    });
-                });
-
-                // Right: info
-                let right_rect = egui::Rect::from_min_size(
-                    egui::pos2(bottom_rect.min.x + left_w + center_w, bottom_rect.min.y),
-                    egui::vec2(right_w, bottom_rect.height()),
-                );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(right_rect), |ui| {
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(info_rect), |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
                         ui.label(format!(
                             "{}  \u{2022}  {}x{}  \u{2022}  {}",
