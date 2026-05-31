@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
@@ -59,8 +60,21 @@ pub async fn scan_folder(
         walkdir::WalkDir::new(folder_path).max_depth(1)
     };
 
+    // Bulk-load existing files for this folder — one query instead of 70k
+    let existing: HashMap<String, (String, i64)> = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT relative_path, blake3_hash, file_size FROM media_files WHERE folder_id = ?1"
+    )
+    .bind(folder_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|(path, hash, size)| (path, (hash, size)))
+    .collect();
+
     let mut existing_paths: Vec<String> = Vec::new();
     let mut scanned_count = 0usize;
+    let mut batch_count = 0usize;
+    const BATCH_SIZE: usize = 1000;
 
     for entry in walker.into_iter().filter_entry(|e| {
         if e.depth() == 0 {
@@ -112,22 +126,12 @@ pub async fn scan_folder(
             .flatten()
             .map(|dt| dt.naive_utc());
 
-        // Check if file changed since last scan
-        let needs_update = {
-            let row = sqlx::query_as::<_, (Option<i64>, Option<String>, Option<i64>)>(
-                "SELECT id, blake3_hash, file_size FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
-            )
-            .bind(folder_id)
-            .bind(&relative_path)
-            .fetch_optional(pool)
-            .await?;
-
-            match row {
-                Some((_, Some(old_hash), Some(old_size))) => {
-                    old_hash.is_empty() || old_size as u64 != file_size
-                }
-                _ => true,
+        // Check if file changed since last scan (in-memory, O(1))
+        let needs_update = match existing.get(&relative_path) {
+            Some((old_hash, old_size)) => {
+                old_hash.is_empty() || *old_size as u64 != file_size
             }
+            None => true,
         };
 
         if !needs_update {
@@ -152,23 +156,43 @@ pub async fn scan_folder(
             }
         };
 
-        crate::db::media::upsert(
-            pool,
-            folder_id,
-            &relative_path,
-            &absolute_path,
-            &hash,
-            width,
-            height,
-            format.as_deref(),
-            Some(file_size),
-            modified_at,
+        // Upsert via the pool (WAL mode allows concurrent reads)
+        sqlx::query(
+            "INSERT INTO media_files
+             (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(folder_id, relative_path) DO UPDATE SET
+                 absolute_path = excluded.absolute_path,
+                 blake3_hash = excluded.blake3_hash,
+                 width = excluded.width,
+                 height = excluded.height,
+                 format = excluded.format,
+                 file_size = excluded.file_size,
+                 modified_at = excluded.modified_at"
         )
+        .bind(folder_id)
+        .bind(&relative_path)
+        .bind(&absolute_path)
+        .bind(&hash)
+        .bind(width.map(|v| v as i64))
+        .bind(height.map(|v| v as i64))
+        .bind(format.as_deref())
+        .bind(file_size as i64)
+        .bind(modified_at)
+        .execute(pool)
         .await?;
 
         scanned_count += 1;
+        batch_count += 1;
+
+        // Yield every batch to let other DB operations through
+        if batch_count >= BATCH_SIZE {
+            batch_count = 0;
+            tokio::task::yield_now().await;
+        }
     }
 
+    // Delete orphans using the pool (single query)
     let deleted = crate::db::media::delete_orphans(pool, folder_id, &existing_paths).await?;
     if deleted > 0 {
         info!("Deleted {} orphan records from folder {}", deleted, folder_id);

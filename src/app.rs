@@ -3,7 +3,6 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
 
 use crate::config::{Config, FolderConfig};
 use crate::db;
@@ -32,7 +31,7 @@ pub enum ToastLevel {
 
 pub struct AkashaApp {
     pub config: Config,
-    pub pool: Arc<Mutex<SqlitePool>>,
+    pub pool: Arc<SqlitePool>,
     pub rt: Arc<Runtime>,
     pub thumbnailer: Thumbnailer,
 
@@ -42,7 +41,8 @@ pub struct AkashaApp {
     pub media_items: Vec<db::media::MediaFile>,
     pub textures: HashMap<String, egui::TextureHandle>,
     pub pending_thumbnails: HashSet<String>,
-    pub thumbnail_queue: VecDeque<String>,
+    pub thumbnail_queue: VecDeque<(usize, String)>,
+    pub queued_indices: HashSet<usize>,
     pub scroll_offset: f32,
     pub thumbnail_epoch: u64,
     pub scan_status: String,
@@ -50,6 +50,8 @@ pub struct AkashaApp {
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
     pub thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
+    pub media_tx: std::sync::mpsc::Sender<Result<Vec<db::media::MediaFile>, String>>,
+    pub media_rx: std::sync::mpsc::Receiver<Result<Vec<db::media::MediaFile>, String>>,
 
     // Viewer state
     pub viewer_open: bool,
@@ -83,11 +85,12 @@ impl AkashaApp {
         );
         let thumbnailer = Thumbnailer::new(config.ui.thumbnail_size, cache_mode);
 
-        let pool_arc = Arc::new(Mutex::new(pool));
+        let pool_arc = Arc::new(pool);
         let rt_arc = Arc::new(rt);
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
+        let (media_tx, media_rx) = std::sync::mpsc::channel::<Result<Vec<db::media::MediaFile>, String>>();
 
         // Clone for background scan task
         let pool_clone = Arc::clone(&pool_arc);
@@ -95,13 +98,12 @@ impl AkashaApp {
         let folders_config: Vec<FolderConfig> = config.folders.clone();
 
         rt_clone.spawn(async move {
-            let pool = pool_clone.lock().await;
             for folder_cfg in &folders_config {
                 let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
 
                 let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
                 match db::folder::insert_or_get(
-                    &*pool,
+                    &pool_clone,
                     &folder_cfg.path,
                     folder_cfg.recursive,
                     &folder_cfg.blacklist,
@@ -112,7 +114,7 @@ impl AkashaApp {
                     Ok(folder_id) => {
                         let path = std::path::Path::new(&folder_cfg.path);
                         match crate::scanner::scan_folder(
-                            &*pool,
+                            &pool_clone,
                             folder_id,
                             path,
                             folder_cfg.recursive,
@@ -155,6 +157,7 @@ impl AkashaApp {
             textures: HashMap::new(),
             pending_thumbnails: HashSet::new(),
             thumbnail_queue: VecDeque::new(),
+            queued_indices: HashSet::new(),
             scroll_offset: 0.0,
             thumbnail_epoch: 0,
             scan_status: "Initializing...".to_string(),
@@ -162,6 +165,8 @@ impl AkashaApp {
             scan_rx,
             thumbnail_tx: thumb_tx,
             thumbnail_rx,
+            media_tx,
+            media_rx,
             viewer_open: false,
             viewer_index: None,
             viewer_texture: None,
@@ -180,31 +185,42 @@ impl AkashaApp {
     fn refresh_folders_blocking(&mut self) {
         let pool = Arc::clone(&self.pool);
         match self.rt.block_on(async move {
-            let p = pool.lock().await;
-            db::folder::list_all(&*p).await
+            db::folder::list_all(&pool).await
         }) {
             Ok(folders) => self.folders = folders,
             Err(e) => self.scan_status = format!("Failed to load folders: {e}"),
         }
     }
 
-    fn refresh_media_blocking(&mut self) {
+    fn refresh_media_async(&mut self) {
         if let Some(idx) = self.selected_folder {
             if let Some(folder) = self.folders.get(idx) {
                 let folder_id = folder.id;
                 let pool = Arc::clone(&self.pool);
-                match self.rt.block_on(async move {
-                    let p = pool.lock().await;
-                    db::media::list_by_folder(&*p, folder_id).await
-                }) {
-                    Ok(items) => {
-                        self.media_items = items;
-                        // Clear pending for items no longer visible
-                        self.pending_thumbnails.clear();
-                        self.thumbnail_queue.clear();
-                        self.scroll_offset = 0.0;
-                    }
-                    Err(e) => self.scan_status = format!("Failed to load media: {e}"),
+                let tx = self.media_tx.clone();
+                self.scan_status = "Loading images...".to_string();
+                self.media_items.clear();
+                self.pending_thumbnails.clear();
+                self.thumbnail_queue.clear();
+                self.queued_indices.clear();
+                self.scroll_offset = 0.0;
+                self.rt.spawn(async move {
+                    let result = db::media::list_by_folder(&pool, folder_id).await;
+                    let _ = tx.send(result.map_err(|e| e.to_string()));
+                });
+            }
+        }
+    }
+
+    fn poll_media_events(&mut self) {
+        if let Ok(result) = self.media_rx.try_recv() {
+            match result {
+                Ok(items) => {
+                    self.media_items = items;
+                    self.scan_status = format!("{} images", self.media_items.len());
+                }
+                Err(e) => {
+                    self.scan_status = format!("Failed to load media: {e}");
                 }
             }
         }
@@ -224,7 +240,7 @@ impl AkashaApp {
                     self.scan_status = format!("Done scanning {path}: {count} files");
                     self.is_scanning = false;
                     self.refresh_folders_blocking();
-                    self.refresh_media_blocking();
+                    self.refresh_media_async();
                 }
                 ScanEvent::Error(path, err) => {
                     self.scan_status = format!("Error scanning {path}: {err}");
@@ -262,47 +278,36 @@ impl AkashaApp {
         if cols == 0 || self.media_items.is_empty() {
             return;
         }
-        let rows = (self.media_items.len() + cols - 1) / cols;
         let first_visible_row = (self.scroll_offset / THUMB_CELL_HEIGHT).floor() as usize;
         let last_visible_row = ((self.scroll_offset + viewport_height) / THUMB_CELL_HEIGHT).ceil() as usize;
-        let first_visible = first_visible_row.saturating_sub(1) * cols;
-        let last_visible = ((last_visible_row + 1) * cols).min(self.media_items.len());
+        // Prefetch 5 rows above and below the viewport (small fixed window)
+        let prefetch_rows = 5;
+        let start_idx = first_visible_row.saturating_sub(prefetch_rows) * cols;
+        let end_idx = ((last_visible_row + prefetch_rows) * cols).min(self.media_items.len());
 
-        // Build a prioritized list: visible first, then nearby, then rest
         let mut to_queue = Vec::new();
-        for i in first_visible..last_visible {
+        for i in start_idx..end_idx {
             let hash = &self.media_items[i].blake3_hash;
             if !self.textures.contains_key(hash)
                 && !self.pending_thumbnails.contains(hash)
-                && !self.thumbnail_queue.contains(hash)
+                && !self.queued_indices.contains(&i)
             {
-                to_queue.push((i, hash.clone(), 0usize)); // priority 0 = visible
-            }
-        }
-        // Nearby items (one screen worth above and below)
-        let nearby_start = first_visible.saturating_sub(rows * cols);
-        let nearby_end = (last_visible + rows * cols).min(self.media_items.len());
-        for i in nearby_start..nearby_end {
-            if i >= first_visible && i < last_visible {
-                continue; // already queued
-            }
-            let hash = &self.media_items[i].blake3_hash;
-            if !self.textures.contains_key(hash)
-                && !self.pending_thumbnails.contains(hash)
-                && !self.thumbnail_queue.contains(hash)
-            {
-                let dist = if i < first_visible {
-                    first_visible - i
+                let row = i / cols;
+                let dist = if row < first_visible_row {
+                    first_visible_row - row
+                } else if row > last_visible_row {
+                    row - last_visible_row
                 } else {
-                    i - last_visible
+                    0
                 };
                 to_queue.push((i, hash.clone(), dist));
             }
         }
 
         to_queue.sort_by_key(|(_, _, dist)| *dist);
-        for (_, hash, _) in to_queue {
-            self.thumbnail_queue.push_back(hash);
+        for (idx, hash, _) in to_queue {
+            self.queued_indices.insert(idx);
+            self.thumbnail_queue.push_back((idx, hash));
         }
     }
 
@@ -313,15 +318,16 @@ impl AkashaApp {
         }
 
         for _ in 0..can_spawn {
-            let Some(hash) = self.thumbnail_queue.pop_front() else {
+            let Some((idx, hash)) = self.thumbnail_queue.pop_front() else {
                 break;
             };
+            self.queued_indices.remove(&idx);
             // Double-check it's still needed
             if self.textures.contains_key(&hash) || self.pending_thumbnails.contains(&hash) {
                 continue;
             }
 
-            let Some(media) = self.media_items.iter().find(|m| m.blake3_hash == hash) else {
+            let Some(media) = self.media_items.get(idx) else {
                 continue;
             };
 
@@ -518,6 +524,7 @@ impl AkashaApp {
                         self.textures.clear();
                         self.pending_thumbnails.clear();
                         self.thumbnail_queue.clear();
+                        self.queued_indices.clear();
                         self.thumbnail_epoch += 1;
                         if let Err(e) = self.config.save() {
                             self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
@@ -553,14 +560,13 @@ impl AkashaApp {
 
         let rt = Arc::clone(&self.rt);
         rt.spawn(async move {
-            let pool = pool_clone.lock().await;
             for folder_cfg in &folders_config {
                 let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
                 let path = std::path::Path::new(&folder_cfg.path);
                 let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
 
                 match db::folder::insert_or_get(
-                    &*pool,
+                    &pool_clone,
                     &folder_cfg.path,
                     folder_cfg.recursive,
                     &folder_cfg.blacklist,
@@ -570,7 +576,7 @@ impl AkashaApp {
                 {
                     Ok(folder_id) => {
                         match crate::scanner::scan_folder(
-                            &*pool,
+                            &pool_clone,
                             folder_id,
                             path,
                             folder_cfg.recursive,
@@ -607,6 +613,7 @@ impl AkashaApp {
 impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
+        self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
         self.process_thumbnail_queue();
@@ -662,7 +669,7 @@ impl eframe::App for AkashaApp {
                     }
                     if let Some(idx) = clicked_idx {
                         self.selected_folder = Some(idx);
-                        self.refresh_media_blocking();
+                        self.refresh_media_async();
                     }
                 }
             });
