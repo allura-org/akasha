@@ -341,7 +341,11 @@ fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>
 
     // Dimensions & format
     let reader = image::ImageReader::open(path)?;
-    let format = reader.format().map(|f| format!("{:?}", f).to_lowercase());
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
+    let format = reader
+        .format()
+        .map(|f| format!("{:?}", f).to_lowercase())
+        .or(ext);
     let (width, height) = reader.into_dimensions().ok().unzip();
 
     Ok((hash, width, height, format))
