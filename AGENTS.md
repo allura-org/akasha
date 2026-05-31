@@ -82,7 +82,9 @@ cargo test
 6. On startup, check each configured folder:
    - If missing or `scan_complete = false` → scan it
    - If `scan_complete = true` → skip
-7. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
+7. During a scan, the scanner uses an **mtime + size fast path** to skip unchanged files without re-hashing them. Only files whose `modified_at` or `file_size` differ from the DB record (or whose `format` is missing) are hashed and upserted.
+8. Changed files are written to the DB in **batches of 500** wrapped in explicit transactions, rather than one implicit transaction per file.
+9. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
 
 ---
 
@@ -136,7 +138,7 @@ Migrations live in `migrations/` and are embedded at compile time.
 - `blake3_hash`, `width`, `height`, `format`, `file_size`, `modified_at`
 - `created_at`
 - Unique on `(folder_id, relative_path)`
-- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id)
+- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at)
 
 ### Notes
 - `blacklist` is stored as a JSON string and deserialized via `serde_json`.

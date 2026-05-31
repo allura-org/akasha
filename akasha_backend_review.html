@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Akasha Backend Review — Scanner &amp; Database</title>
+    <style>
+        :root {
+            --bg: #f7f7f5;
+            --fg: #1a1a1a;
+            --muted: #5a5a5a;
+            --accent: #2b6cb0;
+            --accent-bg: #ebf4ff;
+            --good: #276749;
+            --good-bg: #f0fff4;
+            --warn: #c05621;
+            --warn-bg: #fffaf0;
+            --bad: #c53030;
+            --bad-bg: #fff5f5;
+            --border: #e2e2e0;
+            --code-bg: #f0f0ee;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #1a1a1a;
+                --fg: #e8e6e3;
+                --muted: #a0a0a0;
+                --accent: #63b3ed;
+                --accent-bg: #2a3f54;
+                --good: #68d391;
+                --good-bg: #1c3329;
+                --warn: #f6ad55;
+                --warn-bg: #3d2a1a;
+                --bad: #fc8181;
+                --bad-bg: #3d1f1f;
+                --border: #333331;
+                --code-bg: #2a2a28;
+            }
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.65;
+            max-width: 880px;
+            margin: 0 auto;
+            padding: 2.5rem 1.5rem;
+            background: var(--bg);
+            color: var(--fg);
+        }
+        h1 { font-size: 1.9rem; margin-bottom: 0.2rem; }
+        h2 { font-size: 1.35rem; margin-top: 2.2rem; padding-bottom: 0.3rem; border-bottom: 2px solid var(--border); }
+        h3 { font-size: 1.1rem; margin-top: 1.6rem; color: var(--accent); }
+        h4 { font-size: 0.95rem; margin-top: 1.2rem; margin-bottom: 0.3rem; }
+        .subtitle { color: var(--muted); font-size: 0.95rem; margin-bottom: 1.5rem; }
+        .meta { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }
+
+        .badge {
+            display: inline-block;
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            margin-right: 0.4rem;
+        }
+        .badge-good { background: var(--good-bg); color: var(--good); }
+        .badge-warn { background: var(--warn-bg); color: var(--warn); }
+        .badge-bad { background: var(--bad-bg); color: var(--bad); }
+        .badge-info { background: var(--accent-bg); color: var(--accent); }
+
+        .callout {
+            border-left: 4px solid var(--border);
+            padding: 0.8rem 1rem;
+            margin: 1rem 0;
+            background: rgba(127,127,127,0.04);
+            border-radius: 0 6px 6px 0;
+        }
+        .callout-good { border-left-color: var(--good); background: var(--good-bg); }
+        .callout-warn { border-left-color: var(--warn); background: var(--warn-bg); }
+        .callout-bad { border-left-color: var(--bad); background: var(--bad-bg); }
+        .callout-info { border-left-color: var(--accent); background: var(--accent-bg); }
+
+        code, pre {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.88em;
+            background: var(--code-bg);
+            padding: 0.1em 0.35em;
+            border-radius: 4px;
+        }
+        pre { padding: 0.8rem 1rem; overflow-x: auto; line-height: 1.5; }
+        pre code { padding: 0; background: none; }
+
+        table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.92rem; }
+        th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--border); }
+        th { font-weight: 600; color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
+
+        ul { padding-left: 1.3rem; }
+        li { margin-bottom: 0.35rem; }
+
+        .steelman { font-style: italic; color: var(--muted); border-left: 3px solid var(--border); padding-left: 0.8rem; margin: 0.6rem 0; }
+
+        .procon { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 0.8rem 0; }
+        .procon > div { padding: 0.7rem 0.9rem; border-radius: 6px; }
+        .procon .pro { background: var(--good-bg); }
+        .procon .con { background: var(--bad-bg); }
+        .procon h5 { margin: 0 0 0.4rem; font-size: 0.8rem; text-transform: uppercase; }
+        .procon .pro h5 { color: var(--good); }
+        .procon .con h5 { color: var(--bad); }
+        .procon ul { margin: 0; padding-left: 1.1rem; }
+        .procon li { font-size: 0.9rem; }
+
+        .severity { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+        .sev-high { background: var(--bad); }
+        .sev-med { background: var(--warn); }
+        .sev-low { background: var(--accent); }
+    </style>
+</head>
+<body>
+
+<h1>Akasha Backend Review</h1>
+<div class="subtitle">Scanner &amp; Database — Performance, Stability, and Scalability Assessment</div>
+<div class="meta">Review date: 2026-05-31 &nbsp;|&nbsp; Scope: <code>src/scanner.rs</code>, <code>src/db/</code>, schema migrations, and supporting infrastructure</div>
+
+<div class="callout callout-info">
+    <strong>Mandate reminder:</strong> Nothing is off the table for redesign or refactoring. The user's collection is on the order of <strong>~424,000 items</strong> across many subfolders. Akasha must be faster than a JSON-instead-of-DB approach by as wide a margin as feasible, and must avoid full database rebuilds wherever possible — especially once classifiers and semantic search are layered on top.
+</div>
+
+<h2>1. Executive Summary</h2>
+
+<p>Akasha's backend is <strong>architecturally sound for an MVP</strong> but contains several design decisions that will become painful — some severely — at the target scale. The developer has made genuinely good calls on WAL mode, async/UI separation, and per-subfolder resume logic. However, the scanner is effectively <strong>single-threaded for I/O</strong>, issues <strong>one database round-trip per file</strong>, and loads <strong>entire folder trees into memory</strong> without pagination. At 424k items, these choices compound into a scanner that could take hours instead of minutes, and a UI that stutters or OOMs when the user opens a large root folder.</p>
+
+<p>The good news: most of these are <strong>local, fixable problems</strong> rather than fundamental architectural flaws. The database schema is clean, the self-referencing folder tree is the right abstraction, and the separation of concerns between <code>db::media</code>, <code>db::folder</code>, and <code>scanner</code> gives you room to operate.</p>
+
+<table>
+    <tr><th>Category</th><th>Verdict</th><th>Severity</th></tr>
+    <tr><td>Scanner throughput</td><td>Under-utilizes multicore + fast storage</td><td><span class="severity sev-high"></span> High</td></tr>
+    <tr><td>Database write efficiency</td><td>Per-row UPSERTs, no true batching</td><td><span class="severity sev-high"></span> High</td></tr>
+    <tr><td>Memory scaling</td><td>Loads entire result sets into Vecs</td><td><span class="severity sev-high"></span> High</td></tr>
+    <tr><td>Resumability / robustness</td><td>Per-subfolder <code>scan_complete</code> is well-designed</td><td><span class="severity sev-low"></span> Low (good)</td></tr>
+    <tr><td>Incremental updates</td><td>Not implemented yet (<code>notify</code> present but unused)</td><td><span class="severity sev-med"></span> Medium</td></tr>
+    <tr><td>Schema extensibility</td><td>Clean additive migration strategy</td><td><span class="severity sev-low"></span> Low (good)</td></tr>
+</table>
+
+<h2>2. What's Being Done Well</h2>
+
+<h3><span class="badge badge-good">Good</span> WAL Mode + Async/UI Separation</h3>
+<p>The pool is initialized with <code>journal_mode = WAL</code> and a 5-second busy timeout. This is exactly right: readers (the UI, thumbnail loader) are not blocked by the scanner's writes. Combined with channel-based communication back to the UI thread, the app remains responsive during scans.</p>
+<div class="steelman">
+    <strong>Steelman:</strong> The developer correctly identified that a frozen UI is worse than a slow scan. WAL + async tasks is a disciplined, production-grade foundation for a single-developer project.
+</div>
+
+<h3><span class="badge badge-good">Good</span> Per-Subfolder <code>scan_complete</code> Resume Logic</h3>
+<p>The scanner skips already-complete subdirectories via <code>filter_entry</code>, marks directories complete on exit, and performs per-folder orphan cleanup rather than root-wide deletion. This means a crash or cancellation mid-scan is recoverable without starting over.</p>
+<div class="steelman">
+    <strong>Steelman:</strong> For a library measured in hundreds of thousands of files, a full rescan from scratch is unacceptable. The dir-stack tracking is a clever, lightweight way to get resume semantics without a complex job queue or persistent work log.
+</div>
+
+<h3><span class="badge badge-good">Good</span> Relative Paths + Blake3 Hashing</h3>
+<p>Storing <code>relative_path</code> alongside <code>absolute_path</code> provides portability if root paths move. Blake3 is fast, verified, and the index on <code>blake3_hash</code> enables deduplication lookups. The <code>UNIQUE(folder_id, relative_path)</code> constraint is the correct natural key.</p>
+<div class="steelman">
+    <strong>Steelman:</strong> These choices show the developer is thinking about data integrity and future features (e.g., "find duplicates") rather than just getting pixels on screen.
+</div>
+
+<h3><span class="badge badge-good">Good</span> Additive Migration Strategy</h3>
+<p>Schema changes so far have been <code>ALTER TABLE ... ADD COLUMN</code> operations with sensible defaults. This is the correct long-term approach for a local database where the user cannot be expected to run manual migrations.</p>
+
+<h2>3. Critical Concerns</h2>
+
+<h3><span class="badge badge-bad">Critical</span> The Scanner is Effectively Single-Threaded</h3>
+<p>Inside <code>scan_folder</code>, the <code>for entry in walker</code> loop processes <strong>one file at a time</strong>. For each file that needs updating, it:</p>
+<ol>
+    <li><code>spawn_blocking</code> to hash + decode dimensions</li>
+    <li><code>await</code> the result</li>
+    <li>Issues a single UPSERT</li>
+    <li>Moves to the next file</li>
+</ol>
+<p>While the hashing runs on a blocking thread, the loop itself waits. There is no pipelining, no worker pool consuming a queue of files, and no parallel I/O. On a modern NVMe SSD with 16+ cores, you will be I/O-bound and CPU-idle for most of the scan.</p>
+
+<div class="steelman">
+    <strong>Steelman:</strong> Sequential processing avoids complexity around ordering, backpressure, and partial failure. For an MVP with small <code>test_imgs/</code> directories, it works fine. The developer may also have been cautious about SQLite write contention.
+</div>
+
+<div class="callout callout-bad">
+    <strong>Impact:</strong> At 424k items, even a fast Blake3 hash (~1 GB/s) and image header read can easily take 5–15 ms per file. Serially, that's <strong>35 minutes to 1.7 hours</strong> just for the mechanical work, before we even talk about the database. Parallelizing file I/O and hashing could drop this to <strong>under 5 minutes</strong> on fast storage.
+</div>
+
+<h3><span class="badge badge-bad">Critical</span> Per-File UPSERTs with No Write Batching</h3>
+<p>Every changed file executes a standalone <code>INSERT ... ON CONFLICT ... DO UPDATE</code>. SQLite WAL mode helps, but each statement is still a separate transaction boundary (implicit <code>BEGIN ... COMMIT</code>) unless wrapped in an explicit transaction. The code does not do this. At 424k files, that's 424k fsyncs or WAL checkpoints.</p>
+
+<div class="steelman">
+    <strong>Steelman:</strong> Individual UPSERTs provide fine-grained error isolation: one bad file doesn't roll back a batch of 1,000. The <code>yield_now()</code> every 1,000 files does give the async runtime a chance to interleave other work.
+</div>
+
+<div class="callout callout-bad">
+    <strong>Impact:</strong> SQLite on WAL can do ~1,000–10,000 transactions/sec on an NVMe drive, but implicit per-statement transactions are at the low end. 424k implicit transactions could take <strong>minutes to tens of minutes</strong> of pure DB overhead. Wrapping 1,000 UPSERTs in a single explicit transaction would speed this up by an order of magnitude.
+</div>
+
+<h3><span class="badge badge-bad">Critical</span> Entire Result Sets Loaded Into Memory</h3>
+<p>Both <code>list_by_folder</code> and <code>list_by_folder_recursive</code> call <code>.fetch_all()</code>, returning a <code>Vec&lt;MediaFile&gt;</code> that is then stored in <code>app.media_items</code>. The UI virtualizes rendering (only visible rows are drawn), but <strong>the Vec still holds every record</strong>. For 424k items at ~200 bytes each plus string allocations, that's well over <strong>100 MB of heap</strong> before thumbnails or textures.</p>
+
+<p>Similarly, the scanner bulk-loads <code>existing</code> media for the entire tree into a <code>HashMap&lt;String, (String, i64, Option&lt;String&gt;)&gt;</code>. For 424k entries, this HashMap alone could consume <strong>200–400 MB</strong>.</p>
+
+<div class="steelman">
+    <strong>Steelman:</strong> Keeping everything in memory simplifies the UI code dramatically — no pagination state, no cursors, no "load more" logic. For the MVP target of test directories with dozens of files, it's perfectly reasonable.
+</div>
+
+<div class="callout callout-bad">
+    <strong>Impact:</strong> Opening a large root folder will cause a noticeable pause (fetching 400k rows), memory pressure, and potential OOM on lower-RAM systems. It also increases GC pressure from frequent allocations during the query.
+</div>
+
+<h3><span class="badge badge-warn">High</span> <code>needs_update</code> Logic is Brittle and Ignores <code>modified_at</code></h3>
+<p>The current check is:</p>
+<pre><code>old_hash.is_empty() || *old_size as u64 != file_size || old_format.is_none()</code></pre>
+<p>This has three problems:</p>
+<ol>
+    <li><strong>No mtime comparison:</strong> <code>modified_at</code> is collected from disk but never used to skip unchanged files. It could short-circuit the vast majority of files.</li>
+    <li><strong>Same-size overwrite miss:</strong> If a file is modified in-place but happens to end up with the same byte count, it is silently ignored.</li>
+    <li><strong>Metadata repair trap:</strong> Because the skip is based on hash/size/format, adding a new column (e.g., EXIF orientation, color profile) requires a <strong>full rescan</strong> to populate it for existing files. The backlog notes this explicitly.</li>
+</ol>
+
+<div class="steelman">
+    <strong>Steelman:</strong> Hash comparison is the most robust possible signal of content change. Mtime can lie (git checkouts, archive extractions, filesystem quirks). The developer prioritized correctness over speed, which is defensible for a data-hoarding audience who hates silent corruption.
+</div>
+
+<h3><span class="badge badge-warn">High</span> No Incremental / Live Updates</h3>
+<p>The <code>notify</code> and <code>notify-debouncer-full</code> crates are in <code>Cargo.toml</code> but completely unused. The only way to pick up new files is a full rescan (or restart if the folder is incomplete). Once a folder is marked <code>scan_complete = true</code>, it is invisible to the scanner until a manual rescan resets it.</p>
+
+<div class="steelman">
+    <strong>Steelman:</strong> File watchers add complexity: debouncing, cross-platform path normalization, rename detection, and handling directories that appear/disappear. The developer deliberately deferred this to Phase 7, which is a sensible roadmap decision.
+</div>
+
+<h3><span class="badge badge-warn">Medium</span> Thumbnail Cache is Global-or-Nothing</h3>
+<p><code>PerFolder</code> cache mode is defined but returns <code>None</code> (unimplemented). All thumbnails go into a single flat directory under <code>~/.cache/akasha/</code>. At scale, this creates a directory with hundreds of thousands of files, which can stress filesystem metadata operations.</p>
+
+<h3><span class="badge badge-warn">Medium</span> <code>delete_orphans_for_root</code> is Dead, Buggy Code</h3>
+<p>The function exists in <code>db/media.rs</code> but is no longer called. The comment in <code>SESSION_NOTES.md</code> correctly notes it only matches direct children, not all descendants via CTE. Dead code with known bugs is technical debt.</p>
+
+<h2>4. Recommendations</h2>
+
+<h3>Rec 1: Implement True Batch Transactions in the Scanner</h3>
+<p>Wrap chunks of UPSERTs in explicit <code>BEGIN ... COMMIT</code> transactions. SQLite can absorb thousands of rows per transaction with minimal overhead.</p>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>10–50× faster writes on the same hardware</li>
+            <li>Minimal code change — add <code>begin()</code> / <code>commit()</code> around the loop</li>
+            <li>WAL mode handles concurrent readers gracefully during the transaction</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>A panic/crash during a batch loses the whole batch (acceptable for a resumable scan)</li>
+            <li>One bad row could theoretically fail the whole batch unless handled with savepoints</li>
+        </ul>
+    </div>
+</div>
+
+<h3>Rec 2: Parallelize File Discovery + Hashing with a Worker Pool</h3>
+<p>Replace the sequential loop with a bounded producer/consumer pipeline:</p>
+<pre><code>walkdir (producer) → bounded channel → N workers (hash + dimension) → bounded channel → DB inserter (batch commits)</code></pre>
+<p>The inserter task collects results and flushes a batch every N rows or every M milliseconds. Use <code>tokio::sync::mpsc</code> or <code>crossbeam_channel</code> depending on whether you want the workers to be <code>spawn_blocking</code> or plain OS threads.</p>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>Saturates both NVMe IOPS and CPU cores</li>
+            <li>Natural backpressure via bounded channels</li>
+            <li>Decouples I/O rate from DB commit rate</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>More moving parts: channel closures, backpressure handling, ordered vs unordered results</li>
+            <li>Order of DB inserts is no longer deterministic (usually fine)</li>
+            <li>More complex error propagation</li>
+        </ul>
+    </div>
+</div>
+
+<h3>Rec 3: Add Mtime-Based Fast Path + Schema Versioning Column</h3>
+<p>Change <code>needs_update</code> to:</p>
+<ol>
+    <li>Compare <code>modified_at</code> and <code>file_size</code> first. If both match, skip.</li>
+    <li>If they differ, hash and upsert.</li>
+    <li>Add a <code>schema_version INTEGER</code> column to <code>media_files</code>. When a new metadata field is added, increment the app's schema version and re-scan files where <code>schema_version &lt; current</code> <strong>without</strong> requiring a full hash.</li>
+</ol>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>Eliminates hashing for ~99% of unchanged files</li>
+            <li>Schema version allows targeted metadata backfills without full rescans</li>
+            <li>Still robust: size+mtime mismatch triggers full verification</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>Mtime can be unreliable on some filesystems or after restores</li>
+            <li>Requires storing <code>modified_at</code> as a first-class versioning signal, not just audit info</li>
+        </ul>
+    </div>
+</div>
+
+<h3>Rec 4: Implement Cursor-Based Pagination for Media Lists</h3>
+<p>Replace <code>.fetch_all()</code> with <code>LIMIT</code> / <code>OFFSET</code> or (better) cursor-based pagination keyed by <code>rowid</code> or <code>(folder_id, relative_path)</code>. The UI already virtualizes rendering — it just needs the data layer to match.</p>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>Constant memory regardless of folder size</li>
+            <li>Faster initial load (first page appears instantly)</li>
+            <li>Enables infinite scroll or large-list survival</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>Complicates "jump to index" and random-access navigation (viewer prev/next across pages)</li>
+            <li>Thumbnail prefetching needs to work across page boundaries</li>
+        </ul>
+    </div>
+</div>
+
+<h3>Rec 5: Implement the <code>notify</code> File Watcher (Phase 7, but Sooner)</h3>
+<p>Integrate <code>notify-debouncer-full</code> to watch configured roots. On events:</p>
+<ul>
+    <li><strong>Create/Modify:</strong> Process the single file through a fast path (no walkdir)</li>
+    <li><strong>Delete/Rename:</strong> Remove or update the DB record directly</li>
+    <li><strong>New directory:</strong> Mark parent incomplete and queue a targeted scan of just that subtree</li>
+</ul>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>Eliminates the need for periodic full rescans</li>
+            <li>Makes the app feel "alive" — new downloads appear automatically</li>
+            <li>Dramatically reduces wear on large spinning-rust archives</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>Platform-specific edge cases (network mounts, FUSE, bind mounts)</li>
+            <li>Needs careful debouncing and coalescing</li>
+            <li>Watcher descriptors can be resource-intensive at extreme scale</li>
+        </ul>
+    </div>
+</div>
+
+<h3>Rec 6: Shard the Thumbnail Cache</h3>
+<p>Instead of <code>{hash}_{size}.webp</code> in one flat directory, use a two-level prefix: <code>{hash[0..2]}/{hash[2..4]}/{hash}_{size}.webp</code>. This keeps any single directory under ~65k entries. Also implement the <code>PerFolder</code> cache mode for users who keep media on external drives and want the cache colocated.</p>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>Prevents filesystem metadata bottlenecks</li>
+            <li>Trivial to implement; no schema changes</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>Harder to manually browse the cache directory (who does this?)</li>
+        </ul>
+    </div>
+</div>
+
+<h3>Rec 7: Introduce a <code>scan_queue</code> Table for Robust Resume</h3>
+<p>Replace the implicit dir-stack resume with an explicit work queue:</p>
+<pre><code>CREATE TABLE scan_queue (
+    id INTEGER PRIMARY KEY,
+    folder_id INTEGER NOT NULL REFERENCES folders(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','running','complete','failed')),
+    started_at DATETIME,
+    completed_at DATETIME
+);</code></pre>
+<p>On startup, populate pending entries for any folder where <code>scan_complete = false</code>. A background task drains the queue. This makes resume crash-proof and enables parallel scanning of unrelated roots.</p>
+<div class="procon">
+    <div class="pro">
+        <h5>Pros</h5>
+        <ul>
+            <li>Crash at any point → restart picks up exactly where it left off</li>
+            <li>Enables parallel scanning of multiple roots</li>
+            <li>Visible in UI: "3 of 47 folders remaining"</li>
+            <li>Foundation for future background jobs (classifier inference, transcoding)</li>
+        </ul>
+    </div>
+    <div class="con">
+        <h5>Cons</h5>
+        <ul>
+            <li>More schema and state to manage</li>
+            <li>Overkill if the app remains single-user/single-process forever</li>
+        </ul>
+    </div>
+</div>
+
+<h2>5. Database Schema Observations</h2>
+
+<h3>Missing Indexes</h3>
+<table>
+    <tr><th>Column(s)</th><th>Rationale</th><th>Priority</th></tr>
+    <tr><td><code>modified_at</code></td><td>Fast path for skipping unchanged files during scans</td><td>High</td></tr>
+    <tr><td><code>(folder_id, relative_path)</code></td><td>Covering index for orphan checks and list_by_folder</td><td>High</td></tr>
+    <tr><td><code>format</code></td><td>Filtering by type ("show only GIFs")</td><td>Low</td></tr>
+    <tr><td><code>width, height</code></td><td>Range queries ("images larger than 4K")</td><td>Low</td></tr>
+</table>
+
+<h3>Column Type Notes</h3>
+<p><code>file_size</code> and dimensions are stored as <code>INTEGER</code> (maps to <code>i64</code> in sqlx). This is fine — SQLite has no unsigned type. The conversion noise at the Rust boundary is minor and already handled. However, consider adding <code>CHECK(file_size &gt;= 0)</code> if you want to catch bugs early.</p>
+
+<h3>FTS5 and Vector Tables (Future)</h3>
+<p>The roadmap mentions FTS5 for text search and either <code>sqlite-vec</code> or in-memory HNSW for vector search. If you stay with SQLite (recommended for single-file portability), adding these as virtual tables in a migration is straightforward. Do it <strong>before</strong> the first 424k-item scan so you don't have to backfill.</p>
+
+<h2>6. Strategic Remarks</h2>
+
+<h3>On "Faster Than JSON"</h3>
+<p>Currently, Akasha's DB is <strong>not yet faster than a well-designed JSON/metadata approach</strong> for the narrow case of "read all files in a folder." A flat JSONL file with an in-memory HashMap would beat SQLite on raw read throughput for small-to-medium folders because it avoids query parsing and row deserialization. Where SQLite wins — and where Akasha must lean into it — is:</p>
+<ul>
+    <li><strong>Indexed lookups</strong> (find by hash, find duplicates)</li>
+    <li><strong>Complex filtering</strong> (recursive CTEs, tag intersections, vector similarity)</li>
+    <li><strong>Partial reads</strong> (pagination, not loading the whole world)</li>
+    <li><strong>Concurrent access</strong> (thumbnail cache hits during scan writes)</li>
+</ul>
+<p>To justify the SQLite dependency, you need to start using these capabilities. Add pagination. Add fast-path mtime queries. Plan for FTS5. Otherwise you are carrying database overhead without getting database benefits.</p>
+
+<h3>On Single-Developer Nimbleness</h3>
+<p>Most of the recommendations above (batch transactions, mtime fast path, cache sharding) are <strong>under 50 lines each</strong>. The worker pool is the largest change, but even that is a refactor of one function, not an architectural rewrite. The codebase is small and well-factored enough that aggressive changes are still cheap. Do them now, before the Searchables layer is built on top.</p>
+
+<h3>On the Searchables Layer</h3>
+<p>The planned <code>searchables</code> table with <code>value_json</code> is fine for prototyping, but JSON is slow for filtering and useless for indexing. When you get there:</p>
+<ul>
+    <li>Use <strong>native columns</strong> for common scalar values (confidence, label)</li>
+    <li>Use <strong>FTS5</strong> for text descriptions and tags</li>
+    <li>Use <strong>sqlite-vec</strong> or a dedicated vector column for embeddings</li>
+    <li>Consider a <code>media_searchables</code> junction table if you need many-to-many</li>
+</ul>
+<p>Most importantly: <strong>run inference during scan, not on demand</strong>. When the scanner inserts a new media file, immediately enqueue it for classification. This amortizes cost and means search results are instant.</p>
+
+<h3>On Video Support</h3>
+<p>The <code>process_file</code> function uses <code>image::ImageReader</code>, which will fail on video files. When video support arrives, the scanner will need to probe files without decoding full frames. Consider using <code>ffprobe</code>-style metadata extraction (via <code>ffmpeg-next</code> or shelling out) rather than trying to decode videos through the image crate. The <code>format</code> column should be populated from the file extension as a fallback, which the code already does for HEIF.</p>
+
+<h2>7. Prioritized Action List</h2>
+
+<table>
+    <tr><th>Priority</th><th>Action</th><th>Effort</th><th>Impact</th></tr>
+    <tr><td>P0</td><td>Wrap scanner UPSERTs in explicit transactions (batch size 500–1000)</td><td>Low</td><td>Huge</td></tr>
+    <tr><td>P0</td><td>Use <code>modified_at</code> + <code>file_size</code> for <code>needs_update</code> fast path</td><td>Low</td><td>Huge</td></tr>
+    <tr><td>P1</td><td>Parallelize file hashing with a bounded worker pool</td><td>Medium</td><td>Huge</td></tr>
+    <tr><td>P1</td><td>Add pagination (<code>LIMIT/OFFSET</code> or cursor) to media queries</td><td>Medium</td><td>High</td></tr>
+    <tr><td>P1</td><td>Shard thumbnail cache by hash prefix</td><td>Low</td><td>Medium</td></tr>
+    <tr><td>P2</td><td>Implement <code>notify</code> watcher for incremental updates</td><td>Medium</td><td>High</td></tr>
+    <tr><td>P2</td><td>Add <code>schema_version</code> column for targeted metadata backfills</td><td>Low</td><td>Medium</td></tr>
+    <tr><td>P2</td><td>Remove or fix <code>delete_orphans_for_root</code></td><td>Trivial</td><td>Low</td></tr>
+    <tr><td>P3</td><td>Introduce <code>scan_queue</code> table for robust resume + parallel roots</td><td>Medium</td><td>Medium</td></tr>
+</table>
+
+<h2>8. Closing Thoughts</h2>
+
+<p>Akasha's backend is <strong>good MVP work</strong> with a few sharp edges that will cut deeply at scale. The developer has clearly thought about resumability, data integrity, and UI responsiveness — the hard problems are identified correctly. The remaining work is mostly <strong>mechanical optimization</strong>: batching, parallelism, and pagination. None of it requires throwing away the schema or the architecture.</p>
+
+<p>The most important thing to do <strong>before</strong> building Searchables is to fix the scanner's throughput. If classification is layered on top of a scanner that takes an hour to walk 424k files, the user experience will be miserable regardless of how clever the AI models are. A fast, incremental, resumable scanner is the foundation everything else rests on.</p>
+
+<p>Fix the batching and the mtime fast path first. They're low-effort, high-impact, and they set the tone for the rest of the backend.</p>
+
+</body>
+</html>

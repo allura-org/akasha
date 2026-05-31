@@ -93,25 +93,25 @@ pub async fn scan_folder(
     info!("Found {} complete subfolders to skip", complete_subfolders.len());
 
     // Bulk-load existing files for the ENTIRE tree under this root (recursive CTE)
-    let existing: HashMap<String, (String, i64, Option<String>)> = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
+    let existing: HashMap<String, (String, i64, Option<chrono::NaiveDateTime>, Option<String>)> = sqlx::query_as::<_, (String, String, i64, Option<chrono::NaiveDateTime>, Option<String>)>(
         "WITH RECURSIVE subtree(id) AS (
             SELECT ?1
             UNION ALL
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
         )
-        SELECT relative_path, blake3_hash, file_size, format FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
+        SELECT relative_path, blake3_hash, file_size, modified_at, format FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
     )
     .bind(root_folder_id)
     .fetch_all(pool)
     .await?
     .into_iter()
-    .map(|(path, hash, size, format)| (path, (hash, size, format)))
+    .map(|(path, hash, size, mtime, format)| (path, (hash, size, mtime, format)))
     .collect();
 
     let mut folder_paths: HashMap<i64, Vec<String>> = HashMap::new();
     let mut scanned_count = 0usize;
-    let mut batch_count = 0usize;
-    const BATCH_SIZE: usize = 1000;
+    let mut pending: Vec<PendingUpsert> = Vec::new();
+    const UPSERT_BATCH_SIZE: usize = 500;
 
     // Track directories currently being walked; mark them complete when we leave them
     let mut dir_stack: Vec<(std::path::PathBuf, i64)> = Vec::new();
@@ -232,8 +232,10 @@ pub async fn scan_folder(
 
         // Check if file changed since last scan (in-memory, O(1))
         let needs_update = match existing.get(&relative_path) {
-            Some((old_hash, old_size, old_format)) => {
-                old_hash.is_empty() || *old_size as u64 != file_size || old_format.is_none()
+            Some((_old_hash, old_size, old_modified_at, old_format)) => {
+                let size_matches = *old_size as u64 == file_size;
+                let mtime_matches = *old_modified_at == modified_at;
+                !(size_matches && mtime_matches && old_format.is_some())
             }
             None => true,
         };
@@ -260,34 +262,19 @@ pub async fn scan_folder(
             }
         };
 
-        // Upsert via the pool (WAL mode allows concurrent reads)
-        sqlx::query(
-            "INSERT INTO media_files
-             (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(folder_id, relative_path) DO UPDATE SET
-                 absolute_path = excluded.absolute_path,
-                 blake3_hash = excluded.blake3_hash,
-                 width = excluded.width,
-                 height = excluded.height,
-                 format = excluded.format,
-                 file_size = excluded.file_size,
-                 modified_at = excluded.modified_at"
-        )
-        .bind(folder_id)
-        .bind(&relative_path)
-        .bind(&absolute_path)
-        .bind(&hash)
-        .bind(width.map(|v| v as i64))
-        .bind(height.map(|v| v as i64))
-        .bind(format.as_deref())
-        .bind(file_size as i64)
-        .bind(modified_at)
-        .execute(pool)
-        .await?;
+        pending.push(PendingUpsert {
+            folder_id,
+            relative_path,
+            absolute_path,
+            hash,
+            width,
+            height,
+            format,
+            file_size,
+            modified_at,
+        });
 
         scanned_count += 1;
-        batch_count += 1;
 
         // Send progress every 5000 files
         if scanned_count % 5000 == 0 {
@@ -299,9 +286,9 @@ pub async fn scan_folder(
             }
         }
 
-        // Yield every batch to let other DB operations through
-        if batch_count >= BATCH_SIZE {
-            batch_count = 0;
+        // Flush batch when full
+        if pending.len() >= UPSERT_BATCH_SIZE {
+            flush_batch(pool, &mut pending).await?;
             tokio::task::yield_now().await;
         }
     }
@@ -317,6 +304,11 @@ pub async fn scan_folder(
     }
     info!("Marked {} directories complete at end of scan", final_completions);
 
+    // Flush any remaining pending upserts
+    if !pending.is_empty() {
+        flush_batch(pool, &mut pending).await?;
+    }
+
     // Delete orphans per visited folder (avoids deleting files in skipped complete subtrees)
     for (folder_id, paths) in &folder_paths {
         let deleted = crate::db::media::delete_orphans(pool, *folder_id, paths).await?;
@@ -330,6 +322,58 @@ pub async fn scan_folder(
         scanned_count
     );
     Ok(scanned_count)
+}
+
+#[derive(Debug)]
+struct PendingUpsert {
+    folder_id: i64,
+    relative_path: String,
+    absolute_path: String,
+    hash: String,
+    width: Option<u32>,
+    height: Option<u32>,
+    format: Option<String>,
+    file_size: u64,
+    modified_at: Option<chrono::NaiveDateTime>,
+}
+
+async fn flush_batch(
+    pool: &sqlx::SqlitePool,
+    batch: &mut Vec<PendingUpsert>,
+) -> anyhow::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for item in batch.iter() {
+        sqlx::query(
+            "INSERT INTO media_files
+             (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(folder_id, relative_path) DO UPDATE SET
+                 absolute_path = excluded.absolute_path,
+                 blake3_hash = excluded.blake3_hash,
+                 width = excluded.width,
+                 height = excluded.height,
+                 format = excluded.format,
+                 file_size = excluded.file_size,
+                 modified_at = excluded.modified_at"
+        )
+        .bind(item.folder_id)
+        .bind(&item.relative_path)
+        .bind(&item.absolute_path)
+        .bind(&item.hash)
+        .bind(item.width.map(|v| v as i64))
+        .bind(item.height.map(|v| v as i64))
+        .bind(item.format.as_deref())
+        .bind(item.file_size as i64)
+        .bind(item.modified_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    batch.clear();
+    Ok(())
 }
 
 fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>, Option<String>)> {
