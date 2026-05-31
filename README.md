@@ -16,7 +16,6 @@ akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gall
 ## planned
 
 - killer feature: modular AI classification via a "Searchables" schema abstraction that combines classifiers, taggers, embedding models, VLMs, under one roof
-
 - file watcher
 - gallery-dl integration
 - videos
@@ -42,15 +41,17 @@ thankfully we live in the era of vibe-coding. so i slopped harder than ive ever 
 
 clone it and `cargo build` homeboy.
 
-### HEVC support (optional)
+### feature flags
 
-akasha supports HEVC-coded media via an optional Cargo feature flag (`hevc`).
+if u need an optional feature, use `--features <feature>, <feature>, etc...`
 
-Currently this enables **HEIF / HEIC images**. When video support lands, the same flag will enable **HEVC video in MP4 containers**.
+#### HEVC support
 
-HEVC is patent-encumbered, so decoding requires system libraries. The feature is off by default.
+`hevc`
 
-**Dependencies:**
+HEIC images, H.265 in MP4 (eventually), etc. HEVC is patent-encumbered, so instead of shipping a decoder ourselves we rely on system libraries.
+
+**dependencies:**
 
 - `libheif` >= 1.17.0
 - `libde265` (for HEVC decoding)
@@ -63,18 +64,6 @@ sudo apt install libheif-dev libde265-dev
 
 # Fedora
 sudo dnf install libheif-devel libde265-devel
-```
-
-**Build with HEVC support:**
-
-```bash
-cargo build --features hevc
-```
-
-If the libraries are missing, build without the feature:
-
-```bash
-cargo build --no-default-features
 ```
 
 ## setup
