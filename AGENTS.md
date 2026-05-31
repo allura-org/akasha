@@ -243,9 +243,6 @@ The full original plan (database evaluation, Searchables trait definition, exten
 |------|---------|
 | `Cargo.toml` | Dependencies and package metadata |
 | `migrations/*.sql` | Database schema evolution (source of truth) |
-| `concept.md` | High-level product vision and planned features |
-| `SESSION_NOTES.md` | Session-by-session progress and next-steps |
-| `viewer_and_gallery_tweaks.md` | UI polish backlog |
 | `src/config.rs` | Config serialization, defaults, and XDG paths |
 | `src/db/media.rs` | Media file queries and `MediaFile` struct |
 | `src/db/folder.rs` | Folder queries and `Folder` struct |
@@ -253,3 +250,14 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/scanner.rs` | Directory scanning with per-subfolder resume |
 | `src/thumbnailer.rs` | Thumbnail generation and cache path resolution |
 | `src/ui/viewer.rs` | Full-screen image viewer overlay |
+
+### Scratchpad Folder (`.kimi/`)
+
+Session notes, backlogs, and architectural documents live in `.kimi/` to keep the project root clean. Treat it as a working scratchpad:
+
+| File | Purpose |
+|------|---------|
+| `.kimi/concept.md` | High-level product vision and planned features |
+| `.kimi/SESSION_NOTES.md` | Session-by-session progress and next-steps |
+| `.kimi/BACKLOG.md` | Deferred work and known issues |
+| `.kimi/viewer_and_gallery_tweaks.md` | (Deprecated — contents merged into `BACKLOG.md`) |

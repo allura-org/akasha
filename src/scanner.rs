@@ -93,19 +93,19 @@ pub async fn scan_folder(
     info!("Found {} complete subfolders to skip", complete_subfolders.len());
 
     // Bulk-load existing files for the ENTIRE tree under this root (recursive CTE)
-    let existing: HashMap<String, (String, i64)> = sqlx::query_as::<_, (String, String, i64)>(
+    let existing: HashMap<String, (String, i64, Option<String>)> = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
         "WITH RECURSIVE subtree(id) AS (
             SELECT ?1
             UNION ALL
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
         )
-        SELECT relative_path, blake3_hash, file_size FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
+        SELECT relative_path, blake3_hash, file_size, format FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
     )
     .bind(root_folder_id)
     .fetch_all(pool)
     .await?
     .into_iter()
-    .map(|(path, hash, size)| (path, (hash, size)))
+    .map(|(path, hash, size, format)| (path, (hash, size, format)))
     .collect();
 
     let mut folder_paths: HashMap<i64, Vec<String>> = HashMap::new();
@@ -232,8 +232,8 @@ pub async fn scan_folder(
 
         // Check if file changed since last scan (in-memory, O(1))
         let needs_update = match existing.get(&relative_path) {
-            Some((old_hash, old_size)) => {
-                old_hash.is_empty() || *old_size as u64 != file_size
+            Some((old_hash, old_size, old_format)) => {
+                old_hash.is_empty() || *old_size as u64 != file_size || old_format.is_none()
             }
             None => true,
         };
