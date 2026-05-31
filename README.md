@@ -42,6 +42,41 @@ thankfully we live in the era of vibe-coding. so i slopped harder than ive ever 
 
 clone it and `cargo build` homeboy.
 
+### HEVC support (optional)
+
+akasha supports HEVC-coded media via an optional Cargo feature flag (`hevc`).
+
+Currently this enables **HEIF / HEIC images**. When video support lands, the same flag will enable **HEVC video in MP4 containers**.
+
+HEVC is patent-encumbered, so decoding requires system libraries. The feature is off by default.
+
+**Dependencies:**
+
+- `libheif` >= 1.17.0
+- `libde265` (for HEVC decoding)
+
+**Distro-specific installs:**
+
+```bash
+# Debian / Ubuntu
+sudo apt install libheif-dev libde265-dev
+
+# Fedora
+sudo dnf install libheif-devel libde265-devel
+```
+
+**Build with HEVC support:**
+
+```bash
+cargo build --features hevc
+```
+
+If the libraries are missing, build without the feature:
+
+```bash
+cargo build --no-default-features
+```
+
 ## setup
 
 `~.config/akasha/config.toml` should be generated on first launch. modify the `[[folders]]` section, and copy it for every directory you want akasha to scan.

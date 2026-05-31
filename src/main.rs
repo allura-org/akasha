@@ -10,7 +10,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 fn main() -> anyhow::Result<()> {
-    #[cfg(feature = "heif")]
+    #[cfg(feature = "hevc")]
     libheif_rs::integration::image::register_all_decoding_hooks();
 
     let subscriber = FmtSubscriber::builder()

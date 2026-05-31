@@ -33,7 +33,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Database | `sqlx` 0.8 (sqlite, runtime-tokio, chrono, json) |
 | Migrations | `sqlx::migrate!()` (embedded in binary) |
 | Serialization | `serde`, `serde_json`, `toml` |
-| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEIF/HEIC) |
+| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEVC → HEIF/HEIC) |
 | File hashing | `blake3` |
 | Directory traversal | `walkdir` |
 | Glob blacklists | `globset` |
@@ -65,11 +65,11 @@ cargo test
 
 ### Feature flags
 
-- `heif` — Enables HEIF/HEIC image support via `libheif-rs`. Requires system libraries:
+- `hevc` — Enables HEVC-coded media. Currently covers HEIF/HEIC images; will extend to HEVC video in MP4 when video support lands. Requires system libraries:
   - `libheif-dev` >= 1.17.0 (and its dependency `libde265-dev` for HEVC decoding)
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
-  - Build with the feature: `cargo build --features heif`
-  - If the libraries are missing, disable the feature: `cargo build --no-default-features` (or remove `heif` from `default` in `Cargo.toml`)
+  - Build with the feature: `cargo build --features hevc`
+  - If the libraries are missing, disable the feature: `cargo build --no-default-features` (or remove `hevc` from `default` in `Cargo.toml`)
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 

@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-heif = ["dep:libheif-rs"]
+hevc = ["dep:libheif-rs"]
 
 [dependencies]
 # UI
@@ -53,8 +53,8 @@ directories = "6"
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
 
-# HEIF/HEIC support (optional, requires libheif-dev and libde265-dev)
-# Use v1_17 instead of latest for maximum distro compatibility.
+# HEVC support (optional, requires libheif-dev and libde265-dev).
+# Enables HEIF/HEIC images now; will enable HEVC video in MP4 when video support lands.
 libheif-rs = { version = "2.7", optional = true, default-features = false, features = ["v1_17", "image"] }
 
 # File system watching (Phase 2)

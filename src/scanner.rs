@@ -14,7 +14,7 @@ fn is_supported(path: &Path) -> bool {
             if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
                 return true;
             }
-            #[cfg(feature = "heif")]
+            #[cfg(feature = "hevc")]
             if matches!(ext.as_str(), "heif" | "heic") {
                 return true;
             }
