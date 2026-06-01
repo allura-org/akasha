@@ -1,3 +1,4 @@
+use futures_util::stream::TryStreamExt;
 use sqlx::SqlitePool;
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,154 @@ pub struct MediaFile {
     pub file_size: Option<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MediaSummary {
+    pub id: i64,
+    pub folder_id: i64,
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub blake3_hash: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub format: Option<String>,
+}
+
+pub async fn count_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_files WHERE folder_id = ?1")
+        .bind(folder_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0)
+}
+
+pub async fn count_by_folder_recursive(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+         )
+         SELECT COUNT(*) FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
+    )
+    .bind(folder_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+pub async fn list_summaries_by_folder(
+    pool: &SqlitePool,
+    folder_id: i64,
+) -> anyhow::Result<Vec<MediaSummary>> {
+    let mut summaries = Vec::new();
+    let mut stream = sqlx::query_as::<_, MediaSummaryRow>(
+        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash, width, height, format
+         FROM media_files
+         WHERE folder_id = ?1
+         ORDER BY id"
+    )
+    .bind(folder_id)
+    .fetch(pool);
+
+    while let Some(row) = stream.try_next().await? {
+        summaries.push(into_summary(row));
+    }
+
+    Ok(summaries)
+}
+
+pub async fn list_summaries_by_folder_recursive(
+    pool: &SqlitePool,
+    folder_id: i64,
+) -> anyhow::Result<Vec<MediaSummary>> {
+    let mut summaries = Vec::new();
+    let mut stream = sqlx::query_as::<_, MediaSummaryRow>(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+         )
+         SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash, m.width, m.height, m.format
+         FROM media_files m
+         JOIN subtree s ON m.folder_id = s.id
+         ORDER BY m.id"
+    )
+    .bind(folder_id)
+    .fetch(pool);
+
+    while let Some(row) = stream.try_next().await? {
+        summaries.push(into_summary(row));
+    }
+
+    Ok(summaries)
+}
+
+pub async fn get_by_id(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<MediaFile>> {
+    let row = sqlx::query_as::<_, MediaFileRow>(
+        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
+                width, height, format, file_size
+         FROM media_files WHERE id = ?1"
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(into_media))
+}
+
+pub async fn list_page_by_folder(
+    pool: &SqlitePool,
+    folder_id: i64,
+    after_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<MediaFile>> {
+    let rows = sqlx::query_as::<_, MediaFileRow>(
+        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
+                width, height, format, file_size
+         FROM media_files
+         WHERE folder_id = ?1 AND id > ?2
+         ORDER BY id
+         LIMIT ?3"
+    )
+    .bind(folder_id)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(into_media).collect())
+}
+
+pub async fn list_page_by_folder_recursive(
+    pool: &SqlitePool,
+    folder_id: i64,
+    after_id: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<MediaFile>> {
+    let rows = sqlx::query_as::<_, MediaFileRow>(
+        "WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+         )
+         SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash,
+                m.width, m.height, m.format, m.file_size
+         FROM media_files m
+         JOIN subtree s ON m.folder_id = s.id
+         WHERE m.id > ?2
+         ORDER BY m.id
+         LIMIT ?3"
+    )
+    .bind(folder_id)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(into_media).collect())
+}
+
+// Legacy full-record queries (still used during scans and for detail panels)
 pub async fn list_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<Vec<MediaFile>> {
     let rows = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
@@ -128,6 +277,18 @@ struct MediaFileRow {
     file_size: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct MediaSummaryRow {
+    id: i64,
+    folder_id: i64,
+    relative_path: String,
+    absolute_path: String,
+    blake3_hash: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    format: Option<String>,
+}
+
 fn into_media(row: MediaFileRow) -> MediaFile {
     MediaFile {
         id: row.id,
@@ -139,5 +300,18 @@ fn into_media(row: MediaFileRow) -> MediaFile {
         height: row.height,
         format: row.format,
         file_size: row.file_size,
+    }
+}
+
+fn into_summary(row: MediaSummaryRow) -> MediaSummary {
+    MediaSummary {
+        id: row.id,
+        folder_id: row.folder_id,
+        relative_path: row.relative_path,
+        absolute_path: row.absolute_path,
+        blake3_hash: row.blake3_hash,
+        width: row.width.map(|v| v as u32),
+        height: row.height.map(|v| v as u32),
+        format: row.format,
     }
 }

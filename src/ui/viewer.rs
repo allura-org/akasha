@@ -1,5 +1,5 @@
 use eframe::egui;
-use crate::db::media::MediaFile;
+use crate::db::media::MediaSummary;
 
 pub struct ViewerResponse {
     pub close: bool,
@@ -10,7 +10,7 @@ pub struct ViewerResponse {
 
 pub fn show(
     ctx: &egui::Context,
-    media: &MediaFile,
+    media: &MediaSummary,
     texture: &Option<egui::TextureHandle>,
     zoom_to_fit: bool,
 ) -> ViewerResponse {

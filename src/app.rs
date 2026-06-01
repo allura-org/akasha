@@ -38,7 +38,15 @@ pub struct AkashaApp {
     // UI state
     pub folders: Vec<db::folder::Folder>,
     pub selected_folder_id: Option<i64>,
+
+    // Tier 1: lightweight summaries for ALL items in the selected folder.
+    // This is what the grid renders from and what the thumbnail queue indexes into.
+    pub media_summaries: Vec<db::media::MediaSummary>,
+
+    // Tier 2: paginated full MediaFile records, fetched on demand.
+    // Currently unused (reserved for Phase 6: detail panels / bulk ops).
     pub media_items: Vec<db::media::MediaFile>,
+
     pub textures: HashMap<String, egui::TextureHandle>,
     pub pending_thumbnails: HashSet<String>,
     pub thumbnail_queue: VecDeque<(usize, String)>,
@@ -51,8 +59,8 @@ pub struct AkashaApp {
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
     pub thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
-    pub media_tx: std::sync::mpsc::Sender<(u64, Result<Vec<db::media::MediaFile>, String>)>,
-    pub media_rx: std::sync::mpsc::Receiver<(u64, Result<Vec<db::media::MediaFile>, String>)>,
+    pub media_tx: std::sync::mpsc::Sender<(u64, Result<Vec<db::media::MediaSummary>, String>)>,
+    pub media_rx: std::sync::mpsc::Receiver<(u64, Result<Vec<db::media::MediaSummary>, String>)>,
     pub folders_tx: std::sync::mpsc::Sender<Result<Vec<db::folder::Folder>, String>>,
     pub folders_rx: std::sync::mpsc::Receiver<Result<Vec<db::folder::Folder>, String>>,
     pub last_refresh: std::time::Instant,
@@ -95,7 +103,7 @@ impl AkashaApp {
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
-        let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, Result<Vec<db::media::MediaFile>, String>)>();
+        let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, Result<Vec<db::media::MediaSummary>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
 
         // On startup: scan any configured folders that are new or incomplete
@@ -185,6 +193,7 @@ impl AkashaApp {
             thumbnailer,
             folders: Vec::new(),
             selected_folder_id: None,
+            media_summaries: Vec::new(),
             media_items: Vec::new(),
             textures: HashMap::new(),
             pending_thumbnails: HashSet::new(),
@@ -219,16 +228,6 @@ impl AkashaApp {
         app
     }
 
-    fn folder_depth(&self, folder: &db::folder::Folder) -> usize {
-        let mut depth = 0;
-        let mut current = folder.parent_id;
-        while let Some(pid) = current {
-            depth += 1;
-            current = self.folders.iter().find(|f| f.id == pid).and_then(|f| f.parent_id);
-        }
-        depth
-    }
-
     fn refresh_folders_async(&mut self) {
         let pool = Arc::clone(&self.pool);
         let tx = self.folders_tx.clone();
@@ -256,7 +255,7 @@ impl AkashaApp {
     }
 
     fn render_folder_tree(&mut self, ui: &mut egui::Ui, folder_id: i64, depth: usize, clicked_id: &mut Option<i64>) {
-        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return; };
+        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
         let selected = self.selected_folder_id == Some(folder.id);
         let has_children = self.folders.iter().any(|f| f.parent_id == Some(folder.id));
         let is_root = folder.parent_id.is_none();
@@ -306,8 +305,8 @@ impl AkashaApp {
     }
 
     fn refresh_media_async(&mut self, hard_reset: bool) {
-        let Some(folder_id) = self.selected_folder_id else { return; };
-        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return; };
+        let Some(folder_id) = self.selected_folder_id else { return };
+        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
 
         let pool = Arc::clone(&self.pool);
         let tx = self.media_tx.clone();
@@ -316,6 +315,7 @@ impl AkashaApp {
         if hard_reset {
             self.media_epoch += 1;
             self.scan_status = "Loading images...".to_string();
+            self.media_summaries.clear();
             self.media_items.clear();
             self.textures.clear();
             self.pending_thumbnails.clear();
@@ -327,9 +327,9 @@ impl AkashaApp {
         let epoch = self.media_epoch;
         self.rt.spawn(async move {
             let result = if show_recursive {
-                db::media::list_by_folder_recursive(&pool, folder_id).await
+                db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
             } else {
-                db::media::list_by_folder(&pool, folder_id).await
+                db::media::list_summaries_by_folder(&pool, folder_id).await
             };
             let _ = tx.send((epoch, result.map_err(|e| e.to_string())));
         });
@@ -337,9 +337,7 @@ impl AkashaApp {
 
     fn poll_media_events(&mut self) {
         // Drain the channel and keep only the latest result matching the current epoch.
-        // This prevents stale async results (e.g. from periodic refreshes spawned before
-        // a folder switch) from overwriting the current folder's data.
-        let mut latest: Option<Result<Vec<db::media::MediaFile>, String>> = None;
+        let mut latest: Option<Result<Vec<db::media::MediaSummary>, String>> = None;
         while let Ok((epoch, result)) = self.media_rx.try_recv() {
             if epoch == self.media_epoch {
                 latest = Some(result);
@@ -354,8 +352,8 @@ impl AkashaApp {
                     self.pending_thumbnails.retain(|hash| needed.contains(hash));
                     self.thumbnail_queue.retain(|(idx, _)| items.get(*idx).is_some());
                     self.queued_indices.retain(|idx| items.get(*idx).is_some());
-                    self.media_items = items;
-                    self.scan_status = format!("{} images", self.media_items.len());
+                    self.media_summaries = items;
+                    self.scan_status = format!("{} images", self.media_summaries.len());
                 }
                 Err(e) => {
                     self.scan_status = format!("Failed to load media: {e}");
@@ -421,7 +419,7 @@ impl AkashaApp {
     }
 
     fn queue_visible_thumbnails(&mut self, viewport_height: f32, cols: usize) {
-        if cols == 0 || self.media_items.is_empty() {
+        if cols == 0 || self.media_summaries.is_empty() {
             return;
         }
         let first_visible_row = (self.scroll_offset / THUMB_CELL_HEIGHT).floor() as usize;
@@ -429,11 +427,11 @@ impl AkashaApp {
         // Prefetch 5 rows above and below the viewport (small fixed window)
         let prefetch_rows = 5;
         let start_idx = first_visible_row.saturating_sub(prefetch_rows) * cols;
-        let end_idx = ((last_visible_row + prefetch_rows) * cols).min(self.media_items.len());
+        let end_idx = ((last_visible_row + prefetch_rows) * cols).min(self.media_summaries.len());
 
         let mut to_queue = Vec::new();
         for i in start_idx..end_idx {
-            let hash = &self.media_items[i].blake3_hash;
+            let hash = &self.media_summaries[i].blake3_hash;
             if !self.textures.contains_key(hash)
                 && !self.pending_thumbnails.contains(hash)
                 && !self.queued_indices.contains(&i)
@@ -473,7 +471,7 @@ impl AkashaApp {
                 continue;
             }
 
-            let Some(media) = self.media_items.get(idx) else {
+            let Some(media) = self.media_summaries.get(idx) else {
                 continue;
             };
 
@@ -516,7 +514,7 @@ impl AkashaApp {
 
     fn navigate_viewer(&mut self, delta: isize) {
         if let Some(idx) = self.viewer_index {
-            let len = self.media_items.len();
+            let len = self.media_summaries.len();
             if len == 0 {
                 self.close_viewer();
                 return;
@@ -535,7 +533,7 @@ impl AkashaApp {
 
     fn load_viewer_image(&mut self) {
         if let Some(idx) = self.viewer_index {
-            if let Some(media) = self.media_items.get(idx) {
+            if let Some(media) = self.media_summaries.get(idx) {
                 let source = std::path::PathBuf::from(&media.absolute_path);
                 let hash = media.blake3_hash.clone();
                 let tx = self.viewer_image_tx.clone();
@@ -565,7 +563,7 @@ impl AkashaApp {
             // Ignore viewer image loads for a media item that is no longer
             // the one being viewed (e.g. user navigated away while load was in flight).
             let current_hash = self.viewer_index
-                .and_then(|idx| self.media_items.get(idx))
+                .and_then(|idx| self.media_summaries.get(idx))
                 .map(|m| m.blake3_hash.as_str());
             if current_hash != Some(hash.as_str()) {
                 continue;
@@ -631,9 +629,9 @@ impl AkashaApp {
                 .order(egui::Order::Foreground)
                 .fixed_pos(rect.min)
                 .show(ctx, |ui| {
-                    let frame = egui::Frame::none()
+                    let frame = egui::Frame::new()
                         .fill(bg)
-                        .rounding(8.0)
+                        .corner_radius(8.0)
                         .inner_margin(12.0);
                     frame.show(ui, |ui| {
                         ui.set_min_size(rect.size());
@@ -844,12 +842,12 @@ impl eframe::App for AkashaApp {
 
         // Main content
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.is_scanning && self.media_items.is_empty() && self.selected_folder_id.is_none() {
+            if self.is_scanning && self.media_summaries.is_empty() && self.selected_folder_id.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.heading("Scanning...");
                     ui.label(&self.scan_status);
                 });
-            } else if self.media_items.is_empty() {
+            } else if self.media_summaries.is_empty() {
                 ui.centered_and_justified(|ui| {
                     if self.selected_folder_id.is_some() {
                         ui.heading("No images in this folder");
@@ -858,11 +856,11 @@ impl eframe::App for AkashaApp {
                     }
                 });
             } else {
-                ui.heading(format!("{} images", self.media_items.len()));
+                ui.heading(format!("{} images", self.media_summaries.len()));
                 ui.separator();
 
                 let cols = (ui.available_width() / 220.0).max(1.0) as usize;
-                let rows = (self.media_items.len() + cols - 1) / cols;
+                let rows = (self.media_summaries.len() + cols - 1) / cols;
                 let item_size = egui::vec2(200.0, 200.0);
                 let label_h = 30.0;
                 let row_height = item_size.y + label_h;
@@ -874,10 +872,10 @@ impl eframe::App for AkashaApp {
                             ui.horizontal(|ui| {
                                 for col in 0..cols {
                                     let idx = row * cols + col;
-                                    if idx >= self.media_items.len() {
+                                    if idx >= self.media_summaries.len() {
                                         break;
                                     }
-                                    let media = &self.media_items[idx];
+                                    let media = &self.media_summaries[idx];
 
                                     let clicked = ui.allocate_ui_with_layout(
                                         egui::vec2(item_size.x, row_height),
@@ -931,10 +929,10 @@ impl eframe::App for AkashaApp {
         // Viewer overlay (drawn on top of browser)
         if self.viewer_open {
             if let Some(idx) = self.viewer_index {
-                if let Some(media) = self.media_items.get(idx).cloned() {
+                if let Some(media) = self.media_summaries.get(idx) {
                     let resp = crate::ui::viewer::show(
                         ctx,
-                        &media,
+                        media,
                         &self.viewer_texture,
                         self.viewer_zoom_to_fit,
                     );
