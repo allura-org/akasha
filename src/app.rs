@@ -1,6 +1,13 @@
 use eframe::egui;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone)]
+pub struct ThumbnailJob {
+    pub idx: usize,
+    pub hash: String,
+    pub priority: i64, // lower = higher priority (distance from viewport center)
+}
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -49,9 +56,12 @@ pub struct AkashaApp {
 
     pub textures: HashMap<String, egui::TextureHandle>,
     pub pending_thumbnails: HashSet<String>,
-    pub thumbnail_queue: VecDeque<(usize, String)>,
+    pub thumbnail_queue: Vec<ThumbnailJob>,
     pub queued_indices: HashSet<usize>,
     pub scroll_offset: f32,
+    pub scroll_velocity: f32,      // rows per second, smoothed
+    pub last_scroll_offset: f32,
+    pub last_scroll_time: std::time::Instant,
     pub thumbnail_epoch: u64,
     pub media_epoch: u64,
     pub scan_status: String,
@@ -197,9 +207,12 @@ impl AkashaApp {
             media_items: Vec::new(),
             textures: HashMap::new(),
             pending_thumbnails: HashSet::new(),
-            thumbnail_queue: VecDeque::new(),
+            thumbnail_queue: Vec::new(),
             queued_indices: HashSet::new(),
             scroll_offset: 0.0,
+            scroll_velocity: 0.0,
+            last_scroll_offset: 0.0,
+            last_scroll_time: std::time::Instant::now(),
             thumbnail_epoch: 0,
             media_epoch: 0,
             scan_status: "Initializing...".to_string(),
@@ -350,7 +363,7 @@ impl AkashaApp {
                     let needed: HashSet<String> = items.iter().map(|m| m.blake3_hash.clone()).collect();
                     self.textures.retain(|hash, _| needed.contains(hash));
                     self.pending_thumbnails.retain(|hash| needed.contains(hash));
-                    self.thumbnail_queue.retain(|(idx, _)| items.get(*idx).is_some());
+                    self.thumbnail_queue.retain(|job| items.get(job.idx).is_some());
                     self.queued_indices.retain(|idx| items.get(*idx).is_some());
                     self.media_summaries = items;
                     self.scan_status = format!("{} images", self.media_summaries.len());
@@ -424,8 +437,29 @@ impl AkashaApp {
         }
         let first_visible_row = (self.scroll_offset / THUMB_CELL_HEIGHT).floor() as usize;
         let last_visible_row = ((self.scroll_offset + viewport_height) / THUMB_CELL_HEIGHT).ceil() as usize;
-        // Prefetch 5 rows above and below the viewport (small fixed window)
-        let prefetch_rows = 5;
+        let center_row = (first_visible_row + last_visible_row) / 2;
+
+        // Update scroll velocity (rows per second, exponentially smoothed)
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_scroll_time).as_secs_f32().max(0.001);
+        let rows_delta = (self.scroll_offset - self.last_scroll_offset).abs() / THUMB_CELL_HEIGHT;
+        let instant_velocity = rows_delta / dt;
+        self.scroll_velocity = self.scroll_velocity * 0.8 + instant_velocity * 0.2;
+        self.last_scroll_offset = self.scroll_offset;
+        self.last_scroll_time = now;
+
+        // Determine prefetch zone based on velocity
+        let (prefetch_rows, max_dist) = if self.scroll_velocity > 240.0 {
+            // Fast scroll: only center
+            (1, 2)
+        } else if self.scroll_velocity > 60.0 {
+            // Medium: visible + 2 rows
+            (2, 4)
+        } else {
+            // Idle: visible + 5 rows
+            (5, 8)
+        };
+
         let start_idx = first_visible_row.saturating_sub(prefetch_rows) * cols;
         let end_idx = ((last_visible_row + prefetch_rows) * cols).min(self.media_summaries.len());
 
@@ -434,24 +468,32 @@ impl AkashaApp {
             let hash = &self.media_summaries[i].blake3_hash;
             if !self.textures.contains_key(hash)
                 && !self.pending_thumbnails.contains(hash)
-                && !self.queued_indices.contains(&i)
             {
                 let row = i / cols;
-                let dist = if row < first_visible_row {
-                    first_visible_row - row
-                } else if row > last_visible_row {
-                    row - last_visible_row
+                let dist = if row > center_row {
+                    row - center_row
                 } else {
-                    0
+                    center_row - row
                 };
-                to_queue.push((i, hash.clone(), dist));
+                if dist <= max_dist {
+                    to_queue.push(ThumbnailJob {
+                        idx: i,
+                        hash: hash.clone(),
+                        priority: dist as i64,
+                    });
+                }
             }
         }
 
-        to_queue.sort_by_key(|(_, _, dist)| *dist);
-        for (idx, hash, _) in to_queue {
-            self.queued_indices.insert(idx);
-            self.thumbnail_queue.push_back((idx, hash));
+        // Sort by priority ascending (best first), then reverse for efficient pop()
+        to_queue.sort_by_key(|job| job.priority);
+        to_queue.reverse();
+
+        self.thumbnail_queue.clear();
+        self.queued_indices.clear();
+        for job in to_queue {
+            self.queued_indices.insert(job.idx);
+            self.thumbnail_queue.push(job);
         }
     }
 
@@ -462,20 +504,21 @@ impl AkashaApp {
         }
 
         for _ in 0..can_spawn {
-            let Some((idx, hash)) = self.thumbnail_queue.pop_front() else {
+            let Some(job) = self.thumbnail_queue.pop() else {
                 break;
             };
-            self.queued_indices.remove(&idx);
+            self.queued_indices.remove(&job.idx);
+
             // Double-check it's still needed
-            if self.textures.contains_key(&hash) || self.pending_thumbnails.contains(&hash) {
+            if self.textures.contains_key(&job.hash) || self.pending_thumbnails.contains(&job.hash) {
                 continue;
             }
 
-            let Some(media) = self.media_summaries.get(idx) else {
+            let Some(media) = self.media_summaries.get(job.idx) else {
                 continue;
             };
 
-            self.pending_thumbnails.insert(hash.clone());
+            self.pending_thumbnails.insert(job.hash.clone());
             let source = std::path::PathBuf::from(&media.absolute_path);
             let size = self.thumbnailer.size;
             let cache_mode = self.thumbnailer.cache_mode.clone();
@@ -484,7 +527,7 @@ impl AkashaApp {
 
             self.rt.spawn_blocking(move || {
                 let thumbnailer = Thumbnailer::new(size, cache_mode);
-                let result = thumbnailer.load_thumbnail_bytes(&source, &hash, None)
+                let result = thumbnailer.load_thumbnail_bytes(&source, &job.hash, None)
                     .and_then(|bytes| {
                         let img = image::load_from_memory(&bytes)
                             .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
@@ -492,7 +535,7 @@ impl AkashaApp {
                         let sz = [rgba.width() as usize, rgba.height() as usize];
                         Ok(egui::ColorImage::from_rgba_unmultiplied(sz, rgba.as_raw()))
                     });
-                let _ = tx.send((hash, epoch, result.map_err(|e| e.to_string())));
+                let _ = tx.send((job.hash, epoch, result.map_err(|e| e.to_string())));
             });
         }
     }

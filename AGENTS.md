@@ -33,7 +33,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Database | `sqlx` 0.8 (sqlite, runtime-tokio, chrono, json) |
 | Migrations | `sqlx::migrate!()` (embedded in binary) |
 | Serialization | `serde`, `serde_json`, `toml` |
-| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEVC → HEIF/HEIC) |
+| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEVC → HEIF/HEIC); `fast_image_resize` 6 + `webp` 0.3 (optional SIMD thumbnails) |
 | File hashing | `blake3` |
 | Directory traversal | `walkdir` |
 | Glob blacklists | `globset` |
@@ -70,6 +70,7 @@ cargo test
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
   - Build with the feature: `cargo build --features hevc`
   - If the libraries are missing, disable the feature: `cargo build --no-default-features` (or remove `hevc` from `default` in `Cargo.toml`)
+- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default. Disable for pure-Rust builds: `cargo build --no-default-features`
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
@@ -93,15 +94,15 @@ cargo test
 ```
 src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
-  app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~950 lines)
+  app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailConfig`, `FolderConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
-  thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom)
+  thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
   theme.rs       — Custom flat egui theme
   db/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
     folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `update_show_recursive`
-    media.rs     — Media file CRUD: `list_by_folder`, `list_by_folder_recursive`, `upsert`, `delete_orphans`, `delete_orphans_for_root`
+    media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `delete_orphans`
   ui/
     mod.rs       — Re-exports `browser`, `viewer`, `widgets`
     browser.rs   — `BrowserPanel` placeholder (unused; browser UI is inline in `app.rs`)
@@ -138,13 +139,15 @@ Migrations live in `migrations/` and are embedded at compile time.
 - `blake3_hash`, `width`, `height`, `format`, `file_size`, `modified_at`
 - `created_at`
 - Unique on `(folder_id, relative_path)`
-- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at)
+- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at), `idx_media_summary` (covering index for lightweight grid queries)
 
 ### Notes
 - `blacklist` is stored as a JSON string and deserialized via `serde_json`.
 - `media_files` uses `UPSERT` (`ON CONFLICT ... DO UPDATE SET`) in `db::media::upsert`.
 - Orphan cleanup uses `json_each()` for batch path comparison.
 - Recursive CTEs are used for tree queries (e.g., `list_by_folder_recursive`, `update_scan_complete_recursive`).
+- Summary queries (`list_summaries_by_folder*`) stream rows incrementally via `sqlx::query_as().fetch()` rather than `.fetch_all()`, avoiding a massive allocation spike for large folders.
+- The thumbnail cache uses a 2-level hash prefix (`aa/bb/{hash}_{size}.webp`) to avoid ext4/xfs metadata stress with hundreds of thousands of files.
 
 ---
 
@@ -236,6 +239,8 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - AI/ONNX "Searchables" abstraction is described in `concept.md` but not yet present in code.
 - `delete_orphans_for_root` in `db/media.rs` is no longer called (replaced by per-folder cleanup) and has a bug (only matches direct children, not all descendants).
 - No tests exist yet.
+- **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.
+- **Thumbnail queue velocity tuning:** the scroll-velocity thresholds (60/240 rows/sec) are initial guesses and may need adjustment based on real-world feel.
 
 ---
 
@@ -262,4 +267,6 @@ Session notes, backlogs, and architectural documents live in `.kimi/` to keep th
 | `.kimi/concept.md` | High-level product vision and planned features |
 | `.kimi/SESSION_NOTES.md` | Session-by-session progress and next-steps |
 | `.kimi/BACKLOG.md` | Deferred work and known issues |
+| `.kimi/plan_pagination_thumbnails.md` | Original implementation plan for two-tier media list + priority thumbnails |
+| `.kimi/review_pagination_thumbnails.md` | Backend reviewer's feedback on the plan |
 | `.kimi/viewer_and_gallery_tweaks.md` | (Deprecated — contents merged into `BACKLOG.md`) |
