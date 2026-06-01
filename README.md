@@ -1,8 +1,8 @@
-# akasha - a Linux-native image gallery for data hoarders
+z# akasha - a Linux-native image gallery for data hoarders
 
 <img width="1692" height="1356" alt="image" src="https://github.com/user-attachments/assets/487cffaf-4d05-42c4-8dc2-2833763971bb" />
 
-akasha (ah-kuh-sha) is a modern, performant, database-backed image gallery written in Rust with (currently) egui-based GUI. Built to handle hundreds of thousands of images in a single import.
+akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gallery written in Rust with (currently) egui-based GUI. Built to handle hundreds of thousands of images in a single import.
 
 ⚠️  akasha is in pre-alpha and is not suitable to daily-drive yet.
 
@@ -43,9 +43,10 @@ thankfully we live in the era of vibe-coding. so i slopped harder than ive ever 
 
 clone it and `cargo build` homeboy.
 
-### feature flags
+### extra features
 
-if u need an optional feature, use `--features <feature>, <feature>, etc...`
+akasha is pure-rust by default for ease of setup, but some features require non-rust libraries.
+if u want an optional feature, use `--features <feature>` once for each.
 
 #### HEVC support
 
@@ -58,8 +59,6 @@ HEIC images, H.265 in MP4 (eventually), etc. HEVC is patent-encumbered, so inste
 - `libheif` >= 1.17.0
 - `libde265` (for HEVC decoding)
 
-**Distro-specific installs:**
-
 ```bash
 # Debian / Ubuntu
 sudo apt install libheif-dev libde265-dev
@@ -68,15 +67,33 @@ sudo apt install libheif-dev libde265-dev
 sudo dnf install libheif-devel libde265-devel
 ```
 
+#### SIMD thumbnail generation
+
+`simd-thumbnails`
+
+accelerates thumbnail generation.
+
+**dependencies:**
+
+- `libwebp`
+
+```bash
+# Debian / Ubuntu
+sudo apt install libwebp-dev
+
+# Fedora
+sudo dnf install libwebp-devel
+```
+
 ## setup
 
 `~.config/akasha/config.toml` should be generated on first launch. modify the `[[folders]]` section, and copy it for every directory you want akasha to scan.
 
 each `[[folders]]` section is an import. when `recursive = true`, its children will be scanned, except for any folders with names in the blacklist string array. when `show_recursive = true`, the import will show images found in the root folder *and* all children recursively.
 
-when `thumbnails.cache_mode` is "global", thumbnails are cached to `~/.local/share/akasha/thumbnails/{blake3_hash}_{size}.webp`
+when `thumbnails.cache_mode` is "global", thumbnails are cached to `~/.cache/akasha`
 when `thumbnails.cache_mode` is `custom`, you change where thumbnails are cached to.
-when `thumbnails.cache_mode` is `per_folder`, thumbnails are cached alongside media. 
+when `thumbnails.cache_mode` is `per_folder`, thumbnails are cached alongside media. (WIP)
 when `thumbnails.cache_mode` is `disabled`, no thumbnails are cached.
 
 thats all the setup that exists rn. thumbnail sizes and theme can be changed in the app
