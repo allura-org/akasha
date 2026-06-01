@@ -446,12 +446,10 @@ impl AkashaApp {
         }
     }
 
-    fn queue_visible_thumbnails(&mut self, viewport_height: f32, cols: usize) {
+    fn queue_visible_thumbnails(&mut self, viewport_height: f32, cols: usize, first_visible_row: usize, last_visible_row: usize) {
         if cols == 0 || self.media_summaries.is_empty() {
             return;
         }
-        let first_visible_row = (self.scroll_offset / THUMB_CELL_HEIGHT).floor() as usize;
-        let last_visible_row = ((self.scroll_offset + viewport_height) / THUMB_CELL_HEIGHT).ceil() as usize;
         let center_row = (first_visible_row + last_visible_row) / 2;
 
         // Update scroll velocity (rows per second, exponentially smoothed)
@@ -945,8 +943,10 @@ impl eframe::App for AkashaApp {
                 let label_h = 30.0;
                 let row_height = item_size.y + label_h;
 
+                let mut visible_rows: Option<(usize, usize)> = None;
                 let scroll = egui::ScrollArea::vertical()
                     .show_rows(ui, row_height, rows, |ui, row_range| {
+                        visible_rows = Some((row_range.start, row_range.end));
                         let mut clicked_index = None;
                         for row in row_range {
                             ui.horizontal(|ui| {
@@ -1002,7 +1002,9 @@ impl eframe::App for AkashaApp {
                     });
                 self.scroll_offset = scroll.state.offset.y;
                 let viewport_h = scroll.inner_rect.height();
-                self.queue_visible_thumbnails(viewport_h, cols);
+                if let Some((first, last)) = visible_rows {
+                    self.queue_visible_thumbnails(viewport_h, cols, first, last);
+                }
             }
         });
 
