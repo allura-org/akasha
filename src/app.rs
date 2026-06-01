@@ -84,6 +84,10 @@ pub struct AkashaApp {
     pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
     pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
     pub viewer_just_opened: bool,
+    pub pending_viewer_images: HashSet<String>,
+
+    // Refresh dedup
+    pub media_refresh_in_flight: bool,
 
     // Polish
     pub toasts: Vec<Toast>,
@@ -233,6 +237,8 @@ impl AkashaApp {
             viewer_image_tx: viewer_img_tx,
             viewer_image_rx: viewer_img_rx,
             viewer_just_opened: false,
+            pending_viewer_images: HashSet::new(),
+            media_refresh_in_flight: false,
             toasts: Vec::new(),
             settings_open: false,
         };
@@ -321,6 +327,11 @@ impl AkashaApp {
         let Some(folder_id) = self.selected_folder_id else { return };
         let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
 
+        // Skip if a refresh is already in flight (prevents overlapping queries during scans)
+        if self.media_refresh_in_flight && !hard_reset {
+            return;
+        }
+
         let pool = Arc::clone(&self.pool);
         let tx = self.media_tx.clone();
         let show_recursive = folder.show_recursive;
@@ -337,6 +348,7 @@ impl AkashaApp {
             self.scroll_offset = 0.0;
         }
 
+        self.media_refresh_in_flight = true;
         let epoch = self.media_epoch;
         self.rt.spawn(async move {
             let result = if show_recursive {
@@ -357,6 +369,7 @@ impl AkashaApp {
             }
         }
         if let Some(result) = latest {
+            self.media_refresh_in_flight = false;
             match result {
                 Ok(items) => {
                     // Prune textures for hashes no longer in the current folder
@@ -463,6 +476,17 @@ impl AkashaApp {
         let start_idx = first_visible_row.saturating_sub(prefetch_rows) * cols;
         let end_idx = ((last_visible_row + prefetch_rows) * cols).min(self.media_summaries.len());
 
+        // Evict textures far outside the viewport to bound memory usage.
+        // Keep viewport + prefetch + a 10-row margin.
+        let evict_margin = prefetch_rows + 10;
+        let keep_start = first_visible_row.saturating_sub(evict_margin) * cols;
+        let keep_end = ((last_visible_row + evict_margin) * cols).min(self.media_summaries.len());
+        let keep_hashes: HashSet<&str> = self.media_summaries[keep_start..keep_end]
+            .iter()
+            .map(|m| m.blake3_hash.as_str())
+            .collect();
+        self.textures.retain(|hash, _| keep_hashes.contains(hash.as_str()));
+
         let mut to_queue = Vec::new();
         for i in start_idx..end_idx {
             let hash = &self.media_summaries[i].blake3_hash;
@@ -553,6 +577,7 @@ impl AkashaApp {
         self.viewer_open = false;
         self.viewer_index = None;
         self.viewer_texture = None;
+        self.pending_viewer_images.clear();
     }
 
     fn navigate_viewer(&mut self, delta: isize) {
@@ -577,8 +602,15 @@ impl AkashaApp {
     fn load_viewer_image(&mut self) {
         if let Some(idx) = self.viewer_index {
             if let Some(media) = self.media_summaries.get(idx) {
-                let source = std::path::PathBuf::from(&media.absolute_path);
                 let hash = media.blake3_hash.clone();
+
+                // Skip if this image is already loading
+                if self.pending_viewer_images.contains(&hash) {
+                    return;
+                }
+                self.pending_viewer_images.insert(hash.clone());
+
+                let source = std::path::PathBuf::from(&media.absolute_path);
                 let tx = self.viewer_image_tx.clone();
 
                 self.rt.spawn_blocking(move || {
@@ -603,6 +635,8 @@ impl AkashaApp {
 
     fn poll_viewer_images(&mut self, ctx: &egui::Context) {
         while let Ok((hash, result)) = self.viewer_image_rx.try_recv() {
+            self.pending_viewer_images.remove(&hash);
+
             // Ignore viewer image loads for a media item that is no longer
             // the one being viewed (e.g. user navigated away while load was in flight).
             let current_hash = self.viewer_index
