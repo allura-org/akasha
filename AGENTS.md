@@ -50,14 +50,17 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 Standard Cargo workflow:
 
 ```bash
-# Debug build
+# Debug build (pure Rust, no C dependencies)
 cargo build
 
 # Run
 cargo run
 
-# Release build
+# Release build (pure Rust)
 cargo build --release
+
+# With SIMD thumbnail acceleration (requires libwebp-dev / libwebp-devel)
+cargo build --release --features simd-thumbnails
 
 # Tests (none exist yet, but this is the command)
 cargo test
@@ -70,7 +73,7 @@ cargo test
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
   - Build with the feature: `cargo build --features hevc`
   - If the libraries are missing, disable the feature: `cargo build --no-default-features` (or remove `hevc` from `default` in `Cargo.toml`)
-- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default. Disable for pure-Rust builds: `cargo build --no-default-features`
+- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Opt-in; enable with `cargo build --features simd-thumbnails`. Requires `libwebp-dev` (Debian/Ubuntu) or `libwebp-devel` (Fedora).
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
