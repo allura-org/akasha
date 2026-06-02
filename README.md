@@ -1,4 +1,4 @@
-z# akasha - a Linux-native image gallery for data hoarders
+# akasha - a Linux-native image gallery for data hoarders
 
 <img width="1692" height="1356" alt="image" src="https://github.com/user-attachments/assets/487cffaf-4d05-42c4-8dc2-2833763971bb" />
 
