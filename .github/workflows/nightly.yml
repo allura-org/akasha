@@ -1,0 +1,111 @@
+name: Nightly Release
+
+on:
+  # Build whenever you push to dev or main.
+  push:
+    branches: [dev, main]
+  # Build every night at ~midnight UTC (adjust minute to avoid GitHub's peak times).
+  schedule:
+    - cron: "17 3 * * *"
+  # Let you click "Run workflow" manually from the GitHub UI.
+  workflow_dispatch:
+
+# Give the workflow permission to create releases and move tags.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # ubuntu-22.04 has an older glibc than latest, so the binary runs on more distros.
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          # Standard build: SIMD thumbnails + statically linked libwebp.
+          # No dynamic image deps required at runtime.
+          - feature-flag: ""
+            suffix: ""
+          # HEVC build: everything above, plus dynamic libheif + libde265.
+          # Users must have those two libraries installed on their system.
+          - feature-flag: "hevc"
+            suffix: "-hevc"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libegl1-mesa-dev \
+            libheif-dev \
+            libde265-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: |
+          if [ -n "${{ matrix.feature-flag }}" ]; then
+            cargo build --release --features ${{ matrix.feature-flag }}
+          else
+            cargo build --release
+          fi
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/akasha dist/akasha${{ matrix.suffix }}
+          cd dist
+          tar -czf akasha${{ matrix.suffix }}-linux-x86_64.tar.gz akasha${{ matrix.suffix }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: akasha${{ matrix.suffix }}-linux-x86_64
+          path: dist/akasha${{ matrix.suffix }}-linux-x86_64.tar.gz
+
+  # Only publish a GitHub release once all builds finish successfully.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # We need full history to force-move the nightly tag.
+          fetch-depth: 0
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Move the nightly tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push -f origin nightly
+
+      - name: Create/update Nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly
+          body: |
+            Automated nightly build from the latest `dev` branch.
+            - Built on: ${{ github.sha }}
+          prerelease: true
+          files: artifacts/*.tar.gz
+          # Overwrite existing assets on the release rather than erroring.
+          fail_on_unmatched_files: false
