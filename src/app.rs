@@ -1,19 +1,13 @@
 use eframe::egui;
 use sqlx::SqlitePool;
-use std::collections::{HashMap, HashSet};
-
-#[derive(Debug, Clone)]
-pub struct ThumbnailJob {
-    pub idx: usize,
-    pub hash: String,
-    pub priority: i64, // lower = higher priority (distance from viewport center)
-}
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use crate::config::{Config, FolderConfig};
 use crate::db;
 use crate::thumbnailer::{CacheMode, Thumbnailer};
+use crate::ui::browser::BrowserPanel;
 
 #[derive(Debug, Clone)]
 pub enum ScanEvent {
@@ -41,61 +35,29 @@ pub struct AkashaApp {
     pub pool: Arc<SqlitePool>,
     pub rt: Arc<Runtime>,
     pub thumbnailer: Thumbnailer,
+    pub browser: BrowserPanel,
 
-    // UI state
-    pub folders: Vec<db::folder::Folder>,
-    pub selected_folder_id: Option<i64>,
-
-    // Tier 1: lightweight summaries for ALL items in the selected folder.
-    // This is what the grid renders from and what the thumbnail queue indexes into.
-    pub media_summaries: Vec<db::media::MediaSummary>,
-
-    // Tier 2: paginated full MediaFile records, fetched on demand.
-    // Currently unused (reserved for Phase 6: detail panels / bulk ops).
-    pub media_items: Vec<db::media::MediaFile>,
-
-    pub textures: HashMap<String, egui::TextureHandle>,
-    pub pending_thumbnails: HashSet<String>,
-    pub thumbnail_queue: Vec<ThumbnailJob>,
-    pub queued_indices: HashSet<usize>,
-    pub scroll_offset: f32,
-    pub scroll_velocity: f32,      // rows per second, smoothed
-    pub last_scroll_offset: f32,
-    pub last_scroll_time: std::time::Instant,
-    pub thumbnail_epoch: u64,
-    pub media_epoch: u64,
-    pub scan_status: String,
-    pub is_scanning: bool,
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
-    pub thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
     pub media_tx: std::sync::mpsc::Sender<(u64, Result<Vec<db::media::MediaSummary>, String>)>,
     pub media_rx: std::sync::mpsc::Receiver<(u64, Result<Vec<db::media::MediaSummary>, String>)>,
     pub folders_tx: std::sync::mpsc::Sender<Result<Vec<db::folder::Folder>, String>>,
     pub folders_rx: std::sync::mpsc::Receiver<Result<Vec<db::folder::Folder>, String>>,
-    pub last_refresh: std::time::Instant,
-    pub expanded_folders: HashSet<i64>,
+    pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
+    pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
 
-    // Viewer state
+    pub media_refresh_in_flight: bool,
+    pub last_refresh: std::time::Instant,
+
     pub viewer_open: bool,
     pub viewer_index: Option<usize>,
     pub viewer_texture: Option<egui::TextureHandle>,
     pub viewer_zoom_to_fit: bool,
-    pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
-    pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
     pub viewer_just_opened: bool,
     pub pending_viewer_images: HashSet<String>,
 
-    // Refresh dedup
-    pub media_refresh_in_flight: bool,
-
-    // Polish
     pub toasts: Vec<Toast>,
-    pub settings_open: bool,
 }
-
-const MAX_CONCURRENT_THUMBNAILS: usize = 8;
-const THUMB_CELL_HEIGHT: f32 = 230.0;
 
 impl AkashaApp {
     pub fn new(
@@ -128,11 +90,8 @@ impl AkashaApp {
             let mut incomplete = Vec::new();
             for folder_cfg in &folders_config {
                 match db::folder::get_by_path(&pool_clone, &folder_cfg.path).await {
-                    Ok(Some(folder)) if folder.scan_complete => {
-                        // Already fully scanned, skip
-                    }
+                    Ok(Some(folder)) if folder.scan_complete => {}
                     _ => {
-                        // New or incomplete — needs scanning
                         incomplete.push(folder_cfg.clone());
                     }
                 }
@@ -202,45 +161,27 @@ impl AkashaApp {
 
         let mut app = Self {
             config,
-            pool: pool_arc,
-            rt: rt_arc,
+            pool: pool_arc.clone(),
+            rt: rt_arc.clone(),
             thumbnailer,
-            folders: Vec::new(),
-            selected_folder_id: None,
-            media_summaries: Vec::new(),
-            media_items: Vec::new(),
-            textures: HashMap::new(),
-            pending_thumbnails: HashSet::new(),
-            thumbnail_queue: Vec::new(),
-            queued_indices: HashSet::new(),
-            scroll_offset: 0.0,
-            scroll_velocity: 0.0,
-            last_scroll_offset: 0.0,
-            last_scroll_time: std::time::Instant::now(),
-            thumbnail_epoch: 0,
-            media_epoch: 0,
-            scan_status: "Initializing...".to_string(),
-            is_scanning: true,
+            browser: BrowserPanel::new(rt_arc, thumb_tx),
             scan_rx,
-            thumbnail_tx: thumb_tx,
             thumbnail_rx,
             media_tx,
             media_rx,
             folders_tx,
             folders_rx,
+            viewer_image_tx: viewer_img_tx,
+            viewer_image_rx: viewer_img_rx,
+            media_refresh_in_flight: false,
             last_refresh: std::time::Instant::now(),
-            expanded_folders: HashSet::new(),
             viewer_open: false,
             viewer_index: None,
             viewer_texture: None,
             viewer_zoom_to_fit: true,
-            viewer_image_tx: viewer_img_tx,
-            viewer_image_rx: viewer_img_rx,
             viewer_just_opened: false,
             pending_viewer_images: HashSet::new(),
-            media_refresh_in_flight: false,
             toasts: Vec::new(),
-            settings_open: false,
         };
 
         app.refresh_folders_async();
@@ -260,74 +201,22 @@ impl AkashaApp {
         if let Ok(result) = self.folders_rx.try_recv() {
             match result {
                 Ok(folders) => {
-                    // Auto-expand root folders
                     for folder in &folders {
                         if folder.parent_id.is_none() {
-                            self.expanded_folders.insert(folder.id);
+                            self.browser.expanded_folders.insert(folder.id);
                         }
                     }
-                    self.folders = folders;
+                    self.browser.folders = folders;
                 }
-                Err(e) => self.scan_status = format!("Failed to load folders: {e}"),
-            }
-        }
-    }
-
-    fn render_folder_tree(&mut self, ui: &mut egui::Ui, folder_id: i64, depth: usize, clicked_id: &mut Option<i64>) {
-        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
-        let selected = self.selected_folder_id == Some(folder.id);
-        let has_children = self.folders.iter().any(|f| f.parent_id == Some(folder.id));
-        let is_root = folder.parent_id.is_none();
-
-        ui.horizontal(|ui| {
-            ui.add_space(depth as f32 * 16.0);
-
-            if has_children {
-                let arrow = if self.expanded_folders.contains(&folder.id) { "▼" } else { "▶" };
-                if ui.small_button(arrow).clicked() {
-                    if self.expanded_folders.contains(&folder.id) {
-                        self.expanded_folders.remove(&folder.id);
-                    } else {
-                        self.expanded_folders.insert(folder.id);
-                    }
-                }
-            } else {
-                ui.add_space(24.0);
-            }
-
-            let name = std::path::Path::new(&folder.path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&folder.path);
-
-            let label = if is_root {
-                egui::RichText::new(name).strong()
-            } else {
-                egui::RichText::new(name)
-            };
-
-            if ui.selectable_label(selected, label).clicked() && !selected {
-                *clicked_id = Some(folder.id);
-            }
-        });
-
-        if self.expanded_folders.contains(&folder.id) {
-            let children: Vec<i64> = self.folders
-                .iter()
-                .filter(|f| f.parent_id == Some(folder.id))
-                .map(|f| f.id)
-                .collect();
-            for child_id in children {
-                self.render_folder_tree(ui, child_id, depth + 1, clicked_id);
+                Err(e) => self.browser.scan_status = format!("Failed to load folders: {e}"),
             }
         }
     }
 
     fn refresh_media_async(&mut self, hard_reset: bool) {
-        let Some(folder_id) = self.selected_folder_id else { return };
-        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
+        let Some(folder_id) = self.browser.selected_folder_id else { return };
+        let Some(folder) = self.browser.folders.iter().find(|f| f.id == folder_id) else { return };
 
-        // Skip if a refresh is already in flight (prevents overlapping queries during scans)
         if self.media_refresh_in_flight && !hard_reset {
             return;
         }
@@ -337,19 +226,11 @@ impl AkashaApp {
         let show_recursive = folder.show_recursive;
 
         if hard_reset {
-            self.media_epoch += 1;
-            self.scan_status = "Loading images...".to_string();
-            self.media_summaries.clear();
-            self.media_items.clear();
-            self.textures.clear();
-            self.pending_thumbnails.clear();
-            self.thumbnail_queue.clear();
-            self.queued_indices.clear();
-            self.scroll_offset = 0.0;
+            self.browser.clear_for_refresh(true);
         }
 
         self.media_refresh_in_flight = true;
-        let epoch = self.media_epoch;
+        let epoch = self.browser.media_epoch;
         self.rt.spawn(async move {
             let result = if show_recursive {
                 db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
@@ -361,10 +242,9 @@ impl AkashaApp {
     }
 
     fn poll_media_events(&mut self) {
-        // Drain the channel and keep only the latest result matching the current epoch.
         let mut latest: Option<Result<Vec<db::media::MediaSummary>, String>> = None;
         while let Ok((epoch, result)) = self.media_rx.try_recv() {
-            if epoch == self.media_epoch {
+            if epoch == self.browser.media_epoch {
                 latest = Some(result);
             }
         }
@@ -372,19 +252,16 @@ impl AkashaApp {
             self.media_refresh_in_flight = false;
             match result {
                 Ok(items) => {
-                    // Prune textures for hashes no longer in the current folder
                     let needed: HashSet<String> = items.iter().map(|m| m.blake3_hash.clone()).collect();
-                    self.textures.retain(|hash, _| needed.contains(hash));
-                    self.pending_thumbnails.retain(|hash| needed.contains(hash));
-                    // Clear the queue entirely: old jobs carry stale hashes that won't match
-                    // the new items at the same indices after a scan refresh.
-                    self.thumbnail_queue.clear();
-                    self.queued_indices.clear();
-                    self.media_summaries = items;
-                    self.scan_status = format!("{} images", self.media_summaries.len());
+                    self.browser.textures.retain(|hash, _| needed.contains(hash));
+                    self.browser.pending_thumbnails.retain(|hash| needed.contains(hash));
+                    self.browser.thumbnail_queue.clear();
+                    self.browser.queued_indices.clear();
+                    self.browser.media_summaries = items;
+                    self.browser.scan_status = format!("{} images", self.browser.media_summaries.len());
                 }
                 Err(e) => {
-                    self.scan_status = format!("Failed to load media: {e}");
+                    self.browser.scan_status = format!("Failed to load media: {e}");
                 }
             }
         }
@@ -394,20 +271,19 @@ impl AkashaApp {
         while let Ok(event) = self.scan_rx.try_recv() {
             match event {
                 ScanEvent::Started(path) => {
-                    self.scan_status = format!("Scanning: {path}...");
-                    self.is_scanning = true;
+                    self.browser.scan_status = format!("Scanning: {path}...");
+                    self.browser.is_scanning = true;
                 }
                 ScanEvent::Progress(path, count) => {
-                    self.scan_status = format!("Scanning: {path} ({count} files)...");
+                    self.browser.scan_status = format!("Scanning: {path} ({count} files)...");
                 }
                 ScanEvent::Complete(path, count) => {
-                    self.scan_status = format!("Done scanning {path}: {count} files");
-                    self.is_scanning = false;
+                    self.browser.scan_status = format!("Done scanning {path}: {count} files");
+                    self.browser.is_scanning = false;
                     self.refresh_folders_async();
-                    if self.selected_folder_id.is_none() {
-                        // Select first root folder if nothing selected
-                        if let Some(root) = self.folders.iter().find(|f| f.parent_id.is_none()) {
-                            self.selected_folder_id = Some(root.id);
+                    if self.browser.selected_folder_id.is_none() {
+                        if let Some(root) = self.browser.folders.iter().find(|f| f.parent_id.is_none()) {
+                            self.browser.selected_folder_id = Some(root.id);
                             self.refresh_media_async(true);
                         }
                     } else {
@@ -415,8 +291,8 @@ impl AkashaApp {
                     }
                 }
                 ScanEvent::Error(path, err) => {
-                    self.scan_status = format!("Error scanning {path}: {err}");
-                    self.is_scanning = false;
+                    self.browser.scan_status = format!("Error scanning {path}: {err}");
+                    self.browser.is_scanning = false;
                     self.push_toast(format!("Scan error in {path}: {err}"), ToastLevel::Error);
                 }
             }
@@ -425,9 +301,9 @@ impl AkashaApp {
 
     fn poll_thumbnail_events(&mut self, ctx: &egui::Context) {
         while let Ok((hash, epoch, result)) = self.thumbnail_rx.try_recv() {
-            self.pending_thumbnails.remove(&hash);
-            if epoch != self.thumbnail_epoch {
-                continue; // stale result from before a size change
+            self.browser.pending_thumbnails.remove(&hash);
+            if epoch != self.browser.thumbnail_epoch {
+                continue;
             }
             match result {
                 Ok(color_image) => {
@@ -436,132 +312,13 @@ impl AkashaApp {
                         color_image,
                         egui::TextureOptions::default(),
                     );
-                    self.textures.insert(hash, texture);
+                    self.browser.textures.insert(hash, texture);
                 }
                 Err(e) => {
                     tracing::warn!("Thumbnail failed for {}: {}", hash, e);
                     self.push_toast(format!("Thumbnail failed: {}", e), ToastLevel::Warning);
                 }
             }
-        }
-    }
-
-    fn queue_visible_thumbnails(&mut self, viewport_height: f32, cols: usize, first_visible_row: usize, last_visible_row: usize) {
-        if cols == 0 || self.media_summaries.is_empty() {
-            return;
-        }
-        let center_row = (first_visible_row + last_visible_row) / 2;
-
-        // Update scroll velocity (rows per second, exponentially smoothed)
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(self.last_scroll_time).as_secs_f32().max(0.001);
-        let rows_delta = (self.scroll_offset - self.last_scroll_offset).abs() / THUMB_CELL_HEIGHT;
-        let instant_velocity = rows_delta / dt;
-        self.scroll_velocity = self.scroll_velocity * 0.8 + instant_velocity * 0.2;
-        self.last_scroll_offset = self.scroll_offset;
-        self.last_scroll_time = now;
-
-        // Determine prefetch zone based on velocity.
-        // `max_dist` only applies during fast scroll; medium/idle queue the full prefetch zone.
-        let (prefetch_rows, max_dist, fast_scroll) = if self.scroll_velocity > 240.0 {
-            (1, 2, true)
-        } else if self.scroll_velocity > 60.0 {
-            (2, usize::MAX, false)
-        } else {
-            (5, usize::MAX, false)
-        };
-
-        let start_idx = first_visible_row.saturating_sub(prefetch_rows) * cols;
-        let end_idx = ((last_visible_row + prefetch_rows) * cols).min(self.media_summaries.len());
-
-        // Evict textures far outside the viewport to bound memory usage.
-        // Keep viewport + prefetch + a 10-row margin.
-        let evict_margin = prefetch_rows + 10;
-        let keep_start = first_visible_row.saturating_sub(evict_margin) * cols;
-        let keep_end = ((last_visible_row + evict_margin) * cols).min(self.media_summaries.len());
-        let keep_hashes: HashSet<&str> = self.media_summaries[keep_start..keep_end]
-            .iter()
-            .map(|m| m.blake3_hash.as_str())
-            .collect();
-        self.textures.retain(|hash, _| keep_hashes.contains(hash.as_str()));
-
-        let mut to_queue = Vec::new();
-        for i in start_idx..end_idx {
-            let hash = &self.media_summaries[i].blake3_hash;
-            if !self.textures.contains_key(hash)
-                && !self.pending_thumbnails.contains(hash)
-            {
-                let row = i / cols;
-                let dist = if row > center_row {
-                    row - center_row
-                } else {
-                    center_row - row
-                };
-                if !fast_scroll || dist <= max_dist {
-                    to_queue.push(ThumbnailJob {
-                        idx: i,
-                        hash: hash.clone(),
-                        priority: dist as i64,
-                    });
-                }
-            }
-        }
-
-        // Sort by priority ascending (best first), then reverse for efficient pop()
-        to_queue.sort_by_key(|job| job.priority);
-        to_queue.reverse();
-
-        self.thumbnail_queue.clear();
-        self.queued_indices.clear();
-        for job in to_queue {
-            self.queued_indices.insert(job.idx);
-            self.thumbnail_queue.push(job);
-        }
-    }
-
-    fn process_thumbnail_queue(&mut self) {
-        let can_spawn = MAX_CONCURRENT_THUMBNAILS.saturating_sub(self.pending_thumbnails.len());
-        if can_spawn == 0 {
-            return;
-        }
-
-        for _ in 0..can_spawn {
-            let Some(job) = self.thumbnail_queue.pop() else {
-                break;
-            };
-            self.queued_indices.remove(&job.idx);
-
-            // Double-check it's still needed
-            if self.textures.contains_key(&job.hash) || self.pending_thumbnails.contains(&job.hash) {
-                continue;
-            }
-
-            let Some(media) = self.media_summaries.get(job.idx) else {
-                continue;
-            };
-
-            // Use the CURRENT hash from media_summaries, not the potentially stale job.hash.
-            // This prevents texture key mismatches when media refreshes during scans.
-            let hash = media.blake3_hash.clone();
-            self.pending_thumbnails.insert(hash.clone());
-            let source = std::path::PathBuf::from(&media.absolute_path);
-            let size = self.thumbnailer.size;
-            let cache_mode = self.thumbnailer.cache_mode.clone();
-            let tx = self.thumbnail_tx.clone();
-            let epoch = self.thumbnail_epoch;
-
-            self.rt.spawn_blocking(move || {
-                let thumbnailer = Thumbnailer::new(size, cache_mode);
-                let result = thumbnailer.load_thumbnail_bytes(&source, &hash, None)
-                    .and_then(|bytes| {
-                        let img = image::load_from_memory(&bytes)
-                            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-                        let rgba = img.to_rgba8();
-                        let sz = [rgba.width() as usize, rgba.height() as usize];
-                        Ok(egui::ColorImage::from_rgba_unmultiplied(sz, rgba.as_raw()))
-                    });
-                let _ = tx.send((hash, epoch, result.map_err(|e| e.to_string())));
-            });
         }
     }
 
@@ -583,7 +340,7 @@ impl AkashaApp {
 
     fn navigate_viewer(&mut self, delta: isize) {
         if let Some(idx) = self.viewer_index {
-            let len = self.media_summaries.len();
+            let len = self.browser.media_summaries.len();
             if len == 0 {
                 self.close_viewer();
                 return;
@@ -602,18 +359,14 @@ impl AkashaApp {
 
     fn load_viewer_image(&mut self) {
         if let Some(idx) = self.viewer_index {
-            if let Some(media) = self.media_summaries.get(idx) {
+            if let Some(media) = self.browser.media_summaries.get(idx) {
                 let hash = media.blake3_hash.clone();
-
-                // Skip if this image is already loading
                 if self.pending_viewer_images.contains(&hash) {
                     return;
                 }
                 self.pending_viewer_images.insert(hash.clone());
-
                 let source = std::path::PathBuf::from(&media.absolute_path);
                 let tx = self.viewer_image_tx.clone();
-
                 self.rt.spawn_blocking(move || {
                     match image::open(&source) {
                         Ok(img) => {
@@ -637,11 +390,8 @@ impl AkashaApp {
     fn poll_viewer_images(&mut self, ctx: &egui::Context) {
         while let Ok((hash, result)) = self.viewer_image_rx.try_recv() {
             self.pending_viewer_images.remove(&hash);
-
-            // Ignore viewer image loads for a media item that is no longer
-            // the one being viewed (e.g. user navigated away while load was in flight).
             let current_hash = self.viewer_index
-                .and_then(|idx| self.media_summaries.get(idx))
+                .and_then(|idx| self.browser.media_summaries.get(idx))
                 .map(|m| m.blake3_hash.as_str());
             if current_hash != Some(hash.as_str()) {
                 continue;
@@ -721,67 +471,12 @@ impl AkashaApp {
         }
     }
 
-    fn show_settings(&mut self, ctx: &egui::Context) {
-        let mut open = self.settings_open;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(400.0)
-            .show(ctx, |ui| {
-                ui.heading("Appearance");
-                ui.separator();
-
-                let mut dark = self.config.ui.theme == "dark";
-                if ui.checkbox(&mut dark, "Dark theme").changed() {
-                    self.config.ui.theme = if dark { "dark".to_string() } else { "light".to_string() };
-                    crate::theme::apply(ctx, dark);
-                    if let Err(e) = self.config.save() {
-                        self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
-                    }
-                }
-
-                ui.add_space(16.0);
-                ui.heading("Thumbnails");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Size:");
-                    let mut size = self.config.ui.thumbnail_size as f32;
-                    if ui.add(egui::Slider::new(&mut size, 64.0..=512.0).step_by(16.0)).changed() {
-                        self.config.ui.thumbnail_size = size as u32;
-                        self.thumbnailer.size = size as u32;
-                        self.textures.clear();
-                        self.pending_thumbnails.clear();
-                        self.thumbnail_queue.clear();
-                        self.queued_indices.clear();
-                        self.thumbnail_epoch += 1;
-                        if let Err(e) = self.config.save() {
-                            self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
-                        }
-                    }
-                });
-
-                ui.add_space(16.0);
-                ui.heading("Folders");
-                ui.separator();
-                ui.label("Edit ~/.config/akasha/config.toml to add or remove folders.");
-                ui.label("Changes require a restart to take full effect.");
-
-                ui.add_space(8.0);
-                for folder in &self.config.folders {
-                    ui.label(format!("• {}", folder.path));
-                }
-            });
-        self.settings_open = open;
-    }
-
     fn trigger_rescan(&mut self) {
-        if self.is_scanning {
+        if self.browser.is_scanning {
             return;
         }
-        self.is_scanning = true;
-        self.scan_status = "Rescanning...".to_string();
+        self.browser.is_scanning = true;
+        self.browser.scan_status = "Rescanning...".to_string();
 
         let pool_clone = Arc::clone(&self.pool);
         let folders_config: Vec<FolderConfig> = self.config.folders.clone();
@@ -808,7 +503,6 @@ impl AkashaApp {
                 .await
                 {
                     Ok(folder_id) => {
-                        // Mark entire tree as incomplete before scanning so interruption is recoverable
                         let _ = db::folder::update_scan_complete_recursive(&pool_clone, folder_id, false).await;
                         match crate::scanner::scan_folder(
                             &pool_clone,
@@ -854,164 +548,35 @@ impl eframe::App for AkashaApp {
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
-        self.process_thumbnail_queue();
+        self.browser.process_thumbnail_queue(&self.thumbnailer);
 
-        // Periodic refresh while scanning so the tree populates and counts update live
-        if self.is_scanning && self.last_refresh.elapsed() > std::time::Duration::from_secs(2) {
+        if self.browser.is_scanning && self.last_refresh.elapsed() > std::time::Duration::from_secs(2) {
             self.last_refresh = std::time::Instant::now();
             self.refresh_folders_async();
-            if self.selected_folder_id.is_some() {
+            if self.browser.selected_folder_id.is_some() {
                 self.refresh_media_async(false);
             }
         }
 
-        // Top bar
-        egui::TopBottomPanel::top("top_bar")
-            .frame(egui::Frame::new()
-                .fill(ctx.style().visuals.panel_fill)
-                .inner_margin(egui::Margin::same(12)))
-            .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Akasha");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙ Settings").clicked() {
-                        self.settings_open = !self.settings_open;
-                    }
-                    if ui.button("⟳ Rescan").clicked() && !self.is_scanning {
-                        self.trigger_rescan();
-                    }
-                    ui.label(&self.scan_status);
-                });
-            });
-        });
+        let actions = self.browser.show(ctx);
 
-        // Left sidebar: folder tree
-        egui::SidePanel::left("folders")
-            .resizable(true)
-            .default_width(250.0)
-            .frame(egui::Frame::new()
-                .fill(ctx.style().visuals.panel_fill)
-                .inner_margin(egui::Margin::same(12)))
-            .show(ctx, |ui| {
-                ui.heading("Folders");
-                ui.separator();
+        if let Some(id) = actions.selected_folder {
+            self.browser.selected_folder_id = Some(id);
+            self.refresh_media_async(true);
+        }
+        if let Some(idx) = actions.opened_thumbnail {
+            self.open_viewer(idx);
+        }
+        if actions.rescan_requested {
+            self.trigger_rescan();
+        }
+        if actions.settings_toggled {
+            self.browser.settings_open = !self.browser.settings_open;
+        }
 
-                if self.folders.is_empty() {
-                    ui.label("No folders configured.");
-                    ui.label("Add folders in config.toml");
-                } else {
-                    let mut clicked_id = None;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let roots: Vec<i64> = self.folders
-                            .iter()
-                            .filter(|f| f.parent_id.is_none())
-                            .map(|f| f.id)
-                            .collect();
-                        for root_id in roots {
-                            self.render_folder_tree(ui, root_id, 0, &mut clicked_id);
-                        }
-                    });
-                    if let Some(id) = clicked_id {
-                        self.selected_folder_id = Some(id);
-                        self.refresh_media_async(true);
-                    }
-                }
-            });
-
-        // Main content
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.is_scanning && self.media_summaries.is_empty() && self.selected_folder_id.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.heading("Scanning...");
-                    ui.label(&self.scan_status);
-                });
-            } else if self.media_summaries.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    if self.selected_folder_id.is_some() {
-                        ui.heading("No images in this folder");
-                    } else {
-                        ui.heading("Select a folder");
-                    }
-                });
-            } else {
-                ui.heading(format!("{} images", self.media_summaries.len()));
-                ui.separator();
-
-                let cols = (ui.available_width() / 220.0).max(1.0) as usize;
-                let rows = (self.media_summaries.len() + cols - 1) / cols;
-                let item_size = egui::vec2(200.0, 200.0);
-                let label_h = 30.0;
-                let row_height = item_size.y + label_h;
-
-                let mut visible_rows: Option<(usize, usize)> = None;
-                let scroll = egui::ScrollArea::vertical()
-                    .show_rows(ui, row_height, rows, |ui, row_range| {
-                        visible_rows = Some((row_range.start, row_range.end));
-                        let mut clicked_index = None;
-                        for row in row_range {
-                            ui.horizontal(|ui| {
-                                for col in 0..cols {
-                                    let idx = row * cols + col;
-                                    if idx >= self.media_summaries.len() {
-                                        break;
-                                    }
-                                    let media = &self.media_summaries[idx];
-
-                                    let clicked = ui.allocate_ui_with_layout(
-                                        egui::vec2(item_size.x, row_height),
-                                        egui::Layout::top_down(egui::Align::Center),
-                                        |ui| {
-                                            ui.set_min_height(row_height);
-                                            let response = if let Some(texture) = self.textures.get(&media.blake3_hash) {
-                                                let mut size = item_size;
-                                                let tex_w = texture.size()[0] as f32;
-                                                let tex_h = texture.size()[1] as f32;
-                                                if tex_w > 0.0 && tex_h > 0.0 {
-                                                    let aspect = tex_w / tex_h;
-                                                    if aspect > 1.0 {
-                                                        size.y = size.x / aspect;
-                                                    } else {
-                                                        size.x = size.y * aspect;
-                                                    }
-                                                }
-                                                ui.add_sized(item_size,
-                                                    egui::Image::new((texture.id(), size))
-                                                        .fit_to_exact_size(size)
-                                                        .sense(egui::Sense::click()),
-                                                )
-                                            } else {
-                                                ui.add_sized(item_size, egui::Spinner::new())
-                                            };
-                                            let filename = std::path::Path::new(&media.relative_path)
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or(&media.relative_path);
-                                            ui.add(egui::Label::new(filename).truncate());
-                                            response.clicked()
-                                        },
-                                    ).inner;
-                                    if clicked {
-                                        clicked_index = Some(idx);
-                                    }
-                                }
-                            });
-                        }
-                        if let Some(i) = clicked_index {
-                            self.open_viewer(i);
-                        }
-                    });
-                self.scroll_offset = scroll.state.offset.y;
-                let viewport_h = scroll.inner_rect.height();
-                if let Some((first, last)) = visible_rows {
-                    self.queue_visible_thumbnails(viewport_h, cols, first, last);
-                }
-            }
-        });
-
-        // Viewer overlay (drawn on top of browser)
         if self.viewer_open {
             if let Some(idx) = self.viewer_index {
-                if let Some(media) = self.media_summaries.get(idx) {
+                if let Some(media) = self.browser.media_summaries.get(idx) {
                     let resp = crate::ui::viewer::show(
                         ctx,
                         media,
@@ -1039,11 +604,38 @@ impl eframe::App for AkashaApp {
             self.viewer_just_opened = false;
         }
 
-        if self.settings_open {
-            self.show_settings(ctx);
+        if self.browser.settings_open {
+            let settings_actions = crate::ui::settings::show(
+                ctx,
+                &mut self.browser.settings_open,
+                &mut self.config,
+            );
+            let mut settings_changed = false;
+            for action in settings_actions {
+                match action {
+                    crate::ui::settings::SettingsAction::ThumbnailSizeChanged(size) => {
+                        self.thumbnailer.size = size;
+                        self.browser.textures.clear();
+                        self.browser.pending_thumbnails.clear();
+                        self.browser.thumbnail_queue.clear();
+                        self.browser.queued_indices.clear();
+                        self.browser.thumbnail_epoch += 1;
+                        settings_changed = true;
+                    }
+                    crate::ui::settings::SettingsAction::ThemeChanged(dark) => {
+                        crate::theme::apply(ctx, dark);
+                        settings_changed = true;
+                    }
+                }
+            }
+            if settings_changed {
+                if let Err(e) = self.config.save() {
+                    self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
+                }
+            }
         }
-        self.show_toasts(ctx);
 
+        self.show_toasts(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
