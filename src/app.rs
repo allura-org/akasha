@@ -961,6 +961,7 @@ impl eframe::App for AkashaApp {
                                         egui::vec2(item_size.x, row_height),
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
+                                            ui.set_min_height(row_height);
                                             let response = if let Some(texture) = self.textures.get(&media.blake3_hash) {
                                                 let mut size = item_size;
                                                 let tex_w = texture.size()[0] as f32;
@@ -973,7 +974,7 @@ impl eframe::App for AkashaApp {
                                                         size.x = size.y * aspect;
                                                     }
                                                 }
-                                                ui.add(
+                                                ui.add_sized(item_size,
                                                     egui::Image::new((texture.id(), size))
                                                         .fit_to_exact_size(size)
                                                         .sense(egui::Sense::click()),
@@ -981,12 +982,11 @@ impl eframe::App for AkashaApp {
                                             } else {
                                                 ui.add_sized(item_size, egui::Spinner::new())
                                             };
-                                            ui.label(
-                                                std::path::Path::new(&media.relative_path)
-                                                    .file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .unwrap_or(&media.relative_path),
-                                            );
+                                            let filename = std::path::Path::new(&media.relative_path)
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or(&media.relative_path);
+                                            ui.add(egui::Label::new(filename).truncate());
                                             response.clicked()
                                         },
                                     ).inner;
