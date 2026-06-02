@@ -16,19 +16,19 @@ permissions:
 
 jobs:
   build:
-    # ubuntu-22.04 has an older glibc than latest, so the binary runs on more distros.
-    runs-on: ubuntu-22.04
     strategy:
       matrix:
         include:
-          # Standard build: SIMD thumbnails + statically linked libwebp.
-          # No dynamic image deps required at runtime.
-          - feature-flag: ""
+          # Standard build: older glibc for max compatibility.
+          - os: ubuntu-22.04
+            feature-flag: ""
             suffix: ""
-          # HEVC build: everything above, plus dynamic libheif + libde265.
-          # Users must have those two libraries installed on their system.
-          - feature-flag: "hevc"
+          # HEVC build: needs libheif >= 1.17, which Ubuntu 24.04 provides.
+          # Slightly newer glibc, but HEVC users likely run modern distros anyway.
+          - os: ubuntu-24.04
+            feature-flag: "hevc"
             suffix: "-hevc"
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout repository
