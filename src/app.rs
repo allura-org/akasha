@@ -161,12 +161,14 @@ impl AkashaApp {
         }
 
         let scroll_speed = config.ui.scroll_speed;
+        let sort_key = config.ui.sort_key;
+        let sort_order = config.ui.sort_order;
         let mut app = Self {
             config,
             pool: pool_arc.clone(),
             rt: rt_arc.clone(),
             thumbnailer,
-            browser: BrowserPanel::new(rt_arc, thumb_tx, scroll_speed),
+            browser: BrowserPanel::new(rt_arc, thumb_tx, scroll_speed, sort_key, sort_order),
             scan_rx,
             thumbnail_rx,
             media_tx,
@@ -625,6 +627,18 @@ impl eframe::App for AkashaApp {
                 self.push_toast(format!("Failed to copy to clipboard: {e}"), ToastLevel::Error);
             } else {
                 self.push_toast("Image copied to clipboard".to_string(), ToastLevel::Info);
+            }
+        }
+        if let Some(key) = actions.sort_key_changed {
+            self.config.ui.sort_key = key;
+            if let Err(e) = self.config.save() {
+                self.push_toast(format!("Failed to save config: {e}"), ToastLevel::Error);
+            }
+        }
+        if let Some(order) = actions.sort_order_changed {
+            self.config.ui.sort_order = order;
+            if let Err(e) = self.config.save() {
+                self.push_toast(format!("Failed to save config: {e}"), ToastLevel::Error);
             }
         }
 

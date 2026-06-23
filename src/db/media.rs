@@ -24,6 +24,9 @@ pub struct MediaSummary {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
+    pub file_size: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub modified_at: Option<chrono::NaiveDateTime>,
 }
 
 pub async fn count_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<i64> {
@@ -55,7 +58,7 @@ pub async fn list_summaries_by_folder(
 ) -> anyhow::Result<Vec<MediaSummary>> {
     let mut summaries = Vec::new();
     let mut stream = sqlx::query_as::<_, MediaSummaryRow>(
-        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash, width, height, format
+        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, created_at, modified_at
          FROM media_files
          WHERE folder_id = ?1
          ORDER BY id"
@@ -81,7 +84,7 @@ pub async fn list_summaries_by_folder_recursive(
             UNION ALL
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
          )
-         SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash, m.width, m.height, m.format
+         SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash, m.width, m.height, m.format, m.file_size, m.created_at, m.modified_at
          FROM media_files m
          JOIN subtree s ON m.folder_id = s.id
          ORDER BY m.id"
@@ -287,6 +290,9 @@ struct MediaSummaryRow {
     width: Option<i64>,
     height: Option<i64>,
     format: Option<String>,
+    file_size: Option<i64>,
+    created_at: chrono::NaiveDateTime,
+    modified_at: Option<chrono::NaiveDateTime>,
 }
 
 fn into_media(row: MediaFileRow) -> MediaFile {
@@ -313,5 +319,8 @@ fn into_summary(row: MediaSummaryRow) -> MediaSummary {
         width: row.width.map(|v| v as u32),
         height: row.height.map(|v| v as u32),
         format: row.format,
+        file_size: row.file_size,
+        created_at: row.created_at,
+        modified_at: row.modified_at,
     }
 }

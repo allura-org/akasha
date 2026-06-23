@@ -3,8 +3,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
+use crate::config::{SortKey, SortOrder};
 use crate::db;
+use crate::db::media::MediaSummary;
 use crate::thumbnailer::Thumbnailer;
+
+fn filename_of(media: &MediaSummary) -> String {
+    std::path::Path::new(&media.relative_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| media.relative_path.to_lowercase())
+}
 
 #[derive(Debug, Clone)]
 pub struct ThumbnailJob {
@@ -20,6 +30,8 @@ pub struct BrowserActions {
     pub settings_toggled: bool,
     pub show_in_file_manager: Option<String>,
     pub copy_to_clipboard: Option<String>,
+    pub sort_key_changed: Option<SortKey>,
+    pub sort_order_changed: Option<SortOrder>,
 }
 
 const MAX_CONCURRENT_THUMBNAILS: usize = 8;
@@ -46,6 +58,12 @@ pub struct BrowserPanel {
     pub settings_open: bool,
     pub scroll_speed: f32,
     pub folder_filter: String,
+    pub sort_key: SortKey,
+    pub sort_order: SortOrder,
+
+    last_sorted_key: SortKey,
+    last_sorted_order: SortOrder,
+    last_sorted_len: usize,
 
     rt: Arc<Runtime>,
     thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
@@ -56,6 +74,8 @@ impl BrowserPanel {
         rt: Arc<Runtime>,
         thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
         scroll_speed: f32,
+        sort_key: SortKey,
+        sort_order: SortOrder,
     ) -> Self {
         Self {
             folders: Vec::new(),
@@ -78,6 +98,11 @@ impl BrowserPanel {
             settings_open: false,
             scroll_speed,
             folder_filter: String::new(),
+            sort_key,
+            sort_order,
+            last_sorted_key: sort_key,
+            last_sorted_order: sort_order,
+            last_sorted_len: 0,
             rt,
             thumbnail_tx,
         }
@@ -94,7 +119,47 @@ impl BrowserPanel {
             self.thumbnail_queue.clear();
             self.queued_indices.clear();
             self.scroll_offset = 0.0;
+            self.last_sorted_len = 0;
         }
+    }
+
+    fn ensure_sorted(&mut self) {
+        if self.media_summaries.is_empty() {
+            return;
+        }
+        if self.sort_key == self.last_sorted_key
+            && self.sort_order == self.last_sorted_order
+            && self.media_summaries.len() == self.last_sorted_len
+        {
+            return;
+        }
+
+        let key = self.sort_key;
+        let order = self.sort_order;
+        self.media_summaries.sort_by(|a, b| {
+            let cmp = match key {
+                SortKey::Filename => filename_of(a).cmp(&filename_of(b)),
+                SortKey::Size => a.file_size.cmp(&b.file_size),
+                SortKey::DateCreated => a.created_at.cmp(&b.created_at),
+                SortKey::DateModified => a.modified_at.cmp(&b.modified_at),
+            };
+
+            let cmp = match order {
+                SortOrder::Ascending => cmp,
+                SortOrder::Descending => cmp.reverse(),
+            };
+
+            // Filename is the tie-breaker, always ascending.
+            if cmp == std::cmp::Ordering::Equal {
+                filename_of(a).cmp(&filename_of(b))
+            } else {
+                cmp
+            }
+        });
+
+        self.last_sorted_key = key;
+        self.last_sorted_order = order;
+        self.last_sorted_len = self.media_summaries.len();
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> BrowserActions {
@@ -105,6 +170,8 @@ impl BrowserPanel {
             settings_toggled: false,
             show_in_file_manager: None,
             copy_to_clipboard: None,
+            sort_key_changed: None,
+            sort_order_changed: None,
         };
 
         // Top bar
@@ -122,6 +189,23 @@ impl BrowserPanel {
                         if ui.button("⟳ Rescan").clicked() && !self.is_scanning {
                             actions.rescan_requested = true;
                         }
+
+                        // Sort menu
+                        egui::ComboBox::from_id_salt("sort_key")
+                            .selected_text(self.sort_key.label())
+                            .show_ui(ui, |ui| {
+                                for key in [SortKey::Filename, SortKey::Size, SortKey::DateCreated, SortKey::DateModified] {
+                                    if ui.selectable_label(self.sort_key == key, key.label()).clicked() {
+                                        self.sort_key = key;
+                                        actions.sort_key_changed = Some(key);
+                                    }
+                                }
+                            });
+                        if ui.button(self.sort_order.label()).clicked() {
+                            self.sort_order = self.sort_order.toggle();
+                            actions.sort_order_changed = Some(self.sort_order);
+                        }
+
                         ui.label(&self.scan_status);
                     });
                 });
@@ -185,6 +269,8 @@ impl BrowserPanel {
                     }
                 });
             } else {
+                self.ensure_sorted();
+
                 ui.heading(format!("{} images", self.media_summaries.len()));
                 ui.separator();
 
