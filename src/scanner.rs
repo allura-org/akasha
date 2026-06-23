@@ -6,7 +6,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "avif",
 ];
 
-fn is_supported(path: &Path) -> bool {
+pub fn is_supported(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {
@@ -416,6 +416,57 @@ async fn enqueue_search_jobs(
         media_ids.len()
     );
     Ok(())
+}
+
+/// Process and upsert a single file incrementally. Used by the file watcher.
+pub async fn upsert_one(
+    pool: &sqlx::SqlitePool,
+    folder_id: i64,
+    relative_path: &str,
+    absolute_path: &str,
+) -> anyhow::Result<i64> {
+    let path = std::path::PathBuf::from(absolute_path);
+
+    if !path.is_file() || !is_supported(&path) {
+        anyhow::bail!("unsupported or missing file: {}", absolute_path);
+    }
+
+    let metadata = tokio::fs::metadata(&path).await?;
+    let file_size = metadata.len();
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
+        })
+        .flatten()
+        .map(|dt| dt.naive_utc());
+
+    let path_buf = path.clone();
+    let (hash, width, height, format) = tokio::task::spawn_blocking(move || process_file(&path_buf))
+        .await
+        .map_err(|e| anyhow::anyhow!("task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("process_file failed: {e}"))?;
+
+    let id = crate::db::media::upsert(
+        pool,
+        folder_id,
+        relative_path,
+        absolute_path,
+        &hash,
+        width,
+        height,
+        format.as_deref(),
+        Some(file_size),
+        modified_at,
+    )
+    .await?;
+
+    enqueue_search_jobs(pool, &[id]).await?;
+
+    Ok(id)
 }
 
 fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>, Option<String>)> {

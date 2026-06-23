@@ -90,6 +90,8 @@ cargo test
 7. During a scan, the scanner uses an **mtime + size fast path** to skip unchanged files without re-hashing them. Only files whose `modified_at` or `file_size` differ from the DB record (or whose `format` is missing) are hashed and upserted.
 8. Changed files are written to the DB in **batches of 500** wrapped in explicit transactions, rather than one implicit transaction per file.
 9. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
+10. Start the filesystem watcher (`watcher::spawn`) for every configured folder. Watcher events are ignored while a manual scan is in flight to avoid races.
+11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`.
 
 ---
 
@@ -103,6 +105,7 @@ src/
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
   searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename` Searchable, background worker stub
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
+  watcher.rs     — Filesystem watcher using `notify-debouncer-full`; emits batched Create/Modify/Remove events to `app.rs`
   theme.rs       — Custom flat egui theme
   db/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
@@ -122,6 +125,7 @@ src/
 - `db::folder`, `db::media`, and `db::searchable` are the DB access layers.
 - `scanner` and `thumbnailer` are called from async tasks spawned by `app.rs`.
 - `searchables::SearchWorker` runs as a background tokio task started from `app.rs`.
+- `watcher::spawn` is called from `app.rs` on startup; watcher events are polled each frame.
 - `ui::viewer` is a pure function called from `app.rs` viewer state; `ui::browser` now owns the folder tree and search bar.
 
 ---
@@ -250,8 +254,8 @@ Per-folder config can override `thumbnail_cache_mode`. Blacklists are glob patte
 | 5 | Image viewer + keyboard nav | ✅ Complete |
 | 6 | Polish: theme, error toasts, settings UI | ✅ Complete |
 | — | **MVP Complete** — usable gallery | ✅ Complete |
-| 7 | `notify` file watcher, incremental updates | ❌ Not started |
-| 8 | Searchables trait + filename baseline | 🔄 In progress (trait, registry, and `filename` Searchable implemented; ONNX deferred) |
+| 7 | `notify` file watcher, incremental updates | ✅ Complete (debounced watcher, single-file upsert/delete, subfolder creation) |
+| 8 | Searchables trait + filename baseline | ✅ Complete (trait, registry, and `filename` Searchable implemented; ONNX deferred) |
 | 9 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
 | 10 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
 
@@ -260,10 +264,11 @@ The full original plan (database evaluation, Searchables trait definition, exten
 ## Known Gaps / TODOs
 
 - `ui/widgets.rs` — only contains a placeholder label helper.
-- File system watching (`notify`) is listed as a dependency but not yet integrated.
 - ONNX inference for tags/embeddings/classifications is not yet implemented; `job_queue` and `SearchWorker` are stubs that mark jobs done.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
 - Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
+- Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched folders.
+- Cross-root file moves appear as a Remove + Create pair; no move deduplication.
 - `delete_orphans_for_root` in `db/media.rs` is no longer called (replaced by per-folder cleanup) and has a bug (only matches direct children, not all descendants).
 - **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.
 - **Thumbnail queue velocity tuning:** the scroll-velocity thresholds (60/240 rows/sec) are initial guesses and may need adjustment based on real-world feel.
@@ -289,6 +294,8 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/thumbnailer.rs` | Thumbnail generation and cache path resolution |
 | `src/ui/browser.rs` | Folder tree, thumbnail grid, and search bar |
 | `src/ui/viewer.rs` | Full-screen image viewer overlay |
+| `src/watcher.rs` | Filesystem watcher and event classification |
+| `generate_test_noise.py` | Helper script to create random noise PNGs for watcher testing |
 
 ### Scratchpad Folder (`.kimi/`)
 

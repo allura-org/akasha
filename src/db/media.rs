@@ -161,6 +161,40 @@ pub async fn get_by_id(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Medi
     Ok(row.map(into_media))
 }
 
+pub async fn get_by_path(
+    pool: &SqlitePool,
+    folder_id: i64,
+    relative_path: &str,
+) -> anyhow::Result<Option<MediaFile>> {
+    let row = sqlx::query_as::<_, MediaFileRow>(
+        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
+                width, height, format, file_size
+         FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
+    )
+    .bind(folder_id)
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(into_media))
+}
+
+pub async fn delete_by_path(
+    pool: &SqlitePool,
+    folder_id: i64,
+    relative_path: &str,
+) -> anyhow::Result<u64> {
+    let rows = sqlx::query(
+        "DELETE FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
+    )
+    .bind(folder_id)
+    .bind(relative_path)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(rows)
+}
+
 pub async fn list_page_by_folder(
     pool: &SqlitePool,
     folder_id: i64,
@@ -372,5 +406,50 @@ fn into_summary(row: MediaSummaryRow) -> MediaSummary {
         created_at: row.created_at,
         modified_at: row.modified_at,
         search_score: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::folder;
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn get_by_path_and_delete_by_path_round_trip() {
+        let pool = setup_pool().await;
+        let fid = folder::insert(&pool, None, "/tmp/root", true, true, true, &[], None)
+            .await
+            .unwrap();
+
+        let id = upsert(
+            &pool,
+            fid,
+            "foo.jpg",
+            "/tmp/root/foo.jpg",
+            "hash",
+            Some(100),
+            Some(200),
+            Some("jpeg"),
+            Some(1024),
+            Some(chrono::Local::now().naive_local()),
+        )
+        .await
+        .unwrap();
+
+        let found = get_by_path(&pool, fid, "foo.jpg").await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, id);
+
+        let deleted = delete_by_path(&pool, fid, "foo.jpg").await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let found = get_by_path(&pool, fid, "foo.jpg").await.unwrap();
+        assert!(found.is_none());
     }
 }

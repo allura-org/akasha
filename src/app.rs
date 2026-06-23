@@ -7,6 +7,7 @@ use tokio::runtime::Runtime;
 use crate::config::{Config, FolderConfig};
 use crate::db;
 use crate::searchables::{SearchEngine, SearchQuery};
+use crate::watcher::{WatcherChangeKind, WatcherEvent, WatcherHandle};
 use crate::thumbnailer::{CacheMode, Thumbnailer};
 use crate::ui::browser::BrowserPanel;
 
@@ -49,6 +50,9 @@ pub struct AkashaApp {
     pub search_names_rx: std::sync::mpsc::Receiver<Result<Vec<String>, String>>,
     pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
     pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
+
+    pub watcher_rx: std::sync::mpsc::Receiver<WatcherEvent>,
+    pub watcher_handle: Option<WatcherHandle>,
 
     pub media_refresh_in_flight: bool,
     pub last_refresh: std::time::Instant,
@@ -185,6 +189,8 @@ impl AkashaApp {
             search_names_rx,
             viewer_image_tx: viewer_img_tx,
             viewer_image_rx: viewer_img_rx,
+            watcher_rx: std::sync::mpsc::channel().1,
+            watcher_handle: None,
             media_refresh_in_flight: false,
             last_refresh: std::time::Instant::now(),
             viewer_open: false,
@@ -204,6 +210,19 @@ impl AkashaApp {
         app.rt.spawn(async move {
             crate::searchables::SearchWorker::new(worker_pool).run().await;
         });
+
+        // Start the filesystem watcher immediately. Events that arrive while a
+        // manual scan is in flight are ignored to avoid races.
+        match crate::watcher::spawn(Arc::clone(&app.pool), app.config.folders.clone()) {
+            Ok((handle, rx)) => {
+                app.watcher_handle = Some(handle);
+                app.watcher_rx = rx;
+            }
+            Err(e) => {
+                tracing::error!("Failed to spawn watcher: {e}");
+                app.push_toast(format!("Failed to start watcher: {e}"), ToastLevel::Error);
+            }
+        }
 
         app
     }
@@ -261,6 +280,91 @@ impl AkashaApp {
                 Err(e) => tracing::warn!("Failed to load Searchable names: {e}"),
             }
         }
+    }
+
+    fn poll_watcher_events(&mut self) {
+        if self.browser.is_scanning {
+            // Drain watcher events while a manual scan is running to avoid races.
+            while self.watcher_rx.try_recv().is_ok() {}
+            return;
+        }
+
+        let mut changes = Vec::new();
+        while let Ok(event) = self.watcher_rx.try_recv() {
+            match event {
+                WatcherEvent::Changed(mut batch) => changes.append(&mut batch),
+                WatcherEvent::Error(e) => {
+                    tracing::warn!("Watcher error: {e}");
+                    self.browser.scan_status = format!("Watcher error: {e}");
+                }
+            }
+        }
+
+        if changes.is_empty() {
+            return;
+        }
+
+        self.browser.scan_status = "Updating...".to_string();
+
+        let pool = Arc::clone(&self.pool);
+        let folders_config = self.config.folders.clone();
+        let media_tx = self.media_tx.clone();
+        let epoch = self.browser.media_epoch;
+        let selected_folder_id = self.browser.selected_folder_id;
+
+        self.rt.spawn(async move {
+            let mut upserted = 0usize;
+            let mut removed = 0usize;
+            let mut affected_folder_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+            for change in changes {
+                let Some((folder_id, relative_path)) =
+                    resolve_watched_path(&pool, &folders_config, &change.absolute_path).await
+                else {
+                    continue;
+                };
+
+                match change.kind {
+                    WatcherChangeKind::Upsert => {
+                        match crate::scanner::upsert_one(
+                            &pool,
+                            folder_id,
+                            &relative_path,
+                            change.absolute_path.to_string_lossy().as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                upserted += 1;
+                                affected_folder_ids.insert(folder_id);
+                            }
+                            Err(e) => tracing::warn!("Watcher upsert failed for {}: {e}", change.absolute_path.display()),
+                        }
+                    }
+                    WatcherChangeKind::Remove => {
+                        match db::media::delete_by_path(&pool, folder_id, &relative_path).await {
+                            Ok(n) => {
+                                removed += n as usize;
+                                affected_folder_ids.insert(folder_id);
+                            }
+                            Err(e) => tracing::warn!("Watcher delete failed for {}: {e}", change.absolute_path.display()),
+                        }
+                    }
+                }
+            }
+
+            if upserted > 0 || removed > 0 {
+                tracing::info!("Watcher processed {upserted} upserts and {removed} deletes");
+
+                // If the currently selected folder was affected, refresh its media list.
+                if let Some(selected) = selected_folder_id {
+                    if affected_folder_ids.contains(&selected) {
+                        let result = db::media::list_summaries_by_folder(&pool, selected).await;
+                        let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));
+                    }
+                }
+            }
+        });
     }
 
     fn refresh_search_async(&mut self, query: SearchQuery) {
@@ -666,11 +770,68 @@ impl AkashaApp {
     }
 }
 
+/// Given an absolute path from the watcher, find the configured root folder it belongs to,
+/// ensure the parent folder hierarchy exists in the DB, and return the leaf folder ID and
+/// the file's relative path within that leaf folder.
+async fn resolve_watched_path(
+    pool: &sqlx::SqlitePool,
+    folders_config: &[FolderConfig],
+    absolute_path: &std::path::Path,
+) -> Option<(i64, String)> {
+    // Find the longest matching root path.
+    let mut best_cfg: Option<&FolderConfig> = None;
+    let mut best_len = 0usize;
+    for cfg in folders_config {
+        if absolute_path.starts_with(&cfg.path) && cfg.path.len() >= best_len {
+            best_cfg = Some(cfg);
+            best_len = cfg.path.len();
+        }
+    }
+
+    let cfg = best_cfg?;
+    let root_path = std::path::Path::new(&cfg.path);
+    let relative = absolute_path.strip_prefix(root_path).ok()?;
+
+    let root_folder = db::folder::get_by_path(pool, &cfg.path).await.ok()??;
+    let parent_relative = relative.parent().unwrap_or(std::path::Path::new(""));
+
+    let mut folder_id = root_folder.id;
+    let mut current_path = root_path.to_path_buf();
+    for component in parent_relative.components() {
+        if let std::path::Component::Normal(name) = component {
+            current_path.push(name);
+            let path_str = current_path.to_string_lossy().to_string();
+            match db::folder::get_or_create(
+                pool,
+                Some(folder_id),
+                &path_str,
+                false,
+                cfg.show_recursive,
+                true,
+                &cfg.blacklist,
+                cfg.thumbnail_cache_mode.as_deref(),
+            )
+            .await
+            {
+                Ok(id) => folder_id = id,
+                Err(e) => {
+                    tracing::warn!("Failed to ensure folder {}: {e}", path_str);
+                    break;
+                }
+            }
+        }
+    }
+
+    let file_name = relative.file_name()?.to_string_lossy().to_string();
+    Some((folder_id, file_name))
+}
+
 impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
         self.poll_folders_events();
         self.poll_search_names_events();
+        self.poll_watcher_events();
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
