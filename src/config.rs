@@ -34,6 +34,7 @@ pub enum SortKey {
     Size,
     DateCreated,
     DateModified,
+    Score,
 }
 
 impl SortKey {
@@ -43,6 +44,7 @@ impl SortKey {
             SortKey::Size => "Size",
             SortKey::DateCreated => "Date created",
             SortKey::DateModified => "Date modified",
+            SortKey::Score => "Score",
         }
     }
 }

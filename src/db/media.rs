@@ -27,6 +27,8 @@ pub struct MediaSummary {
     pub file_size: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub modified_at: Option<chrono::NaiveDateTime>,
+    /// Populated when this summary is the result of a search query.
+    pub search_score: Option<f32>,
 }
 
 pub async fn count_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<i64> {
@@ -91,6 +93,53 @@ pub async fn list_summaries_by_folder_recursive(
     )
     .bind(folder_id)
     .fetch(pool);
+
+    while let Some(row) = stream.try_next().await? {
+        summaries.push(into_summary(row));
+    }
+
+    Ok(summaries)
+}
+
+/// Load `MediaSummary` rows for a set of media file IDs, scoped to a folder.
+///
+/// `ids_json` should be a JSON array of integers, e.g. `[1, 2, 3]`.
+pub async fn search_summaries(
+    pool: &SqlitePool,
+    folder_id: i64,
+    recursive: bool,
+    ids_json: &str,
+) -> anyhow::Result<Vec<MediaSummary>> {
+    let mut summaries = Vec::new();
+
+    let sql = if recursive {
+        r#"
+        WITH RECURSIVE subtree(id) AS (
+            SELECT ?1
+            UNION ALL
+            SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+        )
+        SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash,
+               m.width, m.height, m.format, m.file_size, m.created_at, m.modified_at
+        FROM media_files m
+        JOIN subtree s ON m.folder_id = s.id
+        WHERE m.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))
+        ORDER BY m.id
+        "#
+    } else {
+        r#"
+        SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
+               width, height, format, file_size, created_at, modified_at
+        FROM media_files
+        WHERE folder_id = ?1 AND id IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))
+        ORDER BY id
+        "#
+    };
+
+    let mut stream = sqlx::query_as::<_, MediaSummaryRow>(sql)
+        .bind(folder_id)
+        .bind(ids_json)
+        .fetch(pool);
 
     while let Some(row) = stream.try_next().await? {
         summaries.push(into_summary(row));
@@ -322,5 +371,6 @@ fn into_summary(row: MediaSummaryRow) -> MediaSummary {
         file_size: row.file_size,
         created_at: row.created_at,
         modified_at: row.modified_at,
+        search_score: None,
     }
 }

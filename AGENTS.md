@@ -30,6 +30,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 |---------|----------|
 | GUI framework | `eframe` 0.31, `egui` 0.31, `egui_extras` 0.31 |
 | Async runtime | `tokio` (rt-multi-thread, macros, sync) |
+| Async traits | `async-trait` 0.1 (used by the Searchables abstraction) |
 | Database | `sqlx` 0.8 (sqlite, runtime-tokio, chrono, json) |
 | Migrations | `sqlx::migrate!()` (embedded in binary) |
 | Serialization | `serde`, `serde_json`, `toml` |
@@ -100,12 +101,14 @@ src/
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailConfig`, `FolderConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
+  searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename` Searchable, background worker stub
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
   theme.rs       — Custom flat egui theme
   db/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
     folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `update_show_recursive`
-    media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `delete_orphans`
+    media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `delete_orphans`, `search_summaries`
+    searchable.rs — Searchable config/value CRUD and `job_queue` helpers
   ui/
     mod.rs       — Re-exports `browser`, `viewer`, `widgets`
     browser.rs   — `BrowserPanel` placeholder (unused; browser UI is inline in `app.rs`)
@@ -115,10 +118,11 @@ src/
 
 ### Module Relationships
 - `main.rs` depends on all top-level modules.
-- `app.rs` is the orchestrator: holds config, DB pool, Tokio runtime, thumbnailer, and all UI state.
-- `db::folder` and `db::media` are the only DB access layers.
+- `app.rs` is the orchestrator: holds config, DB pool, Tokio runtime, thumbnailer, Searchables engine, and all UI state.
+- `db::folder`, `db::media`, and `db::searchable` are the DB access layers.
 - `scanner` and `thumbnailer` are called from async tasks spawned by `app.rs`.
-- `ui::viewer` is a pure function called from `app.rs` viewer state; `ui::browser` is unused.
+- `searchables::SearchWorker` runs as a background tokio task started from `app.rs`.
+- `ui::viewer` is a pure function called from `app.rs` viewer state; `ui::browser` now owns the folder tree and search bar.
 
 ---
 
@@ -144,13 +148,33 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Unique on `(folder_id, relative_path)`
 - Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at), `idx_media_summary` (covering index for lightweight grid queries)
 
+### `searchable_configs`
+- `id`, `name` (unique), `kind` (`text` | `tags` | `vector` | `classification`)
+- `enabled` (bool), `options` (JSON)
+- Index: `idx_searchable_config_name`
+
+### `searchable_values`
+- `id`, `media_file_id` (FK → `media_files`, cascade delete), `searchable_config_id` (FK → `searchable_configs`, cascade delete)
+- `value_json` — stores strings, string arrays, or float arrays depending on `kind`
+- `created_at`, `updated_at`
+- Unique on `(media_file_id, searchable_config_id)`
+- Indexes: `idx_searchable_values_media`, `idx_searchable_values_config`
+
+### `job_queue`
+- `id`, `media_file_id` (FK), `searchable_config_id` (FK)
+- `status` (`pending` | `running` | `done` | `failed`), `attempts`, `error`
+- `created_at`, `updated_at`
+- Index: `idx_job_queue_pending`
+
 ### Notes
 - `blacklist` is stored as a JSON string and deserialized via `serde_json`.
-- `media_files` uses `UPSERT` (`ON CONFLICT ... DO UPDATE SET`) in `db::media::upsert`.
+- `media_files` uses `UPSERT` (`ON CONFLICT ... DO UPDATE SET`) in `db::media::upsert` and `scanner::flush_batch`.
 - Orphan cleanup uses `json_each()` for batch path comparison.
 - Recursive CTEs are used for tree queries (e.g., `list_by_folder_recursive`, `update_scan_complete_recursive`).
 - Summary queries (`list_summaries_by_folder*`) stream rows incrementally via `sqlx::query_as().fetch()` rather than `.fetch_all()`, avoiding a massive allocation spike for large folders.
+- Search results are hydrated with `search_summaries()`, which uses `json_each()` to match a batch of media IDs.
 - The thumbnail cache uses a 2-level hash prefix (`aa/bb/{hash}_{size}.webp`) to avoid ext4/xfs metadata stress with hundreds of thousands of files.
+- The bare-minimum Searchable is `filename` (kind `text`), seeded by migration `008_seed_filename_searchable.sql`.
 
 ---
 
@@ -198,10 +222,9 @@ Per-folder config can override `thumbnail_cache_mode`. Blacklists are glob patte
 
 ## Testing Instructions
 
-There are currently no tests in the repository. When adding tests:
-
 - Use `cargo test` to run unit and integration tests.
-- For DB-dependent tests, consider using an in-memory SQLite database (`:memory:`) or a temporary file, and running migrations in test setup.
+- Existing tests live in `src/searchables/` and use an in-memory SQLite database (`sqlite::memory:`) with embedded migrations.
+- For DB-dependent tests, run `sqlx::migrate!("./migrations").run(&pool)` in test setup.
 - The project uses `sqlx`, so `SQLX_OFFLINE` may be relevant if query macros are used in the future (currently raw SQL strings are used).
 
 ---
@@ -228,20 +251,20 @@ There are currently no tests in the repository. When adding tests:
 | 6 | Polish: theme, error toasts, settings UI | ✅ Complete |
 | — | **MVP Complete** — usable gallery | ✅ Complete |
 | 7 | `notify` file watcher, incremental updates | ❌ Not started |
-| 8 | Searchables trait + ONNX scaffolding | ❌ Not started |
+| 8 | Searchables trait + filename baseline | 🔄 In progress (trait, registry, and `filename` Searchable implemented; ONNX deferred) |
 | 9 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
-| 10 | Unified search UI | ❌ Not started |
+| 10 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
 
 The full original plan (database evaluation, Searchables trait definition, extensibility hooks, open questions) lives in `SESSION_NOTES.md` under "Full Architectural Roadmap".
 
 ## Known Gaps / TODOs
 
-- `ui/browser.rs` — `BrowserPanel` is a placeholder; the actual browser UI (folder tree + grid) is inline in `app.rs`.
 - `ui/widgets.rs` — only contains a placeholder label helper.
 - File system watching (`notify`) is listed as a dependency but not yet integrated.
-- AI/ONNX "Searchables" abstraction is described in `concept.md` but not yet present in code.
+- ONNX inference for tags/embeddings/classifications is not yet implemented; `job_queue` and `SearchWorker` are stubs that mark jobs done.
+- Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
+- Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
 - `delete_orphans_for_root` in `db/media.rs` is no longer called (replaced by per-folder cleanup) and has a bug (only matches direct children, not all descendants).
-- No tests exist yet.
 - **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.
 - **Thumbnail queue velocity tuning:** the scroll-velocity thresholds (60/240 rows/sec) are initial guesses and may need adjustment based on real-world feel.
 
@@ -258,7 +281,13 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/db/folder.rs` | Folder queries and `Folder` struct |
 | `src/app.rs` | Central app state and `eframe::App` implementation |
 | `src/scanner.rs` | Directory scanning with per-subfolder resume |
+| `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
+| `src/searchables/engine.rs` | Search orchestration and score aggregation |
+| `src/searchables/filename.rs` | Built-in filename Searchable |
+| `src/searchables/worker.rs` | Background `job_queue` worker stub |
+| `src/db/searchable.rs` | Searchable config/value and job queue queries |
 | `src/thumbnailer.rs` | Thumbnail generation and cache path resolution |
+| `src/ui/browser.rs` | Folder tree, thumbnail grid, and search bar |
 | `src/ui/viewer.rs` | Full-screen image viewer overlay |
 
 ### Scratchpad Folder (`.kimi/`)

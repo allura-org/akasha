@@ -6,6 +6,7 @@ use tokio::runtime::Runtime;
 
 use crate::config::{Config, FolderConfig};
 use crate::db;
+use crate::searchables::{SearchEngine, SearchQuery};
 use crate::thumbnailer::{CacheMode, Thumbnailer};
 use crate::ui::browser::BrowserPanel;
 
@@ -36,13 +37,16 @@ pub struct AkashaApp {
     pub rt: Arc<Runtime>,
     pub thumbnailer: Thumbnailer,
     pub browser: BrowserPanel,
+    pub search_engine: SearchEngine,
 
     pub scan_rx: std::sync::mpsc::Receiver<ScanEvent>,
     pub thumbnail_rx: std::sync::mpsc::Receiver<(String, u64, Result<egui::ColorImage, String>)>,
-    pub media_tx: std::sync::mpsc::Sender<(u64, Result<Vec<db::media::MediaSummary>, String>)>,
-    pub media_rx: std::sync::mpsc::Receiver<(u64, Result<Vec<db::media::MediaSummary>, String>)>,
+    pub media_tx: std::sync::mpsc::Sender<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>,
+    pub media_rx: std::sync::mpsc::Receiver<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>,
     pub folders_tx: std::sync::mpsc::Sender<Result<Vec<db::folder::Folder>, String>>,
     pub folders_rx: std::sync::mpsc::Receiver<Result<Vec<db::folder::Folder>, String>>,
+    pub search_names_tx: std::sync::mpsc::Sender<Result<Vec<String>, String>>,
+    pub search_names_rx: std::sync::mpsc::Receiver<Result<Vec<String>, String>>,
     pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
     pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
 
@@ -80,8 +84,9 @@ impl AkashaApp {
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
-        let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, Result<Vec<db::media::MediaSummary>, String>)>();
+        let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
+        let (search_names_tx, search_names_rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
 
         // On startup: scan any configured folders that are new or incomplete
         let pool_clone = Arc::clone(&pool_arc);
@@ -169,12 +174,15 @@ impl AkashaApp {
             rt: rt_arc.clone(),
             thumbnailer,
             browser: BrowserPanel::new(rt_arc, thumb_tx, scroll_speed, sort_key, sort_order),
+            search_engine: SearchEngine::with_defaults(),
             scan_rx,
             thumbnail_rx,
             media_tx,
             media_rx,
             folders_tx,
             folders_rx,
+            search_names_tx,
+            search_names_rx,
             viewer_image_tx: viewer_img_tx,
             viewer_image_rx: viewer_img_rx,
             media_refresh_in_flight: false,
@@ -189,6 +197,14 @@ impl AkashaApp {
         };
 
         app.refresh_folders_async();
+        app.refresh_searchable_names_async();
+
+        // Start the background Searchables worker stub.
+        let worker_pool = Arc::clone(&app.pool);
+        app.rt.spawn(async move {
+            crate::searchables::SearchWorker::new(worker_pool).run().await;
+        });
+
         app
     }
 
@@ -208,6 +224,17 @@ impl AkashaApp {
         });
     }
 
+    fn refresh_searchable_names_async(&mut self) {
+        let pool = Arc::clone(&self.pool);
+        let tx = self.search_names_tx.clone();
+        self.rt.spawn(async move {
+            let result = db::searchable::list_enabled_configs(&pool).await;
+            let _ = tx.send(result.map_err(|e| e.to_string()).map(|configs| {
+                configs.into_iter().map(|c| c.name).collect()
+            }));
+        });
+    }
+
     fn poll_folders_events(&mut self) {
         if let Ok(result) = self.folders_rx.try_recv() {
             match result {
@@ -222,6 +249,52 @@ impl AkashaApp {
                 Err(e) => self.browser.scan_status = format!("Failed to load folders: {e}"),
             }
         }
+    }
+
+    fn poll_search_names_events(&mut self) {
+        if let Ok(result) = self.search_names_rx.try_recv() {
+            match result {
+                Ok(names) => {
+                    self.browser.search_available_names = names.clone();
+                    self.browser.search_enabled_names = names.into_iter().collect();
+                }
+                Err(e) => tracing::warn!("Failed to load Searchable names: {e}"),
+            }
+        }
+    }
+
+    fn refresh_search_async(&mut self, query: SearchQuery) {
+        let Some(folder_id) = self.browser.selected_folder_id else { return };
+        let Some(folder) = self.browser.folders.iter().find(|f| f.id == folder_id) else { return };
+
+        if self.media_refresh_in_flight {
+            return;
+        }
+
+        let pool = Arc::clone(&self.pool);
+        let tx = self.media_tx.clone();
+        let show_recursive = folder.show_recursive;
+        let engine = self.search_engine.clone();
+
+        self.browser.clear_for_refresh(true);
+        self.media_refresh_in_flight = true;
+        let epoch = self.browser.media_epoch;
+
+        self.rt.spawn(async move {
+            let result = engine
+                .execute(&pool, folder_id, show_recursive, &query)
+                .await;
+            let summaries: Result<Vec<db::media::MediaSummary>, String> = result.map(|hits| {
+                hits.into_iter()
+                    .map(|hit| {
+                        let mut summary = hit.media_summary;
+                        summary.search_score = Some(hit.score);
+                        summary
+                    })
+                    .collect()
+            }).map_err(|e| e.to_string());
+            let _ = tx.send((epoch, true, summaries));
+        });
     }
 
     fn refresh_media_async(&mut self, hard_reset: bool) {
@@ -248,18 +321,18 @@ impl AkashaApp {
             } else {
                 db::media::list_summaries_by_folder(&pool, folder_id).await
             };
-            let _ = tx.send((epoch, result.map_err(|e| e.to_string())));
+            let _ = tx.send((epoch, false, result.map_err(|e| e.to_string())));
         });
     }
 
     fn poll_media_events(&mut self) {
-        let mut latest: Option<Result<Vec<db::media::MediaSummary>, String>> = None;
-        while let Ok((epoch, result)) = self.media_rx.try_recv() {
+        let mut latest: Option<(bool, Result<Vec<db::media::MediaSummary>, String>)> = None;
+        while let Ok((epoch, is_search, result)) = self.media_rx.try_recv() {
             if epoch == self.browser.media_epoch {
-                latest = Some(result);
+                latest = Some((is_search, result));
             }
         }
-        if let Some(result) = latest {
+        if let Some((is_search, result)) = latest {
             self.media_refresh_in_flight = false;
             match result {
                 Ok(items) => {
@@ -269,7 +342,15 @@ impl AkashaApp {
                     self.browser.thumbnail_queue.clear();
                     self.browser.queued_indices.clear();
                     self.browser.media_summaries = items;
-                    self.browser.scan_status = format!("{} images", self.browser.media_summaries.len());
+                    if is_search {
+                        self.browser.search_active = true;
+                        self.browser.sort_key = crate::config::SortKey::Score;
+                        self.browser.sort_order = crate::config::SortOrder::Descending;
+                        self.browser.scan_status = format!("{} results", self.browser.media_summaries.len());
+                    } else {
+                        self.browser.search_active = false;
+                        self.browser.scan_status = format!("{} images", self.browser.media_summaries.len());
+                    }
                 }
                 Err(e) => {
                     self.browser.scan_status = format!("Failed to load media: {e}");
@@ -589,6 +670,7 @@ impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
         self.poll_folders_events();
+        self.poll_search_names_events();
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
@@ -606,7 +688,16 @@ impl eframe::App for AkashaApp {
 
         if let Some(id) = actions.selected_folder {
             self.browser.selected_folder_id = Some(id);
+            self.browser.search_query.clear();
+            self.browser.search_active = false;
             self.refresh_media_async(true);
+        }
+        if let Some(query) = actions.search_changed {
+            if query.is_empty() {
+                self.refresh_media_async(true);
+            } else {
+                self.refresh_search_async(query);
+            }
         }
         if let Some(idx) = actions.opened_thumbnail {
             self.open_viewer(ctx, idx);

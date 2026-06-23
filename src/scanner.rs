@@ -111,6 +111,7 @@ pub async fn scan_folder(
     let mut folder_paths: HashMap<i64, Vec<String>> = HashMap::new();
     let mut scanned_count = 0usize;
     let mut pending: Vec<PendingUpsert> = Vec::new();
+    let mut upserted_media_ids: Vec<i64> = Vec::new();
     const UPSERT_BATCH_SIZE: usize = 500;
 
     // Track directories currently being walked; mark them complete when we leave them
@@ -288,7 +289,8 @@ pub async fn scan_folder(
 
         // Flush batch when full
         if pending.len() >= UPSERT_BATCH_SIZE {
-            flush_batch(pool, &mut pending).await?;
+            let ids = flush_batch(pool, &mut pending).await?;
+            upserted_media_ids.extend(ids);
             tokio::task::yield_now().await;
         }
     }
@@ -306,8 +308,12 @@ pub async fn scan_folder(
 
     // Flush any remaining pending upserts
     if !pending.is_empty() {
-        flush_batch(pool, &mut pending).await?;
+        let ids = flush_batch(pool, &mut pending).await?;
+        upserted_media_ids.extend(ids);
     }
+
+    // Enqueue background inference jobs for any non-text Searchables.
+    enqueue_search_jobs(pool, &upserted_media_ids).await?;
 
     // Delete orphans per visited folder (avoids deleting files in skipped complete subtrees)
     for (folder_id, paths) in &folder_paths {
@@ -340,13 +346,14 @@ struct PendingUpsert {
 async fn flush_batch(
     pool: &sqlx::SqlitePool,
     batch: &mut Vec<PendingUpsert>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<i64>> {
     if batch.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut tx = pool.begin().await?;
+    let mut media_ids = Vec::with_capacity(batch.len());
     for item in batch.iter() {
-        sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             "INSERT INTO media_files
              (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -357,7 +364,8 @@ async fn flush_batch(
                  height = excluded.height,
                  format = excluded.format,
                  file_size = excluded.file_size,
-                 modified_at = excluded.modified_at"
+                 modified_at = excluded.modified_at
+             RETURNING id"
         )
         .bind(item.folder_id)
         .bind(&item.relative_path)
@@ -368,11 +376,45 @@ async fn flush_batch(
         .bind(item.format.as_deref())
         .bind(item.file_size as i64)
         .bind(item.modified_at)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        media_ids.push(id);
     }
     tx.commit().await?;
     batch.clear();
+    Ok(media_ids)
+}
+
+async fn enqueue_search_jobs(
+    pool: &sqlx::SqlitePool,
+    media_ids: &[i64],
+) -> anyhow::Result<()> {
+    if media_ids.is_empty() {
+        return Ok(());
+    }
+
+    let configs = crate::db::searchable::list_enabled_configs(pool).await?;
+    let job_configs: Vec<i64> = configs
+        .into_iter()
+        .filter(|c| c.kind != "text")
+        .map(|c| c.id)
+        .collect();
+
+    if job_configs.is_empty() {
+        return Ok(());
+    }
+
+    for media_id in media_ids {
+        for config_id in &job_configs {
+            crate::db::searchable::enqueue_job(pool, *media_id, *config_id).await?;
+        }
+    }
+
+    info!(
+        "Enqueued {} background inference jobs for {} media files",
+        job_configs.len() * media_ids.len(),
+        media_ids.len()
+    );
     Ok(())
 }
 

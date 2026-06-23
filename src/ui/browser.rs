@@ -6,6 +6,7 @@ use tokio::runtime::Runtime;
 use crate::config::{SortKey, SortOrder};
 use crate::db;
 use crate::db::media::MediaSummary;
+use crate::searchables::SearchQuery;
 use crate::thumbnailer::Thumbnailer;
 
 fn filename_of(media: &MediaSummary) -> String {
@@ -32,6 +33,7 @@ pub struct BrowserActions {
     pub copy_to_clipboard: Option<String>,
     pub sort_key_changed: Option<SortKey>,
     pub sort_order_changed: Option<SortOrder>,
+    pub search_changed: Option<SearchQuery>,
 }
 
 const MAX_CONCURRENT_THUMBNAILS: usize = 8;
@@ -60,6 +62,10 @@ pub struct BrowserPanel {
     pub folder_filter: String,
     pub sort_key: SortKey,
     pub sort_order: SortOrder,
+    pub search_query: String,
+    pub search_active: bool,
+    pub search_available_names: Vec<String>,
+    pub search_enabled_names: HashSet<String>,
 
     last_sorted_key: SortKey,
     last_sorted_order: SortOrder,
@@ -100,6 +106,10 @@ impl BrowserPanel {
             folder_filter: String::new(),
             sort_key,
             sort_order,
+            search_query: String::new(),
+            search_active: false,
+            search_available_names: Vec::new(),
+            search_enabled_names: HashSet::new(),
             last_sorted_key: sort_key,
             last_sorted_order: sort_order,
             last_sorted_len: 0,
@@ -142,6 +152,11 @@ impl BrowserPanel {
                 SortKey::Size => a.file_size.cmp(&b.file_size),
                 SortKey::DateCreated => a.created_at.cmp(&b.created_at),
                 SortKey::DateModified => a.modified_at.cmp(&b.modified_at),
+                SortKey::Score => {
+                    let sa = a.search_score.unwrap_or(0.0);
+                    let sb = b.search_score.unwrap_or(0.0);
+                    sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                }
             };
 
             let cmp = match order {
@@ -172,6 +187,7 @@ impl BrowserPanel {
             copy_to_clipboard: None,
             sort_key_changed: None,
             sort_order_changed: None,
+            search_changed: None,
         };
 
         // Top bar
@@ -182,6 +198,53 @@ impl BrowserPanel {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Akasha");
+
+                    // Search bar
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(false), |ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .desired_width(200.0)
+                                .hint_text("Search..."),
+                        );
+
+                        // Searchable toggles
+                        if !self.search_available_names.is_empty() {
+                            ui.menu_button("🔍 Searchables", |ui| {
+                                for name in &self.search_available_names {
+                                    let mut enabled = self.search_enabled_names.contains(name);
+                                    if ui.checkbox(&mut enabled, name).changed() {
+                                        if enabled {
+                                            self.search_enabled_names.insert(name.clone());
+                                        } else {
+                                            self.search_enabled_names.remove(name);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        let search_triggered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let search_clicked = ui.button("Search").clicked();
+                        let clear_clicked = ui.button("✕").clicked();
+
+                        if clear_clicked {
+                            if !self.search_query.is_empty() || self.search_active {
+                                self.search_query.clear();
+                                self.search_active = false;
+                                actions.search_changed = Some(SearchQuery::default());
+                            }
+                        } else if search_triggered || search_clicked {
+                            let query = SearchQuery {
+                                text: self.search_query.clone(),
+                                enabled_searchables: self.search_enabled_names.iter().cloned().collect(),
+                            };
+                            if !query.is_empty() {
+                                self.search_active = true;
+                                actions.search_changed = Some(query);
+                            }
+                        }
+                    });
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("⚙ Settings").clicked() {
                             actions.settings_toggled = true;
@@ -194,7 +257,7 @@ impl BrowserPanel {
                         egui::ComboBox::from_id_salt("sort_key")
                             .selected_text(self.sort_key.label())
                             .show_ui(ui, |ui| {
-                                for key in [SortKey::Filename, SortKey::Size, SortKey::DateCreated, SortKey::DateModified] {
+                                for key in [SortKey::Filename, SortKey::Size, SortKey::DateCreated, SortKey::DateModified, SortKey::Score] {
                                     if ui.selectable_label(self.sort_key == key, key.label()).clicked() {
                                         self.sort_key = key;
                                         actions.sort_key_changed = Some(key);
@@ -262,7 +325,9 @@ impl BrowserPanel {
                 });
             } else if self.media_summaries.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    if self.selected_folder_id.is_some() {
+                    if self.search_active {
+                        ui.heading("No results");
+                    } else if self.selected_folder_id.is_some() {
                         ui.heading("No images in this folder");
                     } else {
                         ui.heading("Select a folder");
@@ -271,7 +336,11 @@ impl BrowserPanel {
             } else {
                 self.ensure_sorted();
 
-                ui.heading(format!("{} images", self.media_summaries.len()));
+                if self.search_active {
+                    ui.heading(format!("{} results for '{}'", self.media_summaries.len(), self.search_query));
+                } else {
+                    ui.heading(format!("{} images", self.media_summaries.len()));
+                }
                 ui.separator();
 
                 let cols = (ui.available_width() / 220.0).max(1.0) as usize;
