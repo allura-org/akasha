@@ -135,8 +135,11 @@ fn classify_events(events: Vec<DebouncedEvent>) -> Vec<WatcherChange> {
 
             use notify_debouncer_full::notify::EventKind::*;
             let kind = match &event.event.kind {
-                Access(_) | Modify(_) | Create(_) => WatcherChangeKind::Upsert,
+                Modify(_) | Create(_) => WatcherChangeKind::Upsert,
                 Remove(_) => WatcherChangeKind::Remove,
+                // Access events are ignored — they fire when a file is merely read
+                // (e.g. thumbnail generation) and must not trigger re-upserts.
+                Access(_) => continue,
                 Any | Other => {
                     // For ambiguous events, check whether the file still exists on disk.
                     if path.exists() {
