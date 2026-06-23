@@ -18,6 +18,8 @@ pub struct BrowserActions {
     pub opened_thumbnail: Option<usize>,
     pub rescan_requested: bool,
     pub settings_toggled: bool,
+    pub show_in_file_manager: Option<String>,
+    pub copy_to_clipboard: Option<String>,
 }
 
 const MAX_CONCURRENT_THUMBNAILS: usize = 8;
@@ -42,6 +44,8 @@ pub struct BrowserPanel {
     pub scan_status: String,
     pub is_scanning: bool,
     pub settings_open: bool,
+    pub scroll_speed: f32,
+    pub folder_filter: String,
 
     rt: Arc<Runtime>,
     thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
@@ -51,6 +55,7 @@ impl BrowserPanel {
     pub fn new(
         rt: Arc<Runtime>,
         thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
+        scroll_speed: f32,
     ) -> Self {
         Self {
             folders: Vec::new(),
@@ -71,6 +76,8 @@ impl BrowserPanel {
             scan_status: "Initializing...".to_string(),
             is_scanning: true,
             settings_open: false,
+            scroll_speed,
+            folder_filter: String::new(),
             rt,
             thumbnail_tx,
         }
@@ -96,6 +103,8 @@ impl BrowserPanel {
             opened_thumbnail: None,
             rescan_requested: false,
             settings_toggled: false,
+            show_in_file_manager: None,
+            copy_to_clipboard: None,
         };
 
         // Top bar
@@ -133,15 +142,25 @@ impl BrowserPanel {
                     ui.label("No folders configured.");
                     ui.label("Add folders in config.toml");
                 } else {
+                    ui.text_edit_singleline(&mut self.folder_filter);
+                    ui.separator();
+
+                    let visible = self.visible_folder_ids();
                     let mut clicked_id = None;
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        let roots: Vec<i64> = self.folders
+                        let mut roots: Vec<i64> = self.folders
                             .iter()
-                            .filter(|f| f.parent_id.is_none())
+                            .filter(|f| f.parent_id.is_none() && visible.contains(&f.id))
                             .map(|f| f.id)
                             .collect();
+                        roots.sort_by_key(|id| {
+                            self.folders
+                                .iter()
+                                .find(|f| f.id == *id)
+                                .map(|f| self.folder_name(f).to_lowercase())
+                        });
                         for root_id in roots {
-                            self.render_folder_tree(ui, root_id, 0, &mut clicked_id);
+                            self.render_folder_tree(ui, root_id, 0, &mut clicked_id, &visible);
                         }
                     });
                     if let Some(id) = clicked_id {
@@ -174,6 +193,10 @@ impl BrowserPanel {
                 let item_size = egui::vec2(200.0, 200.0);
                 let label_h = 30.0;
                 let row_height = item_size.y + label_h;
+
+                // Apply configured scroll speed multiplier to this ScrollArea.
+                let scroll_speed = self.scroll_speed.max(0.1);
+                ui.input_mut(|i| i.smooth_scroll_delta *= scroll_speed);
 
                 let mut visible_rows: Option<(usize, usize)> = None;
                 let scroll = egui::ScrollArea::vertical()
@@ -214,6 +237,16 @@ impl BrowserPanel {
                                             } else {
                                                 ui.add_sized(item_size, egui::Spinner::new())
                                             };
+                                            response.context_menu(|ui| {
+                                                if ui.button("Show in file manager").clicked() {
+                                                    actions.show_in_file_manager = Some(media.absolute_path.clone());
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Copy to clipboard").clicked() {
+                                                    actions.copy_to_clipboard = Some(media.absolute_path.clone());
+                                                    ui.close_menu();
+                                                }
+                                            });
                                             let filename = std::path::Path::new(&media.relative_path)
                                                 .file_name()
                                                 .and_then(|n| n.to_str())
@@ -243,52 +276,108 @@ impl BrowserPanel {
         actions
     }
 
-    fn render_folder_tree(&mut self, ui: &mut egui::Ui, folder_id: i64, depth: usize, clicked_id: &mut Option<i64>) {
+    fn folder_name<'a>(&self, folder: &'a db::folder::Folder) -> &'a str {
+        std::path::Path::new(&folder.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&folder.path)
+    }
+
+    fn visible_folder_ids(&self) -> HashSet<i64> {
+        if self.folder_filter.is_empty() {
+            return self.folders.iter().map(|f| f.id).collect();
+        }
+
+        let filter = self.folder_filter.to_lowercase();
+        let mut visible: HashSet<i64> = self
+            .folders
+            .iter()
+            .filter(|f| {
+                let name = self.folder_name(f).to_lowercase();
+                name.contains(&filter)
+            })
+            .map(|f| f.id)
+            .collect();
+
+        // Propagate visibility up to ancestors.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for folder in &self.folders {
+                if visible.contains(&folder.id) {
+                    if let Some(parent_id) = folder.parent_id {
+                        if visible.insert(parent_id) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        visible
+    }
+
+    fn render_folder_tree(
+        &mut self,
+        ui: &mut egui::Ui,
+        folder_id: i64,
+        depth: usize,
+        clicked_id: &mut Option<i64>,
+        visible: &HashSet<i64>,
+    ) {
         let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
         let selected = self.selected_folder_id == Some(folder.id);
-        let has_children = self.folders.iter().any(|f| f.parent_id == Some(folder.id));
         let is_root = folder.parent_id.is_none();
+        let name = self.folder_name(folder).to_string();
+        let filtering = !self.folder_filter.is_empty();
+
+        // Pre-compute visible children so the mutable closure below doesn't borrow `folder`.
+        let mut children: Vec<i64> = self
+            .folders
+            .iter()
+            .filter(|f| f.parent_id == Some(folder.id) && visible.contains(&f.id))
+            .map(|f| f.id)
+            .collect();
+        children.sort_by_key(|id| {
+            self.folders
+                .iter()
+                .find(|f| f.id == *id)
+                .map(|f| self.folder_name(f).to_lowercase())
+        });
+        let has_visible_children = !children.is_empty();
 
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 16.0);
 
-            if has_children {
-                let arrow = if self.expanded_folders.contains(&folder.id) { "▼" } else { "▶" };
-                if ui.small_button(arrow).clicked() {
-                    if self.expanded_folders.contains(&folder.id) {
-                        self.expanded_folders.remove(&folder.id);
+            if has_visible_children {
+                let expanded = filtering || self.expanded_folders.contains(&folder_id);
+                let arrow = if expanded { "▼" } else { "▶" };
+                if ui.small_button(arrow).clicked() && !filtering {
+                    if self.expanded_folders.contains(&folder_id) {
+                        self.expanded_folders.remove(&folder_id);
                     } else {
-                        self.expanded_folders.insert(folder.id);
+                        self.expanded_folders.insert(folder_id);
                     }
                 }
             } else {
                 ui.add_space(24.0);
             }
 
-            let name = std::path::Path::new(&folder.path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&folder.path);
-
             let label = if is_root {
-                egui::RichText::new(name).strong()
+                egui::RichText::new(&name).strong()
             } else {
-                egui::RichText::new(name)
+                egui::RichText::new(&name)
             };
 
             if ui.selectable_label(selected, label).clicked() && !selected {
-                *clicked_id = Some(folder.id);
+                *clicked_id = Some(folder_id);
             }
         });
 
-        if self.expanded_folders.contains(&folder.id) {
-            let children: Vec<i64> = self.folders
-                .iter()
-                .filter(|f| f.parent_id == Some(folder.id))
-                .map(|f| f.id)
-                .collect();
+        let expand = filtering || self.expanded_folders.contains(&folder_id);
+        if expand {
             for child_id in children {
-                self.render_folder_tree(ui, child_id, depth + 1, clicked_id);
+                self.render_folder_tree(ui, child_id, depth + 1, clicked_id, visible);
             }
         }
     }

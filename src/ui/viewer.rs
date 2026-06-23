@@ -1,29 +1,34 @@
 use eframe::egui;
+use crate::config::ViewerScaleMode;
 use crate::db::media::MediaSummary;
 
 pub struct ViewerResponse {
     pub close: bool,
     pub prev: bool,
     pub next: bool,
-    pub toggle_zoom: bool,
+    pub cycle_scale_mode: bool,
+    pub show_in_file_manager: bool,
+    pub copy_to_clipboard: bool,
 }
 
 pub fn show(
     ctx: &egui::Context,
     media: &MediaSummary,
     texture: &Option<egui::TextureHandle>,
-    zoom_to_fit: bool,
+    scale_mode: ViewerScaleMode,
 ) -> ViewerResponse {
     let mut resp = ViewerResponse {
         close: false,
         prev: false,
         next: false,
-        toggle_zoom: false,
+        cycle_scale_mode: false,
+        show_in_file_manager: false,
+        copy_to_clipboard: false,
     };
 
     // Keyboard shortcuts
     ctx.input(|i| {
-        if i.key_pressed(egui::Key::Escape) {
+        if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::ArrowDown) {
             resp.close = true;
         }
         if i.key_pressed(egui::Key::ArrowLeft) {
@@ -31,6 +36,9 @@ pub fn show(
         }
         if i.key_pressed(egui::Key::ArrowRight) {
             resp.next = true;
+        }
+        if i.key_pressed(egui::Key::ArrowUp) {
+            resp.cycle_scale_mode = true;
         }
     });
 
@@ -46,6 +54,7 @@ pub fn show(
         egui::pos2(screen.max.x, screen.max.y - bottom_height),
     );
     let mut img_rect: Option<egui::Rect> = None;
+    let mut img_resp: Option<egui::Response> = None;
 
     egui::Area::new(egui::Id::new("viewer_overlay"))
         .order(egui::Order::Foreground)
@@ -66,7 +75,7 @@ pub fn show(
                     let tex_h = texture.size()[1] as f32;
                     if tex_w > 0.0 && tex_h > 0.0 {
                         let avail = content_rect.size();
-                        let display_size = if zoom_to_fit {
+                        let display_size = if scale_mode == ViewerScaleMode::Fit {
                             let scale = (avail.x / tex_w).min(avail.y / tex_h);
                             egui::vec2(tex_w * scale, tex_h * scale)
                         } else {
@@ -75,14 +84,25 @@ pub fn show(
 
                         let img_r = egui::Rect::from_center_size(content_rect.center(), display_size);
                         img_rect = Some(img_r);
-                        let img_resp = ui.put(
+                        let image_response = ui.put(
                             img_r,
                             egui::Image::new((texture.id(), display_size))
                                 .sense(egui::Sense::click()),
                         );
-                        if img_resp.double_clicked() {
-                            resp.toggle_zoom = true;
+                        image_response.context_menu(|ui| {
+                            if ui.button("Show in file manager").clicked() {
+                                resp.show_in_file_manager = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Copy to clipboard").clicked() {
+                                resp.copy_to_clipboard = true;
+                                ui.close_menu();
+                            }
+                        });
+                        if image_response.middle_clicked() {
+                            resp.cycle_scale_mode = true;
                         }
+                        img_resp = Some(image_response);
                     }
                 } else {
                     let spinner_rect = egui::Rect::from_center_size(
@@ -107,7 +127,8 @@ pub fn show(
                     egui::pos2(bottom_rect.min.x + pad, y),
                     egui::vec2(100.0, button_h),
                 );
-                if ui.put(close_rect, egui::Button::new("Close")).clicked() {
+                let close_resp = ui.put(close_rect, egui::Button::new("Close"));
+                if close_resp.clicked() {
                     resp.close = true;
                 }
 
@@ -117,19 +138,29 @@ pub fn show(
                     egui::pos2(bottom_rect.center().x - nav_w / 2.0, y),
                     egui::vec2(nav_w, button_h),
                 );
+                let mut prev_clicked = false;
+                let mut scale_clicked = false;
+                let mut next_clicked = false;
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
                     ui.horizontal_centered(|ui| {
-                        if ui.button("< Previous").clicked() {
+                        prev_clicked = ui.button("< Previous").clicked();
+                        if prev_clicked {
                             resp.prev = true;
                         }
-                        if ui.button(if zoom_to_fit { "1:1" } else { "Fit" }).clicked() {
-                            resp.toggle_zoom = true;
+                        scale_clicked = ui.button(scale_mode.label()).clicked();
+                        if scale_clicked {
+                            resp.cycle_scale_mode = true;
                         }
-                        if ui.button("Next >").clicked() {
+                        next_clicked = ui.button("Next >").clicked();
+                        if next_clicked {
                             resp.next = true;
                         }
                     });
                 });
+                let button_clicked = close_resp.clicked()
+                    || prev_clicked
+                    || scale_clicked
+                    || next_clicked;
 
                 // Info — snapped to bottom-right
                 let info_left = bottom_rect.center().x + nav_w / 2.0 + 20.0;
@@ -148,22 +179,22 @@ pub fn show(
                         ));
                     });
                 });
+
+                // Scroll wheel navigates images.
+                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll_delta < -1.0 {
+                    resp.next = true;
+                } else if scroll_delta > 1.0 {
+                    resp.prev = true;
+                }
+                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+
+                // Close viewer on left-click anywhere that isn't a button.
+                if !button_clicked && ui.input(|i| i.pointer.primary_clicked()) {
+                    resp.close = true;
+                }
             });
         });
-
-    // Close viewer when clicking on empty space
-    if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-        if ctx.input(|i| i.pointer.primary_clicked()) {
-            let on_image = img_rect.map_or_else(
-                || content_rect.contains(pos),
-                |r| r.contains(pos),
-            );
-            let on_bottom = bottom_rect.contains(pos);
-            if !on_image && !on_bottom {
-                resp.close = true;
-            }
-        }
-    }
 
     resp
 }

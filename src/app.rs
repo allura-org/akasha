@@ -52,7 +52,7 @@ pub struct AkashaApp {
     pub viewer_open: bool,
     pub viewer_index: Option<usize>,
     pub viewer_texture: Option<egui::TextureHandle>,
-    pub viewer_zoom_to_fit: bool,
+    pub viewer_scale_mode: crate::config::ViewerScaleMode,
     pub viewer_just_opened: bool,
     pub pending_viewer_images: HashSet<String>,
 
@@ -67,6 +67,7 @@ impl AkashaApp {
         rt: Runtime,
     ) -> Self {
         crate::theme::apply(&cc.egui_ctx, config.ui.theme == "dark");
+        Self::apply_input_options(&cc.egui_ctx, &config);
 
         let cache_mode = CacheMode::from_config(
             &config.thumbnails.cache_mode,
@@ -159,12 +160,13 @@ impl AkashaApp {
             });
         }
 
+        let scroll_speed = config.ui.scroll_speed;
         let mut app = Self {
             config,
             pool: pool_arc.clone(),
             rt: rt_arc.clone(),
             thumbnailer,
-            browser: BrowserPanel::new(rt_arc, thumb_tx),
+            browser: BrowserPanel::new(rt_arc, thumb_tx, scroll_speed),
             scan_rx,
             thumbnail_rx,
             media_tx,
@@ -178,7 +180,7 @@ impl AkashaApp {
             viewer_open: false,
             viewer_index: None,
             viewer_texture: None,
-            viewer_zoom_to_fit: true,
+            viewer_scale_mode: crate::config::ViewerScaleMode::Fit,
             viewer_just_opened: false,
             pending_viewer_images: HashSet::new(),
             toasts: Vec::new(),
@@ -186,6 +188,13 @@ impl AkashaApp {
 
         app.refresh_folders_async();
         app
+    }
+
+    fn apply_input_options(ctx: &egui::Context, config: &Config) {
+        let delay_secs = config.ui.double_click_debounce_ms as f64 / 1000.0;
+        ctx.memory_mut(|mem| {
+            mem.options.input_options.max_double_click_delay = delay_secs;
+        });
     }
 
     fn refresh_folders_async(&mut self) {
@@ -322,13 +331,46 @@ impl AkashaApp {
         }
     }
 
-    fn open_viewer(&mut self, index: usize) {
+    fn open_viewer(&mut self, ctx: &egui::Context, index: usize) {
         self.viewer_open = true;
         self.viewer_just_opened = true;
         self.viewer_index = Some(index);
-        self.viewer_zoom_to_fit = true;
+        self.viewer_scale_mode = self.resolve_initial_scale_mode(ctx, index);
         self.viewer_texture = None;
         self.load_viewer_image();
+    }
+
+    fn resolve_initial_scale_mode(
+        &self,
+        ctx: &egui::Context,
+        index: usize,
+    ) -> crate::config::ViewerScaleMode {
+        match self.config.ui.viewer_default_scale_mode {
+            crate::config::ViewerScaleMode::Fit => crate::config::ViewerScaleMode::Fit,
+            crate::config::ViewerScaleMode::OneToOne => crate::config::ViewerScaleMode::OneToOne,
+            crate::config::ViewerScaleMode::Smallest => {
+                let bottom_height = 80.0;
+                let screen = ctx.screen_rect();
+                let avail = egui::vec2(screen.width(), screen.height() - bottom_height);
+                if let Some(media) = self.browser.media_summaries.get(index) {
+                    let fits = match (media.width, media.height) {
+                        (Some(w), Some(h)) => {
+                            let w = w as f32;
+                            let h = h as f32;
+                            w <= avail.x && h <= avail.y
+                        }
+                        _ => false,
+                    };
+                    if fits {
+                        crate::config::ViewerScaleMode::OneToOne
+                    } else {
+                        crate::config::ViewerScaleMode::Fit
+                    }
+                } else {
+                    crate::config::ViewerScaleMode::Fit
+                }
+            }
+        }
     }
 
     fn close_viewer(&mut self) {
@@ -565,7 +607,7 @@ impl eframe::App for AkashaApp {
             self.refresh_media_async(true);
         }
         if let Some(idx) = actions.opened_thumbnail {
-            self.open_viewer(idx);
+            self.open_viewer(ctx, idx);
         }
         if actions.rescan_requested {
             self.trigger_rescan();
@@ -573,15 +615,28 @@ impl eframe::App for AkashaApp {
         if actions.settings_toggled {
             self.browser.settings_open = !self.browser.settings_open;
         }
+        if let Some(path) = actions.show_in_file_manager {
+            if let Err(e) = crate::ui::context_menu::open_containing_folder(&path) {
+                self.push_toast(format!("Failed to open folder: {e}"), ToastLevel::Error);
+            }
+        }
+        if let Some(path) = actions.copy_to_clipboard {
+            if let Err(e) = crate::ui::context_menu::copy_image_to_clipboard(&path) {
+                self.push_toast(format!("Failed to copy to clipboard: {e}"), ToastLevel::Error);
+            } else {
+                self.push_toast("Image copied to clipboard".to_string(), ToastLevel::Info);
+            }
+        }
 
         if self.viewer_open {
             if let Some(idx) = self.viewer_index {
-                if let Some(media) = self.browser.media_summaries.get(idx) {
+                let media = self.browser.media_summaries.get(idx).cloned();
+                if let Some(media) = media {
                     let resp = crate::ui::viewer::show(
                         ctx,
-                        media,
+                        &media,
                         &self.viewer_texture,
-                        self.viewer_zoom_to_fit,
+                        self.viewer_scale_mode,
                     );
                     if resp.close && !self.viewer_just_opened {
                         self.close_viewer();
@@ -592,8 +647,23 @@ impl eframe::App for AkashaApp {
                     if resp.next {
                         self.navigate_viewer(1);
                     }
-                    if resp.toggle_zoom {
-                        self.viewer_zoom_to_fit = !self.viewer_zoom_to_fit;
+                    if resp.cycle_scale_mode {
+                        self.viewer_scale_mode = match self.viewer_scale_mode {
+                            crate::config::ViewerScaleMode::Fit => crate::config::ViewerScaleMode::OneToOne,
+                            _ => crate::config::ViewerScaleMode::Fit,
+                        };
+                    }
+                    if resp.show_in_file_manager {
+                        if let Err(e) = crate::ui::context_menu::open_containing_folder(&media.absolute_path) {
+                            self.push_toast(format!("Failed to open folder: {e}"), ToastLevel::Error);
+                        }
+                    }
+                    if resp.copy_to_clipboard {
+                        if let Err(e) = crate::ui::context_menu::copy_image_to_clipboard(&media.absolute_path) {
+                            self.push_toast(format!("Failed to copy to clipboard: {e}"), ToastLevel::Error);
+                        } else {
+                            self.push_toast("Image copied to clipboard".to_string(), ToastLevel::Info);
+                        }
                     }
                 } else {
                     self.close_viewer();
@@ -624,6 +694,17 @@ impl eframe::App for AkashaApp {
                     }
                     crate::ui::settings::SettingsAction::ThemeChanged(dark) => {
                         crate::theme::apply(ctx, dark);
+                        settings_changed = true;
+                    }
+                    crate::ui::settings::SettingsAction::DoubleClickDebounceChanged => {
+                        Self::apply_input_options(ctx, &self.config);
+                        settings_changed = true;
+                    }
+                    crate::ui::settings::SettingsAction::ScrollSpeedChanged(speed) => {
+                        self.browser.scroll_speed = speed;
+                        settings_changed = true;
+                    }
+                    crate::ui::settings::SettingsAction::ViewerDefaultScaleModeChanged => {
                         settings_changed = true;
                     }
                 }
