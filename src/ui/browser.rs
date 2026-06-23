@@ -194,8 +194,11 @@ impl BrowserPanel {
                 let label_h = 30.0;
                 let row_height = item_size.y + label_h;
 
-                // Apply configured scroll speed multiplier to this ScrollArea.
+                // Apply configured scroll speed multiplier to this ScrollArea only.
+                // We scale the input delta, let the ScrollArea consume it, then restore
+                // the original so other UI (e.g. the viewer) sees unscaled wheel events.
                 let scroll_speed = self.scroll_speed.max(0.1);
+                let original_delta = ui.input(|i| i.smooth_scroll_delta);
                 ui.input_mut(|i| i.smooth_scroll_delta *= scroll_speed);
 
                 let mut visible_rows: Option<(usize, usize)> = None;
@@ -265,6 +268,7 @@ impl BrowserPanel {
                             actions.opened_thumbnail = Some(i);
                         }
                     });
+                ui.input_mut(|i| i.smooth_scroll_delta = original_delta);
                 self.scroll_offset = scroll.state.offset.y;
                 let viewport_h = scroll.inner_rect.height();
                 if let Some((first, last)) = visible_rows {

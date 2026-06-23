@@ -9,6 +9,7 @@ pub struct ViewerResponse {
     pub cycle_scale_mode: bool,
     pub show_in_file_manager: bool,
     pub copy_to_clipboard: bool,
+    pub context_menu_used: bool,
 }
 
 pub fn show(
@@ -24,6 +25,7 @@ pub fn show(
         cycle_scale_mode: false,
         show_in_file_manager: false,
         copy_to_clipboard: false,
+        context_menu_used: false,
     };
 
     // Keyboard shortcuts
@@ -92,10 +94,12 @@ pub fn show(
                         image_response.context_menu(|ui| {
                             if ui.button("Show in file manager").clicked() {
                                 resp.show_in_file_manager = true;
+                                resp.context_menu_used = true;
                                 ui.close_menu();
                             }
                             if ui.button("Copy to clipboard").clicked() {
                                 resp.copy_to_clipboard = true;
+                                resp.context_menu_used = true;
                                 ui.close_menu();
                             }
                         });
@@ -180,17 +184,19 @@ pub fn show(
                     });
                 });
 
-                // Scroll wheel navigates images.
-                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                // Scroll wheel navigates images one per notch.
+                // Use raw_scroll_delta so a single wheel notch produces one event,
+                // not several frames of smoothed velocity.
+                let scroll_delta = ui.input(|i| i.raw_scroll_delta.y);
                 if scroll_delta < -1.0 {
                     resp.next = true;
                 } else if scroll_delta > 1.0 {
                     resp.prev = true;
                 }
-                ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+                ui.input_mut(|i| i.raw_scroll_delta = egui::Vec2::ZERO);
 
-                // Close viewer on left-click anywhere that isn't a button.
-                if !button_clicked && ui.input(|i| i.pointer.primary_clicked()) {
+                // Close viewer on left-click anywhere that isn't a button or context menu item.
+                if !button_clicked && !resp.context_menu_used && ui.input(|i| i.pointer.primary_clicked()) {
                     resp.close = true;
                 }
             });
