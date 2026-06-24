@@ -4,7 +4,7 @@
 
 akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gallery written in Rust with (currently) egui-based GUI. Built to handle hundreds of thousands of images in a single import.
 
-⚠️  akasha is in pre-alpha and is not suitable to daily-drive yet.
+⚠️  akasha is currently in ALPHA. Most of its features are present, but it is still in heavy flux and the biggest lifts are yet to come!
 
 ## features
 
@@ -27,7 +27,7 @@ akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gall
 
 ## generative AI disclosure
 
-akasha was coded primarily by an LLM called Kimi 2.6. through its creation, it was actively directed and observed, as an exercise in learning about databases and Rust. it's primarily made for the use of its author and shared in hopes it'll be useful. akasha's design principles mean it shouldn't be of any harm to your media (it currently doesn't even have any means of manipulation that Could be harmful), but it's regardless a good idea to **keep backups.**
+akasha was coded primarily by an LLM called Kimi (2.6, 2.7). through its creation, it was actively directed and observed, as an exercise in learning about databases and Rust. it's primarily made for the use of its author and shared in hopes it'll be useful. akasha's design principles mean it shouldn't be of any harm to your media (it currently doesn't even have any means of manipulation that Could be harmful), but it's regardless a good idea to **keep backups.**
 
 ## rationale
 

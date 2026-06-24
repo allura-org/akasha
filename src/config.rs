@@ -9,11 +9,79 @@ pub struct Config {
     pub folders: Vec<FolderConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewerScaleMode {
+    Fit,
+    OneToOne,
+    Smallest,
+}
+
+impl ViewerScaleMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ViewerScaleMode::Fit => "Fit",
+            ViewerScaleMode::OneToOne => "1:1",
+            ViewerScaleMode::Smallest => "Smallest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortKey {
+    Filename,
+    Size,
+    DateCreated,
+    DateModified,
+    Score,
+}
+
+impl SortKey {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortKey::Filename => "Filename",
+            SortKey::Size => "Size",
+            SortKey::DateCreated => "Date created",
+            SortKey::DateModified => "Date modified",
+            SortKey::Score => "Score",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+impl SortOrder {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortOrder::Ascending => "Ascending",
+            SortOrder::Descending => "Descending",
+        }
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            SortOrder::Ascending => SortOrder::Descending,
+            SortOrder::Descending => SortOrder::Ascending,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     pub theme: String,
     pub thumbnail_size: u32,
+    pub double_click_debounce_ms: u64,
+    pub scroll_speed: f32,
+    pub viewer_default_scale_mode: ViewerScaleMode,
+    pub sort_key: SortKey,
+    pub sort_order: SortOrder,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +122,11 @@ impl Default for UiConfig {
         Self {
             theme: "dark".to_string(),
             thumbnail_size: 256,
+            double_click_debounce_ms: 300,
+            scroll_speed: 1.0,
+            viewer_default_scale_mode: ViewerScaleMode::Smallest,
+            sort_key: SortKey::Filename,
+            sort_order: SortOrder::Ascending,
         }
     }
 }

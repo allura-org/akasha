@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod folder;
 pub mod media;
+pub mod searchable;
 
 pub async fn init_pool(db_path: PathBuf) -> anyhow::Result<SqlitePool> {
     if let Some(parent) = db_path.parent() {

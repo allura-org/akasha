@@ -16,6 +16,9 @@ egui_extras = { version = "0.31", features = ["image"] }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
+# Async trait support (used by Searchables abstraction)
+async-trait = "0.1"
+
 # Database
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "chrono", "json"] }
 
@@ -50,6 +53,9 @@ anyhow = "1"
 
 # XDG directories
 directories = "6"
+
+# URL/file URI construction
+url = "2"
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }

@@ -2,9 +2,11 @@ mod app;
 mod config;
 mod db;
 mod scanner;
+mod searchables;
 mod theme;
 mod thumbnailer;
 mod ui;
+mod watcher;
 
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;

@@ -6,7 +6,7 @@ const SUPPORTED_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "webp", "gif", "bmp", "tiff", "avif",
 ];
 
-fn is_supported(path: &Path) -> bool {
+pub fn is_supported(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| {
@@ -111,6 +111,7 @@ pub async fn scan_folder(
     let mut folder_paths: HashMap<i64, Vec<String>> = HashMap::new();
     let mut scanned_count = 0usize;
     let mut pending: Vec<PendingUpsert> = Vec::new();
+    let mut upserted_media_ids: Vec<i64> = Vec::new();
     const UPSERT_BATCH_SIZE: usize = 500;
 
     // Track directories currently being walked; mark them complete when we leave them
@@ -288,7 +289,8 @@ pub async fn scan_folder(
 
         // Flush batch when full
         if pending.len() >= UPSERT_BATCH_SIZE {
-            flush_batch(pool, &mut pending).await?;
+            let ids = flush_batch(pool, &mut pending).await?;
+            upserted_media_ids.extend(ids);
             tokio::task::yield_now().await;
         }
     }
@@ -306,8 +308,12 @@ pub async fn scan_folder(
 
     // Flush any remaining pending upserts
     if !pending.is_empty() {
-        flush_batch(pool, &mut pending).await?;
+        let ids = flush_batch(pool, &mut pending).await?;
+        upserted_media_ids.extend(ids);
     }
+
+    // Enqueue background inference jobs for any non-text Searchables.
+    enqueue_search_jobs(pool, &upserted_media_ids).await?;
 
     // Delete orphans per visited folder (avoids deleting files in skipped complete subtrees)
     for (folder_id, paths) in &folder_paths {
@@ -340,13 +346,14 @@ struct PendingUpsert {
 async fn flush_batch(
     pool: &sqlx::SqlitePool,
     batch: &mut Vec<PendingUpsert>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<i64>> {
     if batch.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut tx = pool.begin().await?;
+    let mut media_ids = Vec::with_capacity(batch.len());
     for item in batch.iter() {
-        sqlx::query(
+        let id: i64 = sqlx::query_scalar(
             "INSERT INTO media_files
              (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -357,7 +364,8 @@ async fn flush_batch(
                  height = excluded.height,
                  format = excluded.format,
                  file_size = excluded.file_size,
-                 modified_at = excluded.modified_at"
+                 modified_at = excluded.modified_at
+             RETURNING id"
         )
         .bind(item.folder_id)
         .bind(&item.relative_path)
@@ -368,12 +376,97 @@ async fn flush_batch(
         .bind(item.format.as_deref())
         .bind(item.file_size as i64)
         .bind(item.modified_at)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
+        media_ids.push(id);
     }
     tx.commit().await?;
     batch.clear();
+    Ok(media_ids)
+}
+
+async fn enqueue_search_jobs(
+    pool: &sqlx::SqlitePool,
+    media_ids: &[i64],
+) -> anyhow::Result<()> {
+    if media_ids.is_empty() {
+        return Ok(());
+    }
+
+    let configs = crate::db::searchable::list_enabled_configs(pool).await?;
+    let job_configs: Vec<i64> = configs
+        .into_iter()
+        .filter(|c| c.kind != "text")
+        .map(|c| c.id)
+        .collect();
+
+    if job_configs.is_empty() {
+        return Ok(());
+    }
+
+    for media_id in media_ids {
+        for config_id in &job_configs {
+            crate::db::searchable::enqueue_job(pool, *media_id, *config_id).await?;
+        }
+    }
+
+    info!(
+        "Enqueued {} background inference jobs for {} media files",
+        job_configs.len() * media_ids.len(),
+        media_ids.len()
+    );
     Ok(())
+}
+
+/// Process and upsert a single file incrementally. Used by the file watcher.
+pub async fn upsert_one(
+    pool: &sqlx::SqlitePool,
+    folder_id: i64,
+    relative_path: &str,
+    absolute_path: &str,
+) -> anyhow::Result<i64> {
+    let path = std::path::PathBuf::from(absolute_path);
+
+    if !path.is_file() || !is_supported(&path) {
+        anyhow::bail!("unsupported or missing file: {}", absolute_path);
+    }
+
+    let metadata = tokio::fs::metadata(&path).await?;
+    let file_size = metadata.len();
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
+        })
+        .flatten()
+        .map(|dt| dt.naive_utc());
+
+    let path_buf = path.clone();
+    let (hash, width, height, format) = tokio::task::spawn_blocking(move || process_file(&path_buf))
+        .await
+        .map_err(|e| anyhow::anyhow!("task panicked: {e}"))?
+        .map_err(|e| anyhow::anyhow!("process_file failed: {e}"))?;
+
+    let id = crate::db::media::upsert(
+        pool,
+        folder_id,
+        relative_path,
+        absolute_path,
+        &hash,
+        width,
+        height,
+        format.as_deref(),
+        Some(file_size),
+        modified_at,
+    )
+    .await?;
+
+    enqueue_search_jobs(pool, &[id]).await?;
+
+    Ok(id)
 }
 
 fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>, Option<String>)> {
