@@ -13,13 +13,13 @@ akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gall
 - simplistic, comfortable, content-over-chrome design.
 - fast as hell, hundreds of images index per second on a LUKS2-encrypted SATA SSD.
 - media stays where it is, no duplication. akasha gets you to the content you want, it doesn't demand control over it.
+- updates to existing folders are processed automatically
 - backwards-compatible schema means no database rebuilds. migration scripts provided for breaking changes.
 
 ## planned
 
 - killer feature: modular AI classification via a "Searchables" schema abstraction that combines classifiers, taggers, embedding models, VLMs, under one roof
-- file watcher
-- gallery-dl integration
+- ~~gallery-dl integration~~ being moved to another project :3
 - videos
 - remuxing, transcoding
 - interaction API
@@ -41,7 +41,7 @@ thankfully we live in the era of vibe-coding. so i slopped harder than ive ever 
 
 ## install
 
-clone it and `cargo build` homeboy.
+clone it and `cargo build` homeboy. (or grab the latest nightly over hyea)
 
 ### extra features
 
