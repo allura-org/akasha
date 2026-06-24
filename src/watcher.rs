@@ -135,7 +135,10 @@ fn classify_events(events: Vec<DebouncedEvent>) -> Vec<WatcherChange> {
 
             use notify_debouncer_full::notify::EventKind::*;
             let kind = match &event.event.kind {
-                Modify(_) | Create(_) => WatcherChangeKind::Upsert,
+                Create(_) if !path.exists() => WatcherChangeKind::Remove,
+                Create(_) => WatcherChangeKind::Upsert,
+                Modify(_) if !path.exists() => WatcherChangeKind::Remove,
+                Modify(_) => WatcherChangeKind::Upsert,
                 Remove(_) => WatcherChangeKind::Remove,
                 // Access events are ignored — they fire when a file is merely read
                 // (e.g. thumbnail generation) and must not trigger re-upserts.
@@ -172,7 +175,14 @@ mod tests {
     use std::io::Write;
 
     fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("akasha_watcher_test_{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "akasha_watcher_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -227,5 +237,64 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         assert!(found, "expected watcher to detect created file");
+    }
+
+    #[test]
+    fn detects_file_deletion() {
+        let dir = temp_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = FolderConfig {
+            path: dir.to_string_lossy().to_string(),
+            recursive: true,
+            show_recursive: true,
+            blacklist: Vec::new(),
+            thumbnail_cache_mode: None,
+        };
+
+        let pool = Arc::new(tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            pool
+        }));
+
+        let (_handle, rx) = spawn(pool, vec![cfg]).unwrap();
+
+        let test_file = dir.join("test.png");
+        {
+            let mut f = std::fs::File::create(&test_file).unwrap();
+            let png: &[u8] = &[
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+                0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+                0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00,
+                0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8, 0x0f, 0x00, 0x00,
+                0x01, 0x01, 0x00, 0x05, 0x18, 0xd8, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x49,
+                0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            ];
+            f.write_all(png).unwrap();
+        }
+
+        // Wait for the creation event to be emitted.
+        std::thread::sleep(Duration::from_millis(1200));
+        while rx.try_recv().is_ok() {}
+
+        // Delete the file and wait for the watcher to report it.
+        std::fs::remove_file(&test_file).unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let mut found_remove = false;
+        while let Ok(event) = rx.try_recv() {
+            if let WatcherEvent::Changed(changes) = event {
+                if changes.iter().any(|c| {
+                    c.absolute_path == test_file && c.kind == WatcherChangeKind::Remove
+                }) {
+                    found_remove = true;
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(found_remove, "expected watcher to detect deleted file as Remove");
     }
 }
