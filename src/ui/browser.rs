@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 use crate::config::{SortKey, SortOrder};
+use crate::thumbnailer::CacheMode;
 use crate::db;
 use crate::db::media::MediaSummary;
 use crate::searchables::SearchQuery;
@@ -67,6 +68,9 @@ pub struct BrowserPanel {
     pub search_available_names: Vec<String>,
     pub search_enabled_names: HashSet<String>,
 
+    /// Maps folder id -> (import root path, effective cache mode for that root).
+    folder_thumbnail_info: HashMap<i64, (std::path::PathBuf, CacheMode)>,
+
     last_sorted_key: SortKey,
     last_sorted_order: SortOrder,
     last_sorted_len: usize,
@@ -110,6 +114,7 @@ impl BrowserPanel {
             search_active: false,
             search_available_names: Vec::new(),
             search_enabled_names: HashSet::new(),
+            folder_thumbnail_info: HashMap::new(),
             last_sorted_key: sort_key,
             last_sorted_order: sort_order,
             last_sorted_len: 0,
@@ -608,6 +613,36 @@ impl BrowserPanel {
         }
     }
 
+    /// Rebuild the map from folder id to (import root path, effective cache mode).
+    /// `global_cache_mode` is used for roots that don't have a per-folder override.
+    pub fn rebuild_folder_thumbnail_info(&mut self, global_cache_mode: &CacheMode) {
+        use std::path::PathBuf;
+
+        let folders_by_id: HashMap<i64, &db::folder::Folder> =
+            self.folders.iter().map(|f| (f.id, f)).collect();
+
+        let find_root = |folder_id: i64| -> Option<&db::folder::Folder> {
+            let mut current = folders_by_id.get(&folder_id)?;
+            while let Some(parent_id) = current.parent_id {
+                current = folders_by_id.get(&parent_id)?;
+            }
+            Some(current)
+        };
+
+        self.folder_thumbnail_info.clear();
+        for folder in &self.folders {
+            if let Some(root) = find_root(folder.id) {
+                let mode = root
+                    .thumbnail_cache_mode
+                    .as_deref()
+                    .map(|m| CacheMode::from_config(m, ""))
+                    .unwrap_or_else(|| global_cache_mode.clone());
+                self.folder_thumbnail_info
+                    .insert(folder.id, (PathBuf::from(&root.path), mode));
+            }
+        }
+    }
+
     pub fn process_thumbnail_queue(&mut self, thumbnailer: &Thumbnailer) {
         let can_spawn = MAX_CONCURRENT_THUMBNAILS.saturating_sub(self.pending_thumbnails.len());
         if can_spawn == 0 {
@@ -632,14 +667,24 @@ impl BrowserPanel {
             self.pending_thumbnails.insert(hash.clone());
             let source = std::path::PathBuf::from(&media.absolute_path);
             let size = thumbnailer.size;
-            let cache_mode = thumbnailer.cache_mode.clone();
+            let (folder_root, cache_mode) = self
+                .folder_thumbnail_info
+                .get(&media.folder_id)
+                .cloned()
+                .unwrap_or_else(|| (std::path::PathBuf::new(), thumbnailer.cache_mode.clone()));
             let tx = self.thumbnail_tx.clone();
             let epoch = self.thumbnail_epoch;
             let rt = Arc::clone(&self.rt);
 
             rt.spawn_blocking(move || {
                 let thumbnailer = Thumbnailer::new(size, cache_mode);
-                let result = thumbnailer.load_thumbnail_bytes(&source, &hash, None)
+                let folder_root = if folder_root.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(folder_root.as_path())
+                };
+                let result = thumbnailer
+                    .load_thumbnail_bytes(&source, &hash, folder_root)
                     .and_then(|bytes| {
                         let img = image::load_from_memory(&bytes)
                             .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
@@ -650,5 +695,69 @@ impl BrowserPanel {
                 let _ = tx.send((hash, epoch, result.map_err(|e| e.to_string())));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_folder(
+        id: i64,
+        parent_id: Option<i64>,
+        path: &str,
+        cache_mode: Option<&str>,
+    ) -> db::folder::Folder {
+        db::folder::Folder {
+            id,
+            parent_id,
+            path: path.to_string(),
+            recursive: true,
+            show_recursive: true,
+            scan_complete: true,
+            blacklist: Vec::new(),
+            thumbnail_cache_mode: cache_mode.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn per_folder_thumbnail_cache_mode_overrides_global() {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending);
+
+        panel.folders = vec![
+            make_folder(1, None, "/imports/photos", Some("per_folder")),
+            make_folder(2, Some(1), "/imports/photos/vacation", None),
+        ];
+
+        panel.rebuild_folder_thumbnail_info(&CacheMode::Global);
+
+        let (root, mode) = panel
+            .folder_thumbnail_info
+            .get(&2)
+            .expect("child folder info missing");
+        assert_eq!(root, std::path::Path::new("/imports/photos"));
+        assert!(matches!(mode, CacheMode::PerFolder));
+    }
+
+    #[test]
+    fn folder_without_override_uses_global_cache_mode() {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending);
+
+        panel.folders = vec![
+            make_folder(1, None, "/imports/photos", None),
+            make_folder(2, Some(1), "/imports/photos/vacation", None),
+        ];
+
+        panel.rebuild_folder_thumbnail_info(&CacheMode::Disabled);
+
+        let (_, mode) = panel
+            .folder_thumbnail_info
+            .get(&2)
+            .expect("child folder info missing");
+        assert!(matches!(mode, CacheMode::Disabled));
     }
 }

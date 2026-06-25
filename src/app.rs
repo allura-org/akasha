@@ -264,6 +264,7 @@ impl AkashaApp {
                         }
                     }
                     self.browser.folders = folders;
+                    self.browser.rebuild_folder_thumbnail_info(&self.thumbnailer.cache_mode);
                 }
                 Err(e) => self.browser.scan_status = format!("Failed to load folders: {e}"),
             }
