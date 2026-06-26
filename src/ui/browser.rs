@@ -67,6 +67,9 @@ pub struct BrowserPanel {
     pub search_available_names: Vec<String>,
     pub search_enabled_names: HashSet<String>,
 
+    /// Maps folder id -> per-import thumbnail config for its import root.
+    folder_thumbnail_info: HashMap<i64, (std::path::PathBuf, String, String, String)>,
+
     last_sorted_key: SortKey,
     last_sorted_order: SortOrder,
     last_sorted_len: usize,
@@ -110,6 +113,7 @@ impl BrowserPanel {
             search_active: false,
             search_available_names: Vec::new(),
             search_enabled_names: HashSet::new(),
+            folder_thumbnail_info: HashMap::new(),
             last_sorted_key: sort_key,
             last_sorted_order: sort_order,
             last_sorted_len: 0,
@@ -503,7 +507,7 @@ impl BrowserPanel {
                 .find(|f| f.id == *id)
                 .map(|f| self.folder_name(f).to_lowercase())
         });
-        let has_visible_children = !children.is_empty();
+        let has_visible_children = !children.is_empty() && !folder.flatten;
 
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 16.0);
@@ -534,7 +538,7 @@ impl BrowserPanel {
         });
 
         let expand = filtering || self.expanded_folders.contains(&folder_id);
-        if expand {
+        if expand && !folder.flatten {
             for child_id in children {
                 self.render_folder_tree(ui, child_id, depth + 1, clicked_id, visible);
             }
@@ -608,6 +612,41 @@ impl BrowserPanel {
         }
     }
 
+    /// Rebuild the map from folder id to its import root's thumbnail config.
+    pub fn rebuild_folder_thumbnail_info(&mut self, _thumbnailer: &Thumbnailer) {
+        use std::path::PathBuf;
+
+        let folders_by_id: HashMap<i64, &db::folder::Folder> =
+            self.folders.iter().map(|f| (f.id, f)).collect();
+
+        let find_root = |folder_id: i64| -> Option<&db::folder::Folder> {
+            let mut current = folders_by_id.get(&folder_id)?;
+            while let Some(parent_id) = current.parent_id {
+                current = folders_by_id.get(&parent_id)?;
+            }
+            Some(current)
+        };
+
+        self.folder_thumbnail_info.clear();
+        for folder in &self.folders {
+            if let Some(root) = find_root(folder.id) {
+                let mode = root
+                    .thumbnail_cache_mode
+                    .clone()
+                    .unwrap_or_else(|| "global".to_string());
+                let cache_folder = root
+                    .thumbnail_cache_folder
+                    .clone()
+                    .unwrap_or_default();
+                let fallback = root.thumbnail_cache_fallback.clone();
+                self.folder_thumbnail_info.insert(
+                    folder.id,
+                    (PathBuf::from(&root.path), mode, cache_folder, fallback),
+                );
+            }
+        }
+    }
+
     pub fn process_thumbnail_queue(&mut self, thumbnailer: &Thumbnailer) {
         let can_spawn = MAX_CONCURRENT_THUMBNAILS.saturating_sub(self.pending_thumbnails.len());
         if can_spawn == 0 {
@@ -632,14 +671,48 @@ impl BrowserPanel {
             self.pending_thumbnails.insert(hash.clone());
             let source = std::path::PathBuf::from(&media.absolute_path);
             let size = thumbnailer.size;
-            let cache_mode = thumbnailer.cache_mode.clone();
+            let global_cache_folder = thumbnailer.global_cache_folder.clone();
+            let disable_cache = thumbnailer.disable_cache;
+            let temporary_cache = thumbnailer.temporary_cache;
+            let no_cache_read = thumbnailer.no_cache_read;
+            let (folder_root, cache_mode, cache_folder, cache_fallback) = self
+                .folder_thumbnail_info
+                .get(&media.folder_id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    (
+                        std::path::PathBuf::new(),
+                        "global".to_string(),
+                        String::new(),
+                        "disable".to_string(),
+                    )
+                });
             let tx = self.thumbnail_tx.clone();
             let epoch = self.thumbnail_epoch;
             let rt = Arc::clone(&self.rt);
 
             rt.spawn_blocking(move || {
-                let thumbnailer = Thumbnailer::new(size, cache_mode);
-                let result = thumbnailer.load_thumbnail_bytes(&source, &hash, None)
+                let thumbnailer = Thumbnailer::new(
+                    size,
+                    global_cache_folder,
+                    disable_cache,
+                    temporary_cache,
+                    no_cache_read,
+                );
+                let folder_root = if folder_root.as_os_str().is_empty() {
+                    None
+                } else {
+                    Some(folder_root.as_path())
+                };
+                let result = thumbnailer
+                    .load_thumbnail_bytes(
+                        &source,
+                        &hash,
+                        folder_root,
+                        Some(&cache_mode),
+                        Some(cache_folder.as_str()).filter(|s| !s.is_empty()),
+                        Some(&cache_fallback),
+                    )
                     .and_then(|bytes| {
                         let img = image::load_from_memory(&bytes)
                             .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
@@ -650,5 +723,74 @@ impl BrowserPanel {
                 let _ = tx.send((hash, epoch, result.map_err(|e| e.to_string())));
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_folder(
+        id: i64,
+        parent_id: Option<i64>,
+        path: &str,
+        cache_mode: Option<&str>,
+    ) -> db::folder::Folder {
+        db::folder::Folder {
+            id,
+            parent_id,
+            path: path.to_string(),
+            recursive: true,
+            flatten: false,
+            scan_complete: true,
+            exclude: Vec::new(),
+            include: Vec::new(),
+            thumbnail_cache_mode: cache_mode.map(|s| s.to_string()),
+            thumbnail_cache_folder: None,
+            thumbnail_cache_fallback: "disable".to_string(),
+        }
+    }
+
+    #[test]
+    fn per_import_thumbnail_cache_mode_is_resolved() {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending);
+        let thumbnailer = Thumbnailer::new(256, std::path::PathBuf::new(), false, false, false);
+
+        panel.folders = vec![
+            make_folder(1, None, "/imports/photos", Some("custom")),
+            make_folder(2, Some(1), "/imports/photos/vacation", None),
+        ];
+
+        panel.rebuild_folder_thumbnail_info(&thumbnailer);
+
+        let (root, mode, _cache_folder, _fallback) = panel
+            .folder_thumbnail_info
+            .get(&2)
+            .expect("child folder info missing");
+        assert_eq!(root, std::path::Path::new("/imports/photos"));
+        assert_eq!(mode, "custom");
+    }
+
+    #[test]
+    fn folder_without_override_defaults_to_global_cache_mode() {
+        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending);
+        let thumbnailer = Thumbnailer::new(256, std::path::PathBuf::new(), false, false, false);
+
+        panel.folders = vec![
+            make_folder(1, None, "/imports/photos", None),
+            make_folder(2, Some(1), "/imports/photos/vacation", None),
+        ];
+
+        panel.rebuild_folder_thumbnail_info(&thumbnailer);
+
+        let (_, mode, _, _) = panel
+            .folder_thumbnail_info
+            .get(&2)
+            .expect("child folder info missing");
+        assert_eq!(mode, "global");
     }
 }

@@ -5,8 +5,10 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Config {
     pub ui: UiConfig,
-    pub thumbnails: ThumbnailConfig,
-    pub folders: Vec<FolderConfig>,
+    pub thumbnails: ThumbnailsConfig,
+    pub debug: DebugConfig,
+    #[serde(alias = "folders")]
+    pub imports: Vec<ImportConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +78,6 @@ impl SortOrder {
 #[serde(default)]
 pub struct UiConfig {
     pub theme: String,
-    pub thumbnail_size: u32,
     pub double_click_debounce_ms: u64,
     pub scroll_speed: f32,
     pub viewer_default_scale_mode: ViewerScaleMode,
@@ -86,21 +87,45 @@ pub struct UiConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ThumbnailConfig {
-    pub cache_mode: String, // "disabled" | "global" | "per_folder" | "custom"
-    pub custom_path: String,
+pub struct ThumbnailsConfig {
+    /// The size of thumbnails, by longest side.
+    pub thumbnail_size: u32,
+    /// The location of the global cache. Empty means `$HOME/.cache/akasha`.
+    pub cache_folder: String,
+    /// Disables writing to *any* thumbnail cache. Caches are still read.
+    pub disable_cache: bool,
+    /// Writes all new thumbnails to `/tmp/.akasha_thumbnails`. Deleted on exit.
+    pub temporary_cache: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FolderConfig {
+#[serde(default)]
+pub struct DebugConfig {
+    /// Disable all thumbnail cache reads, forcing regeneration.
+    pub no_cache_read: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImportConfig {
     pub path: String,
     #[serde(default = "default_true")]
     pub recursive: bool,
     #[serde(default)]
-    pub show_recursive: bool,
+    pub flatten: bool,
+    #[serde(default, alias = "blacklist")]
+    pub exclude: Vec<String>,
     #[serde(default)]
-    pub blacklist: Vec<String>,
-    pub thumbnail_cache_mode: Option<String>,
+    pub include: Vec<String>,
+    pub thumbnails: ImportThumbnailsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImportThumbnailsConfig {
+    pub cache_mode: String,
+    pub cache_folder: String,
+    pub cache_fallback: String,
 }
 
 fn default_true() -> bool {
@@ -111,8 +136,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             ui: UiConfig::default(),
-            thumbnails: ThumbnailConfig::default(),
-            folders: Vec::new(),
+            thumbnails: ThumbnailsConfig::default(),
+            debug: DebugConfig::default(),
+            imports: Vec::new(),
         }
     }
 }
@@ -121,7 +147,6 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: "dark".to_string(),
-            thumbnail_size: 256,
             double_click_debounce_ms: 300,
             scroll_speed: 1.0,
             viewer_default_scale_mode: ViewerScaleMode::Smallest,
@@ -131,11 +156,44 @@ impl Default for UiConfig {
     }
 }
 
-impl Default for ThumbnailConfig {
+impl Default for ThumbnailsConfig {
+    fn default() -> Self {
+        Self {
+            thumbnail_size: 512,
+            cache_folder: String::new(),
+            disable_cache: false,
+            temporary_cache: false,
+        }
+    }
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            no_cache_read: false,
+        }
+    }
+}
+
+impl Default for ImportConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            recursive: true,
+            flatten: false,
+            exclude: Vec::new(),
+            include: Vec::new(),
+            thumbnails: ImportThumbnailsConfig::default(),
+        }
+    }
+}
+
+impl Default for ImportThumbnailsConfig {
     fn default() -> Self {
         Self {
             cache_mode: "global".to_string(),
-            custom_path: String::new(),
+            cache_folder: String::new(),
+            cache_fallback: "disable".to_string(),
         }
     }
 }

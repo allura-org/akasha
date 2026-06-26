@@ -423,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn get_by_path_and_delete_by_path_round_trip() {
         let pool = setup_pool().await;
-        let fid = folder::insert(&pool, None, "/tmp/root", true, true, true, &[], None)
+        let fid = folder::insert(&pool, None, "/tmp/root", true, false, true, &[], &[], None, None, "disable")
             .await
             .unwrap();
 

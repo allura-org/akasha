@@ -18,7 +18,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 ### Key Goals (from `concept.md`)
 - Keep media in-place; use hashes to avoid duplicates within the app
 - Browse by folder tree (recursive or flat per-folder)
-- Add folders to watch (recursive or not) with blacklist glob patterns
+- Add imports to watch (recursive or not) with exclude/include path filters
 - Modular "Searchables" abstraction for AI classification (classifiers, embeddings, VLMs, etc.)
 - Extensible, backwards-compatible schema
 
@@ -37,7 +37,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEVC → HEIF/HEIC); `fast_image_resize` 6 + `webp` 0.3 (optional SIMD thumbnails) |
 | File hashing | `blake3` |
 | Directory traversal | `walkdir` |
-| Glob blacklists | `globset` |
+| Exclude/include path filters | exact path + substring matching |
 | Logging | `tracing`, `tracing-subscriber` (env-filter) |
 | Error handling | `anyhow` |
 | XDG directories | `directories` 6 |
@@ -101,7 +101,7 @@ cargo test
 src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
-  config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailConfig`, `FolderConfig`
+  config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ImportConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
   searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename` Searchable, background worker stub
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
@@ -109,7 +109,7 @@ src/
   theme.rs       — Custom flat egui theme
   db/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
-    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `update_show_recursive`
+    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `update_flatten`
     media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `delete_orphans`, `search_summaries`
     searchable.rs — Searchable config/value CRUD and `job_queue` helpers
   ui/
@@ -137,10 +137,12 @@ Migrations live in `migrations/` and are embedded at compile time.
 ### `folders`
 - `id`, `parent_id` (FK, self-referencing, cascade delete)
 - `path` (unique, absolute)
-- `recursive` (bool), `show_recursive` (bool)
+- `recursive` (bool), `flatten` (bool)
 - `scan_complete` (bool, DEFAULT 0) — per-subfolder completion tracking
-- `blacklist` (JSON array string)
-- `thumbnail_cache_mode` (optional string: 'disabled', 'global', 'per_folder', 'custom')
+- `exclude` (JSON array string), `include` (JSON array string)
+- `thumbnail_cache_mode` (optional string: 'disabled' | 'global' | 'custom')
+- `thumbnail_cache_folder` (optional string)
+- `thumbnail_cache_fallback` (string: 'disable' | 'global')
 - `created_at`
 - Index: `idx_folder_parent` on `parent_id`
 
@@ -171,7 +173,7 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Index: `idx_job_queue_pending`
 
 ### Notes
-- `blacklist` is stored as a JSON string and deserialized via `serde_json`.
+- `exclude` and `include` are stored as JSON strings and deserialized via `serde_json`.
 - `media_files` uses `UPSERT` (`ON CONFLICT ... DO UPDATE SET`) in `db::media::upsert` and `scanner::flush_batch`.
 - Orphan cleanup uses `json_each()` for batch path comparison.
 - Recursive CTEs are used for tree queries (e.g., `list_by_folder_recursive`, `update_scan_complete_recursive`).
@@ -192,16 +194,30 @@ Cache path: `~/.cache/akasha/`
 ```toml
 [ui]
 theme = "dark"
-thumbnail_size = 256
 
 [thumbnails]
-cache_mode = "global"   # "disabled" | "global" | "per_folder" | "custom"
-custom_path = ""
+thumbnail_size = 512
+cache_folder = ""        # Defaults to $HOME/.cache/akasha
+disable_cache = false
+temporary_cache = false  # Writes to /tmp/.akasha_thumbnails, cleaned on exit
 
-# folders = []
+[debug]
+no_cache_read = false    # Force thumbnail regeneration
+
+# [[import]]
+# path = ""
+# recursive = true
+# flatten = false        # Show import as one folder in the folders pane
+# exclude = []
+# include = []
+#
+# [import.thumbnails]
+# cache_mode = "global"  # "global" | "custom" | "disabled"
+# cache_folder = ""      # Defaults to <import_root>/.akasha_thumbnails
+# cache_fallback = "disable"  # "disable" | "global"
 ```
 
-Per-folder config can override `thumbnail_cache_mode`. Blacklists are glob patterns stored per-folder.
+`exclude`/`include` support exact absolute paths or substring matches against the full path; `exclude` takes precedence. Per-import thumbnail config overrides the global cache location.
 
 ---
 
@@ -267,7 +283,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - ONNX inference for tags/embeddings/classifications is not yet implemented; `job_queue` and `SearchWorker` are stubs that mark jobs done.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
 - Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
-- Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched folders.
+- Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
 - Cross-root file moves appear as a Remove + Create pair; no move deduplication.
 - `delete_orphans_for_root` in `db/media.rs` is no longer called (replaced by per-folder cleanup) and has a bug (only matches direct children, not all descendants).
 - **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.

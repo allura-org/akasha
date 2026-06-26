@@ -6,10 +6,13 @@ pub struct Folder {
     pub parent_id: Option<i64>,
     pub path: String,
     pub recursive: bool,
-    pub show_recursive: bool,
+    pub flatten: bool,
     pub scan_complete: bool,
-    pub blacklist: Vec<String>,
+    pub exclude: Vec<String>,
+    pub include: Vec<String>,
     pub thumbnail_cache_mode: Option<String>,
+    pub thumbnail_cache_folder: Option<String>,
+    pub thumbnail_cache_fallback: String,
 }
 
 pub async fn list_all(pool: &SqlitePool) -> anyhow::Result<Vec<Folder>> {
@@ -55,23 +58,30 @@ pub async fn insert(
     parent_id: Option<i64>,
     path: &str,
     recursive: bool,
-    show_recursive: bool,
+    flatten: bool,
     scan_complete: bool,
-    blacklist: &[String],
+    exclude: &[String],
+    include: &[String],
     cache_mode: Option<&str>,
+    cache_folder: Option<&str>,
+    cache_fallback: &str,
 ) -> anyhow::Result<i64> {
-    let blacklist_json = serde_json::to_string(blacklist)?;
+    let exclude_json = serde_json::to_string(exclude)?;
+    let include_json = serde_json::to_string(include)?;
     let id = sqlx::query(
-        "INSERT INTO folders (parent_id, path, recursive, show_recursive, scan_complete, blacklist, thumbnail_cache_mode)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        "INSERT INTO folders (parent_id, path, recursive, flatten, scan_complete, exclude, include, thumbnail_cache_mode, thumbnail_cache_folder, thumbnail_cache_fallback)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
     )
     .bind(parent_id)
     .bind(path)
     .bind(recursive)
-    .bind(show_recursive)
+    .bind(flatten)
     .bind(scan_complete)
-    .bind(blacklist_json)
+    .bind(exclude_json)
+    .bind(include_json)
     .bind(cache_mode)
+    .bind(cache_folder)
+    .bind(cache_fallback)
     .execute(pool)
     .await?
     .last_insert_rowid();
@@ -84,15 +94,31 @@ pub async fn get_or_create(
     parent_id: Option<i64>,
     path: &str,
     recursive: bool,
-    show_recursive: bool,
+    flatten: bool,
     scan_complete: bool,
-    blacklist: &[String],
+    exclude: &[String],
+    include: &[String],
     cache_mode: Option<&str>,
+    cache_folder: Option<&str>,
+    cache_fallback: &str,
 ) -> anyhow::Result<i64> {
     if let Some(folder) = get_by_path(pool, path).await? {
         return Ok(folder.id);
     }
-    insert(pool, parent_id, path, recursive, show_recursive, scan_complete, blacklist, cache_mode).await
+    insert(
+        pool,
+        parent_id,
+        path,
+        recursive,
+        flatten,
+        scan_complete,
+        exclude,
+        include,
+        cache_mode,
+        cache_folder,
+        cache_fallback,
+    )
+    .await
 }
 
 pub async fn update_scan_complete(
@@ -128,13 +154,13 @@ pub async fn update_scan_complete_recursive(
     Ok(result.rows_affected())
 }
 
-pub async fn update_show_recursive(
+pub async fn update_flatten(
     pool: &SqlitePool,
     folder_id: i64,
-    show_recursive: bool,
+    flatten: bool,
 ) -> anyhow::Result<()> {
-    sqlx::query("UPDATE folders SET show_recursive = ?1 WHERE id = ?2")
-        .bind(show_recursive)
+    sqlx::query("UPDATE folders SET flatten = ?1 WHERE id = ?2")
+        .bind(flatten)
         .bind(folder_id)
         .execute(pool)
         .await?;
@@ -147,10 +173,13 @@ struct FolderRow {
     parent_id: Option<i64>,
     path: String,
     recursive: i64,
-    show_recursive: i64,
+    flatten: i64,
     scan_complete: i64,
-    blacklist: String,
+    exclude: String,
+    include: String,
     thumbnail_cache_mode: Option<String>,
+    thumbnail_cache_folder: Option<String>,
+    thumbnail_cache_fallback: String,
 }
 
 fn into_folder(row: FolderRow) -> Folder {
@@ -159,9 +188,12 @@ fn into_folder(row: FolderRow) -> Folder {
         parent_id: row.parent_id,
         path: row.path,
         recursive: row.recursive != 0,
-        show_recursive: row.show_recursive != 0,
+        flatten: row.flatten != 0,
         scan_complete: row.scan_complete != 0,
-        blacklist: serde_json::from_str(&row.blacklist).unwrap_or_default(),
+        exclude: serde_json::from_str(&row.exclude).unwrap_or_default(),
+        include: serde_json::from_str(&row.include).unwrap_or_default(),
         thumbnail_cache_mode: row.thumbnail_cache_mode,
+        thumbnail_cache_folder: row.thumbnail_cache_folder,
+        thumbnail_cache_fallback: row.thumbnail_cache_fallback,
     }
 }

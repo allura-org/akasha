@@ -10,7 +10,7 @@ use notify_debouncer_full::{
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use crate::config::FolderConfig;
+use crate::config::ImportConfig;
 use crate::scanner::is_supported;
 
 /// A single filesystem change the watcher wants the app to apply.
@@ -46,7 +46,7 @@ pub struct WatcherHandle {
 /// stops when the handle is dropped.
 pub fn spawn(
     _pool: Arc<SqlitePool>,
-    folders: Vec<FolderConfig>,
+    imports: Vec<ImportConfig>,
 ) -> anyhow::Result<(WatcherHandle, Receiver<WatcherEvent>)> {
     let (app_tx, app_rx) = channel::<WatcherEvent>();
     let (internal_tx, internal_rx) = channel::<WatcherEvent>();
@@ -60,9 +60,9 @@ pub fn spawn(
         make_handler(internal_tx.clone()),
     )?;
 
-    for folder in folders {
-        let path = PathBuf::from(&folder.path);
-        let mode = if folder.recursive {
+    for import in imports {
+        let path = PathBuf::from(&import.path);
+        let mode = if import.recursive {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
@@ -191,12 +191,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let cfg = FolderConfig {
+        let cfg = ImportConfig {
             path: dir.to_string_lossy().to_string(),
             recursive: true,
-            show_recursive: true,
-            blacklist: Vec::new(),
-            thumbnail_cache_mode: None,
+            flatten: true,
+            exclude: Vec::new(),
+            include: Vec::new(),
+            thumbnails: crate::config::ImportThumbnailsConfig::default(),
         };
 
         let pool = Arc::new(tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -245,12 +246,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let cfg = FolderConfig {
+        let cfg = ImportConfig {
             path: dir.to_string_lossy().to_string(),
             recursive: true,
-            show_recursive: true,
-            blacklist: Vec::new(),
-            thumbnail_cache_mode: None,
+            flatten: true,
+            exclude: Vec::new(),
+            include: Vec::new(),
+            thumbnails: crate::config::ImportThumbnailsConfig::default(),
         };
 
         let pool = Arc::new(tokio::runtime::Runtime::new().unwrap().block_on(async {
