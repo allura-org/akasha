@@ -1,0 +1,76 @@
+# Example Akasha configuration.
+# Copy or rename this file to config.toml and place it at:
+#   ~/.config/akasha/config.toml
+#
+# The application will create a default config.toml on first launch if one does
+# not exist, but this file shows all available options.
+
+[debug]
+# Don't touch these unless you know what you're doing!
+noCacheRead = false
+# Disable *all thumbnail cache reads*, forcing Akasha to always regenerate thumbnails. For testing/benchmarking.
+
+[thumbnails]
+# Note that thumbnail settings affect WRITES ONLY. Existing caches will always be read, unless debug.noCacheRead is set.
+# Thumbnail caches are read in this order:
+# `import.thumbnails.cache_folder` (if the applicable import.thumbnails != "global")
+# `import.path`/.akasha_thumbnails (if the applicable import.thumbnails != "global")
+# `thumbnails.cache_folder`
+# `$HOME/.cache/akasha`
+
+thumbnail_size = 512
+# The size of thumbnails, by longest side.
+
+cache_folder = ""
+# The location of the global cache. Defaults to `$HOME/.cache/akasha`. If `temporary_cache` or `disable_cache` are true, this is ignored.
+
+temporary_cache = false
+# Writes ALL new thumbnails to `/tmp/.akasha_thumbnails`, overriding other settings. This temp cache is deleted on exit. Does not delete any other caches. If `disable_cache` is true, this is ignored. Mostly for debugging but some may find it useful.
+
+disable_cache = false
+# Disables writing to *any* thumbnail cache. Caches are still read.
+
+[ui]
+theme = "dark"
+double_click_debounce_ms = 300
+scroll_speed = 1.0
+viewer_default_scale_mode = "smallest"
+sort_key = "filename"
+sort_order = "ascending"
+
+[[import]]
+path = ""
+# The path to the import root. If this is unset or reading the path fails, the import is ignored, and if it was previously imported, it's hidden from the gallery. A toast will be shown at startup informing the user of the issue.
+
+recursive = true
+# Whether to scan every folder in the import or just the top-level folder.
+
+flatten = false
+# Show the whole import as one folder. Only affects visibility in the folders pane.
+
+exclude = []
+# Folders or items to exclude from the import. Takes precedence over `include` (so you can selectively exclude from included folders, but NOT vice-versa.)
+# When entries in this array are resolvable paths, the exact path is excluded.
+# When an entry is a bare string, *any* folders or items whose path contains the string is excluded.
+# Useful for e.g. platform thumbnails, sensitive content.
+
+include = []
+# Folders or items to include, *ignoring* everything else. Behaves the same as `exclude`, but `exclude` takes precedence (so you can selectively exclude from included folders, but NOT vice-versa.)
+# Useful for e.g. asset libraries, where you have compatible media in some folders but not others, or for when you have a couple folders that you want to import in the same high-level folder.
+
+[import.thumbnails]
+cache_mode = "global"
+# How to cache thumbnails for this import.
+# If "global", uses the global thumbnail cache.
+# If "custom", uses "cache_folder".
+# If "disabled", thumbnails for this import will not be written (but will still be read if present.)
+
+cache_folder = ""
+# Where to store thumbnails when `cache_mode = "custom".` Ignored otherwise.
+# When unset, thumbnails are stored in a `.akasha_thumbnails` directory at the root of the import.
+
+cache_fallback = "disable"
+# If this import's `cache_folder` can't be used, this controls what to do.
+# In any case, a toast will pop up at startup, advising the user of the issue.
+# If "disable", disables writing new thumbnails.
+# If "global", use the global thumbnail cache.
