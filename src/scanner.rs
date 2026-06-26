@@ -23,24 +23,45 @@ pub fn is_supported(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_blacklist_set(blacklist: &[String]) -> anyhow::Result<globset::GlobSet> {
-    let mut builder = globset::GlobSetBuilder::new();
-    for pattern in blacklist {
-        let glob = globset::Glob::new(pattern)?;
-        builder.add(glob);
+/// Returns true if `path` should be excluded based on the user's exclude list.
+/// An entry that resolves to an absolute path performs exact-path matching;
+/// otherwise the entry is treated as a substring matched against the full path.
+fn is_excluded(path: &Path, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        let candidate = std::path::Path::new(pattern);
+        if candidate.is_absolute() {
+            if path == candidate {
+                return true;
+            }
+        } else {
+            let path_str = path.to_string_lossy();
+            if path_str.contains(pattern) {
+                return true;
+            }
+        }
     }
-    Ok(builder.build()?)
+    false
 }
 
-fn check_blacklist(entry: &walkdir::DirEntry, blacklist: &globset::GlobSet) -> bool {
-    let name = entry.file_name().to_string_lossy();
-    if blacklist.is_match(&*name) {
+/// Returns true if `path` is allowed by the user's include list.
+/// If the include list is empty, everything is allowed.
+/// An entry that resolves to an absolute path performs exact-path matching;
+/// otherwise the entry is treated as a substring matched against the full path.
+fn is_included(path: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
         return true;
     }
-    if let Some(relative) = entry.path().file_name() {
-        let rel = relative.to_string_lossy();
-        if blacklist.is_match(&*rel) {
-            return true;
+    for pattern in patterns {
+        let candidate = std::path::Path::new(pattern);
+        if candidate.is_absolute() {
+            if path == candidate {
+                return true;
+            }
+        } else {
+            let path_str = path.to_string_lossy();
+            if path_str.contains(pattern) {
+                return true;
+            }
         }
     }
     false
@@ -51,19 +72,20 @@ pub async fn scan_folder(
     root_folder_id: i64,
     folder_path: &Path,
     recursive: bool,
-    show_recursive: bool,
-    blacklist: &[String],
+    flatten: bool,
+    exclude: &[String],
+    include: &[String],
     progress_tx: Option<&std::sync::mpsc::Sender<crate::app::ScanEvent>>,
 ) -> anyhow::Result<usize> {
+    let _ = flatten;
     info!(
-        "Scanning folder: {} (recursive={}, show_recursive={}, blacklist={:?})",
+        "Scanning folder: {} (recursive={}, exclude={:?}, include={:?})",
         folder_path.display(),
         recursive,
-        show_recursive,
-        blacklist
+        exclude,
+        include
     );
 
-    let blacklist_set = build_blacklist_set(blacklist)?;
     let walker = if recursive {
         walkdir::WalkDir::new(folder_path)
     } else {
@@ -122,7 +144,11 @@ pub async fn scan_folder(
         if e.depth() == 0 {
             return true;
         }
-        if check_blacklist(e, &blacklist_set) {
+        let path = e.path();
+        if is_excluded(path, exclude) {
+            return false;
+        }
+        if !is_included(path, include) {
             return false;
         }
         if e.file_type().is_dir() && complete_subfolders.contains(e.path()) {
@@ -168,10 +194,13 @@ pub async fn scan_folder(
                     parent_id,
                     &path.to_string_lossy(),
                     false,       // subfolders are non-recursive by default
-                    show_recursive,
+                    false,       // flatten only applies to the import root
                     false,       // not known to be complete until walker leaves it
-                    blacklist,
+                    exclude,
+                    include,
                     None,        // inherit cache mode
+                    None,        // inherit cache folder
+                    "disable",   // inherit fallback
                 )
                 .await
                 {
@@ -486,4 +515,50 @@ fn process_file(path: &Path) -> anyhow::Result<(String, Option<u32>, Option<u32>
     let (width, height) = reader.into_dimensions().ok().unzip();
 
     Ok((hash, width, height, format))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exclude_matches_exact_absolute_path() {
+        let patterns = vec!["/tmp/skip".to_string()];
+        assert!(is_excluded(Path::new("/tmp/skip"), &patterns));
+        assert!(!is_excluded(Path::new("/tmp/keep"), &patterns));
+    }
+
+    #[test]
+    fn exclude_matches_substring() {
+        let patterns = vec!["node_modules".to_string()];
+        assert!(is_excluded(Path::new("/home/user/node_modules/foo.png"), &patterns));
+        assert!(!is_excluded(Path::new("/home/user/photos/foo.png"), &patterns));
+    }
+
+    #[test]
+    fn include_requires_match_when_non_empty() {
+        let patterns = vec!["photos".to_string()];
+        assert!(is_included(Path::new("/home/user/photos/foo.png"), &patterns));
+        assert!(!is_included(Path::new("/home/user/videos/foo.mp4"), &patterns));
+    }
+
+    #[test]
+    fn empty_include_allows_all() {
+        let patterns: Vec<String> = Vec::new();
+        assert!(is_included(Path::new("/anything"), &patterns));
+    }
+
+    #[test]
+    fn exclude_wins_over_include() {
+        let exclude = vec!["private".to_string()];
+        let include = vec!["photos".to_string()];
+        let path = Path::new("/home/user/photos/private/foo.png");
+        assert!(is_excluded(path, &exclude));
+        assert!(is_included(path, &include));
+        // When applying both, exclude takes precedence: the path is rejected.
+        assert!(
+            is_excluded(path, &exclude) || !is_included(path, &include),
+            "exclude should win over include"
+        );
+    }
 }

@@ -112,7 +112,7 @@ mod tests {
     }
 
     async fn insert_test_folder(pool: &SqlitePool, path: &str) -> i64 {
-        folder::insert(pool, None, path, true, true, true, &[], None)
+        folder::insert(pool, None, path, true, false, true, &[], &[], None, None, "disable")
             .await
             .unwrap()
     }
@@ -169,7 +169,7 @@ mod tests {
     async fn recursive_search_follows_subfolders() {
         let pool = setup_pool().await;
         let root = insert_test_folder(&pool, "/tmp/root").await;
-        let child = folder::insert(&pool, Some(root), "/tmp/root/child", true, true, true, &[], None)
+        let child = folder::insert(&pool, Some(root), "/tmp/root/child", true, false, true, &[], &[], None, None, "disable")
             .await
             .unwrap();
         let _ = insert_test_media(&pool, root, "root.jpg").await;

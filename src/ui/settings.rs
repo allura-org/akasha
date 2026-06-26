@@ -34,9 +34,9 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> Vec<Se
 
             ui.horizontal(|ui| {
                 ui.label("Size:");
-                let mut size = config.ui.thumbnail_size as f32;
+                let mut size = config.thumbnails.thumbnail_size as f32;
                 if ui.add(egui::Slider::new(&mut size, 64.0..=512.0).step_by(16.0)).changed() {
-                    config.ui.thumbnail_size = size as u32;
+                    config.thumbnails.thumbnail_size = size as u32;
                     actions.push(SettingsAction::ThumbnailSizeChanged(size as u32));
                 }
             });
@@ -82,14 +82,14 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> Vec<Se
             });
 
             ui.add_space(16.0);
-            ui.heading("Folders");
+            ui.heading("Imports");
             ui.separator();
-            ui.label("Edit ~/.config/akasha/config.toml to add or remove folders.");
+            ui.label("Edit ~/.config/akasha/config.toml to add or remove imports.");
             ui.label("Changes require a restart to take full effect.");
 
             ui.add_space(8.0);
-            for folder in &config.folders {
-                ui.label(format!("• {}", folder.path));
+            for import in &config.imports {
+                ui.label(format!("• {}", import.path));
             }
         });
 

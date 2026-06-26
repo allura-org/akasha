@@ -4,11 +4,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use crate::config::{Config, FolderConfig};
+use crate::config::{Config, ImportConfig};
 use crate::db;
 use crate::searchables::{SearchEngine, SearchQuery};
 use crate::watcher::{WatcherChangeKind, WatcherEvent, WatcherHandle};
-use crate::thumbnailer::{CacheMode, Thumbnailer};
+use crate::thumbnailer::Thumbnailer;
 use crate::ui::browser::BrowserPanel;
 
 #[derive(Debug, Clone)]
@@ -77,11 +77,13 @@ impl AkashaApp {
         crate::theme::apply(&cc.egui_ctx, config.ui.theme == "dark");
         Self::apply_input_options(&cc.egui_ctx, &config);
 
-        let cache_mode = CacheMode::from_config(
-            &config.thumbnails.cache_mode,
-            &config.thumbnails.custom_path,
+        let thumbnailer = Thumbnailer::new(
+            config.thumbnails.thumbnail_size,
+            std::path::PathBuf::from(&config.thumbnails.cache_folder),
+            config.thumbnails.disable_cache,
+            config.thumbnails.temporary_cache,
+            config.debug.no_cache_read,
         );
-        let thumbnailer = Thumbnailer::new(config.ui.thumbnail_size, cache_mode);
 
         let pool_arc = Arc::new(pool);
         let rt_arc = Arc::new(rt);
@@ -92,67 +94,93 @@ impl AkashaApp {
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
         let (search_names_tx, search_names_rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
 
-        // On startup: scan any configured folders that are new or incomplete
+        // On startup: scan any configured imports that are new or incomplete.
+        // Unreachable imports are ignored and a toast is queued.
         let pool_clone = Arc::clone(&pool_arc);
-        let folders_config: Vec<FolderConfig> = config.folders.clone();
+        let mut startup_toasts: Vec<(String, ToastLevel)> = Vec::new();
+        let imports_config: Vec<ImportConfig> = config
+            .imports
+            .iter()
+            .cloned()
+            .filter(|import_cfg| {
+                if import_cfg.path.is_empty() {
+                    startup_toasts.push((
+                        "An import has no path configured and will be ignored".to_string(),
+                        ToastLevel::Warning,
+                    ));
+                    return false;
+                }
+                if !std::path::Path::new(&import_cfg.path).exists() {
+                    startup_toasts.push((
+                        format!("Import not reachable, hiding from gallery: {}", import_cfg.path),
+                        ToastLevel::Warning,
+                    ));
+                    return false;
+                }
+                true
+            })
+            .collect();
 
-        let incomplete_folders: Vec<FolderConfig> = rt_arc.block_on(async {
+        let incomplete_imports: Vec<ImportConfig> = rt_arc.block_on(async {
             let mut incomplete = Vec::new();
-            for folder_cfg in &folders_config {
-                match db::folder::get_by_path(&pool_clone, &folder_cfg.path).await {
+            for import_cfg in &imports_config {
+                match db::folder::get_by_path(&pool_clone, &import_cfg.path).await {
                     Ok(Some(folder)) if folder.scan_complete => {}
                     _ => {
-                        incomplete.push(folder_cfg.clone());
+                        incomplete.push(import_cfg.clone());
                     }
                 }
             }
             incomplete
         });
 
-        if incomplete_folders.is_empty() {
+        if incomplete_imports.is_empty() {
             let _ = scan_tx.send(ScanEvent::Complete("Existing data loaded".to_string(), 0));
         } else {
             let rt_clone = Arc::clone(&rt_arc);
             let pool_clone = Arc::clone(&pool_arc);
             rt_clone.spawn(async move {
-                for folder_cfg in &incomplete_folders {
-                    let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
+                for import_cfg in &incomplete_imports {
+                    let _ = scan_tx.send(ScanEvent::Started(import_cfg.path.clone()));
 
-                    let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
                     match db::folder::get_or_create(
                         &pool_clone,
                         None,
-                        &folder_cfg.path,
-                        folder_cfg.recursive,
-                        folder_cfg.show_recursive,
+                        &import_cfg.path,
+                        import_cfg.recursive,
+                        import_cfg.flatten,
                         false,
-                        &folder_cfg.blacklist,
-                        cache_mode,
+                        &import_cfg.exclude,
+                        &import_cfg.include,
+                        Some(&import_cfg.thumbnails.cache_mode),
+                        Some(import_cfg.thumbnails.cache_folder.as_str()).filter(|s| !s.is_empty()),
+                        &import_cfg.thumbnails.cache_fallback,
                     )
                     .await
                     {
                         Ok(folder_id) => {
-                            let path = std::path::Path::new(&folder_cfg.path);
+                            let path = std::path::Path::new(&import_cfg.path);
                             match crate::scanner::scan_folder(
                                 &pool_clone,
                                 folder_id,
                                 path,
-                                folder_cfg.recursive,
-                                folder_cfg.show_recursive,
-                                &folder_cfg.blacklist,
+                                import_cfg.recursive,
+                                import_cfg.flatten,
+                                &import_cfg.exclude,
+                                &import_cfg.include,
                                 Some(&scan_tx),
                             )
                             .await
                             {
                                 Ok(count) => {
                                     let _ = scan_tx.send(ScanEvent::Complete(
-                                        folder_cfg.path.clone(),
+                                        import_cfg.path.clone(),
                                         count,
                                     ));
                                 }
                                 Err(e) => {
                                     let _ = scan_tx.send(ScanEvent::Error(
-                                        folder_cfg.path.clone(),
+                                        import_cfg.path.clone(),
                                         e.to_string(),
                                     ));
                                 }
@@ -160,7 +188,7 @@ impl AkashaApp {
                         }
                         Err(e) => {
                             let _ = scan_tx.send(ScanEvent::Error(
-                                folder_cfg.path.clone(),
+                                import_cfg.path.clone(),
                                 e.to_string(),
                             ));
                         }
@@ -202,6 +230,10 @@ impl AkashaApp {
             toasts: Vec::new(),
         };
 
+        for (message, level) in startup_toasts {
+            app.push_toast(message, level);
+        }
+
         app.refresh_folders_async();
         app.refresh_searchable_names_async();
 
@@ -213,7 +245,14 @@ impl AkashaApp {
 
         // Start the filesystem watcher immediately. Events that arrive while a
         // manual scan is in flight are ignored to avoid races.
-        match crate::watcher::spawn(Arc::clone(&app.pool), app.config.folders.clone()) {
+        let reachable_imports: Vec<ImportConfig> = app
+            .config
+            .imports
+            .iter()
+            .cloned()
+            .filter(|i| !i.path.is_empty() && std::path::Path::new(&i.path).exists())
+            .collect();
+        match crate::watcher::spawn(Arc::clone(&app.pool), reachable_imports) {
             Ok((handle, rx)) => {
                 app.watcher_handle = Some(handle);
                 app.watcher_rx = rx;
@@ -258,18 +297,54 @@ impl AkashaApp {
         if let Ok(result) = self.folders_rx.try_recv() {
             match result {
                 Ok(folders) => {
+                    // Filter out folders belonging to imports whose root path is no longer
+                    // reachable. Their DB records are preserved but hidden from the gallery.
+                    let by_id: std::collections::HashMap<i64, i64> = folders
+                        .iter()
+                        .map(|f| (f.id, f.parent_id.unwrap_or(f.id)))
+                        .collect();
+                    let mut root_map: std::collections::HashMap<i64, i64> =
+                        std::collections::HashMap::new();
+                    for folder in &folders {
+                        let mut current = folder.id;
+                        while let Some(parent) = by_id.get(&current) {
+                            if *parent == current {
+                                break;
+                            }
+                            current = *parent;
+                        }
+                        root_map.insert(folder.id, current);
+                    }
+
+                    let reachable_roots: std::collections::HashSet<i64> = folders
+                        .iter()
+                        .filter(|f| f.parent_id.is_none())
+                        .filter(|f| std::path::Path::new(&f.path).exists())
+                        .map(|f| f.id)
+                        .collect();
+
+                    let folders: Vec<db::folder::Folder> = folders
+                        .into_iter()
+                        .filter(|f| {
+                            let root_id = root_map.get(&f.id).copied().unwrap_or(f.id);
+                            reachable_roots.contains(&root_id)
+                        })
+                        .collect();
+
                     for folder in &folders {
                         if folder.parent_id.is_none() {
                             self.browser.expanded_folders.insert(folder.id);
                         }
                     }
                     self.browser.folders = folders;
-                    self.browser.rebuild_folder_thumbnail_info(&self.thumbnailer.cache_mode);
+                    self.browser.rebuild_folder_thumbnail_info(&self.thumbnailer);
                 }
                 Err(e) => self.browser.scan_status = format!("Failed to load folders: {e}"),
             }
         }
     }
+
+
 
     fn poll_search_names_events(&mut self) {
         if let Ok(result) = self.search_names_rx.try_recv() {
@@ -308,7 +383,7 @@ impl AkashaApp {
         self.browser.scan_status = "Updating...".to_string();
 
         let pool = Arc::clone(&self.pool);
-        let folders_config = self.config.folders.clone();
+        let imports_config = self.config.imports.clone();
         let media_tx = self.media_tx.clone();
         let epoch = self.browser.media_epoch;
         let selected_folder_id = self.browser.selected_folder_id;
@@ -320,7 +395,7 @@ impl AkashaApp {
 
             for change in changes {
                 let Some((folder_id, relative_path)) =
-                    resolve_watched_path(&pool, &folders_config, &change.absolute_path).await
+                    resolve_watched_path(&pool, &imports_config, &change.absolute_path).await
                 else {
                     continue;
                 };
@@ -370,7 +445,9 @@ impl AkashaApp {
 
     fn refresh_search_async(&mut self, query: SearchQuery) {
         let Some(folder_id) = self.browser.selected_folder_id else { return };
-        let Some(folder) = self.browser.folders.iter().find(|f| f.id == folder_id) else { return };
+        if self.browser.folders.iter().find(|f| f.id == folder_id).is_none() {
+            return;
+        }
 
         if self.media_refresh_in_flight {
             return;
@@ -378,7 +455,6 @@ impl AkashaApp {
 
         let pool = Arc::clone(&self.pool);
         let tx = self.media_tx.clone();
-        let show_recursive = folder.show_recursive;
         let engine = self.search_engine.clone();
 
         self.browser.clear_for_refresh(true);
@@ -387,7 +463,7 @@ impl AkashaApp {
 
         self.rt.spawn(async move {
             let result = engine
-                .execute(&pool, folder_id, show_recursive, &query)
+                .execute(&pool, folder_id, true, &query)
                 .await;
             let summaries: Result<Vec<db::media::MediaSummary>, String> = result.map(|hits| {
                 hits.into_iter()
@@ -404,7 +480,9 @@ impl AkashaApp {
 
     fn refresh_media_async(&mut self, hard_reset: bool) {
         let Some(folder_id) = self.browser.selected_folder_id else { return };
-        let Some(folder) = self.browser.folders.iter().find(|f| f.id == folder_id) else { return };
+        if self.browser.folders.iter().find(|f| f.id == folder_id).is_none() {
+            return;
+        }
 
         if self.media_refresh_in_flight && !hard_reset {
             return;
@@ -412,7 +490,6 @@ impl AkashaApp {
 
         let pool = Arc::clone(&self.pool);
         let tx = self.media_tx.clone();
-        let show_recursive = folder.show_recursive;
 
         if hard_reset {
             self.browser.clear_for_refresh(true);
@@ -421,11 +498,7 @@ impl AkashaApp {
         self.media_refresh_in_flight = true;
         let epoch = self.browser.media_epoch;
         self.rt.spawn(async move {
-            let result = if show_recursive {
-                db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
-            } else {
-                db::media::list_summaries_by_folder(&pool, folder_id).await
-            };
+            let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await;
             let _ = tx.send((epoch, false, result.map_err(|e| e.to_string())));
         });
     }
@@ -709,26 +782,34 @@ impl AkashaApp {
         self.browser.scan_status = "Rescanning...".to_string();
 
         let pool_clone = Arc::clone(&self.pool);
-        let folders_config: Vec<FolderConfig> = self.config.folders.clone();
+        let imports_config: Vec<ImportConfig> = self
+            .config
+            .imports
+            .iter()
+            .cloned()
+            .filter(|i| !i.path.is_empty() && std::path::Path::new(&i.path).exists())
+            .collect();
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         self.scan_rx = scan_rx;
 
         let rt = Arc::clone(&self.rt);
         rt.spawn(async move {
-            for folder_cfg in &folders_config {
-                let _ = scan_tx.send(ScanEvent::Started(folder_cfg.path.clone()));
-                let path = std::path::Path::new(&folder_cfg.path);
-                let cache_mode = folder_cfg.thumbnail_cache_mode.as_deref();
+            for import_cfg in &imports_config {
+                let _ = scan_tx.send(ScanEvent::Started(import_cfg.path.clone()));
+                let path = std::path::Path::new(&import_cfg.path);
 
                 match db::folder::get_or_create(
                     &pool_clone,
                     None,
-                    &folder_cfg.path,
-                    folder_cfg.recursive,
-                    folder_cfg.show_recursive,
+                    &import_cfg.path,
+                    import_cfg.recursive,
+                    import_cfg.flatten,
                     false,
-                    &folder_cfg.blacklist,
-                    cache_mode,
+                    &import_cfg.exclude,
+                    &import_cfg.include,
+                    Some(&import_cfg.thumbnails.cache_mode),
+                    Some(import_cfg.thumbnails.cache_folder.as_str()).filter(|s| !s.is_empty()),
+                    &import_cfg.thumbnails.cache_fallback,
                 )
                 .await
                 {
@@ -738,22 +819,23 @@ impl AkashaApp {
                             &pool_clone,
                             folder_id,
                             path,
-                            folder_cfg.recursive,
-                            folder_cfg.show_recursive,
-                            &folder_cfg.blacklist,
+                            import_cfg.recursive,
+                            import_cfg.flatten,
+                            &import_cfg.exclude,
+                            &import_cfg.include,
                             Some(&scan_tx),
                         )
                         .await
                         {
                             Ok(count) => {
                                 let _ = scan_tx.send(ScanEvent::Complete(
-                                    folder_cfg.path.clone(),
+                                    import_cfg.path.clone(),
                                     count,
                                 ));
                             }
                             Err(e) => {
                                 let _ = scan_tx.send(ScanEvent::Error(
-                                    folder_cfg.path.clone(),
+                                    import_cfg.path.clone(),
                                     e.to_string(),
                                 ));
                             }
@@ -761,7 +843,7 @@ impl AkashaApp {
                     }
                     Err(e) => {
                         let _ = scan_tx.send(ScanEvent::Error(
-                            folder_cfg.path.clone(),
+                            import_cfg.path.clone(),
                             e.to_string(),
                         ));
                     }
@@ -776,13 +858,13 @@ impl AkashaApp {
 /// the file's relative path within that leaf folder.
 async fn resolve_watched_path(
     pool: &sqlx::SqlitePool,
-    folders_config: &[FolderConfig],
+    imports_config: &[ImportConfig],
     absolute_path: &std::path::Path,
 ) -> Option<(i64, String)> {
     // Find the longest matching root path.
-    let mut best_cfg: Option<&FolderConfig> = None;
+    let mut best_cfg: Option<&ImportConfig> = None;
     let mut best_len = 0usize;
-    for cfg in folders_config {
+    for cfg in imports_config {
         if absolute_path.starts_with(&cfg.path) && cfg.path.len() >= best_len {
             best_cfg = Some(cfg);
             best_len = cfg.path.len();
@@ -807,10 +889,13 @@ async fn resolve_watched_path(
                 Some(folder_id),
                 &path_str,
                 false,
-                cfg.show_recursive,
+                cfg.flatten,
                 true,
-                &cfg.blacklist,
-                cfg.thumbnail_cache_mode.as_deref(),
+                &cfg.exclude,
+                &cfg.include,
+                Some(&cfg.thumbnails.cache_mode),
+                Some(cfg.thumbnails.cache_folder.as_str()).filter(|s| !s.is_empty()),
+                &cfg.thumbnails.cache_fallback,
             )
             .await
             {
@@ -985,5 +1070,18 @@ impl eframe::App for AkashaApp {
 
         self.show_toasts(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+impl Drop for AkashaApp {
+    fn drop(&mut self) {
+        if self.config.thumbnails.temporary_cache {
+            let tmp = std::path::Path::new(crate::thumbnailer::TEMP_CACHE_DIR);
+            if tmp.exists() {
+                if let Err(e) = std::fs::remove_dir_all(tmp) {
+                    tracing::warn!("Failed to clean up temporary thumbnail cache: {e}");
+                }
+            }
+        }
     }
 }
