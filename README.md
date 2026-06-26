@@ -35,17 +35,18 @@ my collection stretches to nearly half a million images, accrued over nearly a d
 
 every image gallery sucks. half of them are giant docker containers meant to reimplement the entirety of google photos. hydrus network is a respectable project but it's an absolute behemoth that demands i put too much trust in it, and i see no reason for it to be as complex as it is for what it does.
 
-there is an absolute dearth of appropriate solutions for creatures like me.
+and even among the solutions that Let you use an AI model for content search, they use piddly models from the stone ages that are dogwater at recognizing the things I'm actually interested in.
+so there is an absolute dearth of appropriate solutions for creatures like me.
 
 thankfully we live in the era of vibe-coding. so i slopped harder than ive ever slopped before :3
 
 ## install
 
-clone it and `cargo build` homeboy. (or grab the latest nightly over hyea)
+clone it and `cargo build` homeboy. (or grab the latest nightly over [hyea](https://github.com/allura-org/akasha/releases/tag/nightly))
 
 ### extra features
 
-akasha is pure-rust by default for ease of setup, but some features require non-rust libraries.
+when building from source, akasha is pure-rust by default for ease of setup, but some features require non-rust libraries.
 if u want an optional feature, use `--features <feature>` once for each.
 
 #### HEVC support
@@ -87,13 +88,8 @@ sudo dnf install libwebp-devel
 
 ## setup
 
-`~.config/akasha/config.toml` should be generated on first launch. modify the `[[folders]]` section, and copy it for every directory you want akasha to scan.
+`~.config/akasha/config.toml` should be generated on first launch.
+modify the `[[import]]` table array (including the `[import.thumbnails]` tables) to your preferences.
+you can copy these table arrays multiple times for multiple imports.
 
-each `[[folders]]` section is an import. when `recursive = true`, its children will be scanned, except for any folders with names in the blacklist string array. when `show_recursive = true`, the import will show images found in the root folder *and* all children recursively.
-
-when `thumbnails.cache_mode` is "global", thumbnails are cached to `~/.cache/akasha`
-when `thumbnails.cache_mode` is `custom`, you change where thumbnails are cached to.
-when `thumbnails.cache_mode` is `per_folder`, thumbnails are cached alongside media. (WIP)
-when `thumbnails.cache_mode` is `disabled`, no thumbnails are cached.
-
-thats all the setup that exists rn. thumbnail sizes and theme can be changed in the app
+refer to `config.example.toml` in this repo for info on all the available options.
