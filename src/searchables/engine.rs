@@ -109,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn engine_scores_and_sorts() {
         let pool = setup_pool().await;
-        let fid = folder::insert(&pool, None, "/tmp", true, false, true, &[], &[], None, None, "disable")
+        let fid = folder::insert(&pool, None, "/tmp", true, false, &[], &[], None, None, "disable")
             .await
             .unwrap();
 
@@ -168,7 +168,7 @@ mod tests {
     #[tokio::test]
     async fn engine_aggregates_multiple_searchables() {
         let pool = setup_pool().await;
-        let fid = folder::insert(&pool, None, "/tmp", true, false, true, &[], &[], None, None, "disable")
+        let fid = folder::insert(&pool, None, "/tmp", true, false, &[], &[], None, None, "disable")
             .await
             .unwrap();
 
