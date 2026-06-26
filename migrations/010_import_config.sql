@@ -6,9 +6,8 @@ ALTER TABLE folders ADD COLUMN include TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE folders ADD COLUMN thumbnail_cache_folder TEXT;
 ALTER TABLE folders ADD COLUMN thumbnail_cache_fallback TEXT NOT NULL DEFAULT 'disable';
 
--- Migrate old show_recursive semantics to new flatten semantics.
--- Both are booleans that expand the import's presentation; preserve the value.
-UPDATE folders SET flatten = show_recursive;
+-- Migrate old show_recursive semantics to new flatten semantics (flipped).
+UPDATE folders SET flatten = NOT show_recursive;
 
 -- Migrate old blacklist JSON to new exclude JSON.
 UPDATE folders SET exclude = blacklist;

@@ -1,4 +1,4 @@
--- Fix imports that were incorrectly flattened by migration 010.
--- Old `show_recursive = false` should map to `flatten = false` (show tree),
--- and old `show_recursive = true` should map to `flatten = true` (show as one folder).
+-- Migration 010 flipped show_recursive into flatten, which was incorrect:
+-- old show_recursive=false (tree view, direct files) became flatten=true (flat folder).
+-- Reset flatten to match the original show_recursive value.
 UPDATE folders SET flatten = show_recursive;
