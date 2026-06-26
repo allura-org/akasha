@@ -72,12 +72,10 @@ pub async fn scan_folder(
     root_folder_id: i64,
     folder_path: &Path,
     recursive: bool,
-    flatten: bool,
     exclude: &[String],
     include: &[String],
     progress_tx: Option<&std::sync::mpsc::Sender<crate::app::ScanEvent>>,
 ) -> anyhow::Result<usize> {
-    let _ = flatten;
     info!(
         "Scanning folder: {} (recursive={}, exclude={:?}, include={:?})",
         folder_path.display(),
@@ -194,7 +192,6 @@ pub async fn scan_folder(
                     parent_id,
                     &path.to_string_lossy(),
                     false,       // subfolders are non-recursive by default
-                    false,       // flatten only applies to the import root
                     false,       // not known to be complete until walker leaves it
                     exclude,
                     include,

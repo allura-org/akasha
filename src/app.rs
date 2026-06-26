@@ -148,7 +148,6 @@ impl AkashaApp {
                         None,
                         &import_cfg.path,
                         import_cfg.recursive,
-                        import_cfg.flatten,
                         false,
                         &import_cfg.exclude,
                         &import_cfg.include,
@@ -165,7 +164,6 @@ impl AkashaApp {
                                 folder_id,
                                 path,
                                 import_cfg.recursive,
-                                import_cfg.flatten,
                                 &import_cfg.exclude,
                                 &import_cfg.include,
                                 Some(&scan_tx),
@@ -200,12 +198,13 @@ impl AkashaApp {
         let scroll_speed = config.ui.scroll_speed;
         let sort_key = config.ui.sort_key;
         let sort_order = config.ui.sort_order;
+        let browser_imports = config.imports.clone();
         let mut app = Self {
             config,
             pool: pool_arc.clone(),
             rt: rt_arc.clone(),
             thumbnailer,
-            browser: BrowserPanel::new(rt_arc, thumb_tx, scroll_speed, sort_key, sort_order),
+            browser: BrowserPanel::new(rt_arc, thumb_tx, scroll_speed, sort_key, sort_order, browser_imports),
             search_engine: SearchEngine::with_defaults(),
             scan_rx,
             thumbnail_rx,
@@ -803,7 +802,6 @@ impl AkashaApp {
                     None,
                     &import_cfg.path,
                     import_cfg.recursive,
-                    import_cfg.flatten,
                     false,
                     &import_cfg.exclude,
                     &import_cfg.include,
@@ -820,7 +818,6 @@ impl AkashaApp {
                             folder_id,
                             path,
                             import_cfg.recursive,
-                            import_cfg.flatten,
                             &import_cfg.exclude,
                             &import_cfg.include,
                             Some(&scan_tx),
@@ -889,7 +886,6 @@ async fn resolve_watched_path(
                 Some(folder_id),
                 &path_str,
                 false,
-                cfg.flatten,
                 true,
                 &cfg.exclude,
                 &cfg.include,

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use crate::config::{SortKey, SortOrder};
+use crate::config::{ImportConfig, SortKey, SortOrder};
 use crate::db;
 use crate::db::media::MediaSummary;
 use crate::searchables::SearchQuery;
@@ -70,6 +70,8 @@ pub struct BrowserPanel {
     /// Maps folder id -> per-import thumbnail config for its import root.
     folder_thumbnail_info: HashMap<i64, (std::path::PathBuf, String, String, String)>,
 
+    imports: Vec<ImportConfig>,
+
     last_sorted_key: SortKey,
     last_sorted_order: SortOrder,
     last_sorted_len: usize,
@@ -85,6 +87,7 @@ impl BrowserPanel {
         scroll_speed: f32,
         sort_key: SortKey,
         sort_order: SortOrder,
+        imports: Vec<ImportConfig>,
     ) -> Self {
         Self {
             folders: Vec::new(),
@@ -114,6 +117,7 @@ impl BrowserPanel {
             search_available_names: Vec::new(),
             search_enabled_names: HashSet::new(),
             folder_thumbnail_info: HashMap::new(),
+            imports,
             last_sorted_key: sort_key,
             last_sorted_order: sort_order,
             last_sorted_len: 0,
@@ -494,6 +498,13 @@ impl BrowserPanel {
         let name = self.folder_name(folder).to_string();
         let filtering = !self.folder_filter.is_empty();
 
+        // flatten is a purely visual setting read from config, not stored in the DB.
+        let flatten = is_root
+            && self
+                .imports
+                .iter()
+                .any(|i| i.path == folder.path && i.flatten);
+
         // Pre-compute visible children so the mutable closure below doesn't borrow `folder`.
         let mut children: Vec<i64> = self
             .folders
@@ -507,7 +518,7 @@ impl BrowserPanel {
                 .find(|f| f.id == *id)
                 .map(|f| self.folder_name(f).to_lowercase())
         });
-        let has_visible_children = !children.is_empty() && !folder.flatten;
+        let has_visible_children = !children.is_empty() && !flatten;
 
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 16.0);
@@ -538,7 +549,7 @@ impl BrowserPanel {
         });
 
         let expand = filtering || self.expanded_folders.contains(&folder_id);
-        if expand && !folder.flatten {
+        if expand && !flatten {
             for child_id in children {
                 self.render_folder_tree(ui, child_id, depth + 1, clicked_id, visible);
             }
@@ -741,7 +752,6 @@ mod tests {
             parent_id,
             path: path.to_string(),
             recursive: true,
-            flatten: false,
             scan_complete: true,
             exclude: Vec::new(),
             include: Vec::new(),
@@ -755,7 +765,7 @@ mod tests {
     fn per_import_thumbnail_cache_mode_is_resolved() {
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending);
+        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending, Vec::new());
         let thumbnailer = Thumbnailer::new(256, std::path::PathBuf::new(), false, false, false);
 
         panel.folders = vec![
@@ -777,7 +787,7 @@ mod tests {
     fn folder_without_override_defaults_to_global_cache_mode() {
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
         let (tx, _rx) = std::sync::mpsc::channel();
-        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending);
+        let mut panel = BrowserPanel::new(rt, tx, 1.0, SortKey::Filename, SortOrder::Ascending, Vec::new());
         let thumbnailer = Thumbnailer::new(256, std::path::PathBuf::new(), false, false, false);
 
         panel.folders = vec![
