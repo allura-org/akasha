@@ -107,11 +107,9 @@ pub struct DebugConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, transparent)]
 pub struct ModelsConfig {
-    pub tagger: Vec<ModelConfig>,
-    pub classifier: Vec<ModelConfig>,
-    pub visionlanguage: Vec<ModelConfig>,
+    pub models: Vec<ModelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,14 +117,39 @@ pub struct ModelConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: ModelKind,
-    /// Local model: HuggingFace slug or on-disk directory.
-    pub source: Option<String>,
-    /// Remote OpenAI-compatible base URL.
+    pub path: Option<String>,
     pub base_url: Option<String>,
-    /// Remote model identifier.
     pub model_id: Option<String>,
-    /// API key for remote models. Prefer env vars / keyring in production.
     pub api_key: Option<String>,
+    pub tags: Option<ModelTagsOptions>,
+    pub description: Option<ModelDescriptionOptions>,
+    pub classification: Option<ModelClassificationOptions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelTagsOptions {
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDescriptionOptions {
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelClassificationOptions {}
+
+fn default_threshold() -> f32 {
+    0.35
+}
+
+impl Default for ModelTagsOptions {
+    fn default() -> Self {
+        Self {
+            threshold: default_threshold(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,30 +295,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_models_config() {
+    fn parse_unified_models_config() {
         let text = r#"
 [ui]
 theme = "dark"
 
-[[models.tagger]]
-name = "wd14"
+[[models]]
+name = "wd-vit-tagger-v3"
 type = "local"
-source = "SmilingWolf/wd-v1-4-convnext-tagger-v2"
+path = "SmilingWolf/wd-vit-tagger-v3"
 
-[[models.classifier]]
-name = "nsfw"
-type = "remote"
-base_url = "http://localhost:8000/v1"
-model_id = "my-classifier"
+[models.tags]
+threshold = 0.35
 "#;
 
         let config: Config = toml::from_str(text).unwrap();
-        assert_eq!(config.models.tagger.len(), 1);
-        assert_eq!(config.models.tagger[0].name, "wd14");
-        assert_eq!(config.models.tagger[0].kind, ModelKind::Local);
-        assert_eq!(config.models.tagger[0].source.as_deref(), Some("SmilingWolf/wd-v1-4-convnext-tagger-v2"));
-        assert_eq!(config.models.classifier.len(), 1);
-        assert_eq!(config.models.classifier[0].kind, ModelKind::Remote);
-        assert_eq!(config.models.classifier[0].base_url.as_deref(), Some("http://localhost:8000/v1"));
+        assert_eq!(config.models.models.len(), 1);
+        assert_eq!(config.models.models[0].name, "wd-vit-tagger-v3");
+        assert_eq!(config.models.models[0].kind, ModelKind::Local);
+        assert_eq!(config.models.models[0].path.as_deref(), Some("SmilingWolf/wd-vit-tagger-v3"));
+        assert_eq!(config.models.models[0].tags.as_ref().unwrap().threshold, 0.35);
     }
 }

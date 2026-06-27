@@ -54,12 +54,17 @@ impl AiSubTab {
         }
     }
 
-    fn models<'a>(&self, config: &'a Config) -> &'a [ModelConfig] {
-        match self {
-            AiSubTab::VisionLanguage => &config.models.visionlanguage,
-            AiSubTab::Tagger => &config.models.tagger,
-            AiSubTab::Classifier => &config.models.classifier,
-        }
+    fn models<'a>(&self, config: &'a Config) -> Vec<&'a ModelConfig> {
+        config
+            .models
+            .models
+            .iter()
+            .filter(|m| match self {
+                AiSubTab::VisionLanguage => m.description.is_some(),
+                AiSubTab::Tagger => m.tags.is_some(),
+                AiSubTab::Classifier => m.classification.is_some(),
+            })
+            .collect()
     }
 }
 
@@ -121,9 +126,8 @@ pub fn show(
 
             if models.is_empty() {
                 ui.label(format!(
-                    "No {} models configured. Add them to config.toml under [[models.{}]].",
-                    sub_tab.label(),
-                    sub_tab.job_kind()
+                    "No {} models configured. Add them to config.toml under [[models]].",
+                    sub_tab.label()
                 ));
             } else {
                 ui.label("Model:");
@@ -154,10 +158,10 @@ pub fn show(
                     ui.label("Kind:");
                     ui.label(models[selected].kind_label());
                 });
-                if let Some(source) = &models[selected].source {
+                if let Some(path) = &models[selected].path {
                     ui.horizontal(|ui| {
-                        ui.label("Source:");
-                        ui.label(source);
+                        ui.label("Path:");
+                        ui.label(path);
                     });
                 }
                 if let Some(base_url) = &models[selected].base_url {
