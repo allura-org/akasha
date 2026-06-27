@@ -294,6 +294,12 @@ pub async fn sync_model_configs(
 
     let existing = list_searchable_configs(pool).await?;
     for cfg in existing {
+        // Never disable built-in text Searchables (e.g. the seeded `filename`
+        // row). They are not part of the user-configured [[models]] registry but
+        // must remain active.
+        if cfg.kind == "text" {
+            continue;
+        }
         if !wanted.contains(&(cfg.name.clone(), cfg.kind.clone())) {
             sqlx::query("UPDATE searchable_configs SET enabled = 0 WHERE id = ?1")
                 .bind(cfg.id)
@@ -649,5 +655,90 @@ mod tests {
         assert!(description.enabled);
         assert_eq!(description.options["prompt"].as_str(), Some("describe"));
         assert_eq!(description.options["path"].as_str(), Some("/models/test"));
+    }
+
+    #[tokio::test]
+    async fn sync_model_configs_keeps_filename_enabled() {
+        use crate::config::{ModelConfig, ModelKind};
+
+        let pool = setup_pool().await;
+
+        let model = ModelConfig {
+            name: "test-model".into(),
+            kind: ModelKind::Local,
+            path: Some("/models/test".into()),
+            base_url: None,
+            model_id: Some("id1".into()),
+            api_key: None,
+            tags: None,
+            description: None,
+            classification: None,
+        };
+        sync_model_configs(&pool, &[model]).await.unwrap();
+
+        let filename = get_config_by_name_kind(&pool, "filename", "text")
+            .await
+            .unwrap()
+            .expect("filename config should exist");
+        assert!(filename.enabled);
+    }
+
+    #[tokio::test]
+    async fn migration_path_preserves_searchable_child_rows() {
+        let pool = setup_pool().await;
+
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+
+        let media_id = crate::db::media::upsert(
+            &pool,
+            fid,
+            "foo.jpg",
+            "/tmp/root/foo.jpg",
+            "hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let cfg_id = upsert_config(&pool, "test-cfg", "tags", true, serde_json::json!({}))
+            .await
+            .unwrap();
+
+        upsert_value(&pool, media_id, cfg_id, serde_json::json!("value"))
+            .await
+            .unwrap();
+
+        let job_id = enqueue_job(&pool, media_id, "tagger", r#"{"model":"x"}"#, Some(cfg_id))
+            .await
+            .unwrap();
+
+        // Re-running migrations must be idempotent and must not delete rows.
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let value_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM searchable_values WHERE media_file_id = ?1 AND searchable_config_id = ?2"
+        )
+        .bind(media_id)
+        .bind(cfg_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(value_count.0, 1);
+
+        let job_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM job_queue WHERE id = ?1")
+                .bind(job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(job_count.0, 1);
     }
 }

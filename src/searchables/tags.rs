@@ -48,7 +48,7 @@ impl Searchable for TagsSearchable {
                  JOIN media_files m ON m.id = t.media_file_id
                  JOIN folders f ON f.id = m.folder_id
                  WHERE (f.id = ?1 OR f.path LIKE (SELECT path || '/%' FROM folders WHERE id = ?1))
-                   AND t.tag IN ({})
+                   AND LOWER(t.tag) IN ({})
                  GROUP BY t.media_file_id",
                 placeholders.join(",")
             )
@@ -57,7 +57,7 @@ impl Searchable for TagsSearchable {
                 "SELECT t.media_file_id, COUNT(*) AS matches
                  FROM searchable_tags t
                  JOIN media_files m ON m.id = t.media_file_id
-                 WHERE m.folder_id = ?1 AND t.tag IN ({})
+                 WHERE m.folder_id = ?1 AND LOWER(t.tag) IN ({})
                  GROUP BY t.media_file_id",
                 placeholders.join(",")
             )

@@ -68,9 +68,18 @@ impl CandleWorker {
         .await?
         .context("missing searchable_config for job")?;
 
-        // Load/replace model if needed.
+        // Load/replace model if needed. All model construction (file I/O,
+        // memory-mapping, and ViT build) runs on the blocking thread pool so it
+        // does not stall the async runtime.
         if self.resident_config_id != Some(cfg.id) {
-            self.resident = Some(load_model_for_config(&cfg, &self.device).await?);
+            let device = self.device.clone();
+            let cfg_for_load = cfg.clone();
+            self.resident = Some(
+                tokio::task::spawn_blocking(move || load_model_for_config(&cfg_for_load, &device))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("model loading task panicked: {e}"))?
+                    .with_context(|| format!("failed to load model for {}", cfg.name))?,
+            );
             self.resident_config_id = Some(cfg.id);
         }
 
@@ -108,7 +117,7 @@ impl CandleWorker {
     }
 }
 
-async fn load_model_for_config(
+fn load_model_for_config(
     cfg: &crate::db::searchable::SearchableConfig,
     device: &Device,
 ) -> Result<Box<dyn CandleModel>> {
@@ -127,9 +136,7 @@ async fn load_model_for_config(
         .and_then(|v| v.as_str())
         .unwrap_or(&cfg.name);
     let source = loader::resolve_source(path)?;
-    let files = tokio::task::spawn_blocking(move || loader::load_model_files(&source))
-        .await
-        .map_err(|e| anyhow::anyhow!("model loading task panicked: {e}"))?
+    let files = loader::load_model_files(&source)
         .with_context(|| format!("failed to load model files for {}", cfg.name))?;
 
     match cfg.kind.as_str() {
