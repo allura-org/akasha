@@ -9,6 +9,8 @@ pub mod preprocess;
 pub mod tagger;
 #[cfg(feature = "candle")]
 pub mod worker;
+#[cfg(feature = "candle")]
+pub mod stub;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelOutputKind {

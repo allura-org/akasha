@@ -112,3 +112,35 @@ async fn load_model_for_config(
         other => anyhow::bail!("unsupported model kind: {other}"),
     }
 }
+
+#[cfg(all(test, feature = "candle"))]
+mod tests {
+    use std::sync::Arc;
+    use sqlx::SqlitePool;
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn candle_worker_writes_tags() {
+        let pool = setup_pool().await;
+        let fid = crate::db::folder::insert(&pool, None, "/tmp", true, false, &[], &[], None, None, "disable").await.unwrap();
+        let mid = crate::db::media::upsert(&pool, fid, "a.jpg", "/tmp/a.jpg", "hash", None, None, None, None, None).await.unwrap();
+
+        let cfg_id = crate::db::searchable::upsert_config(&pool, "stub", "tags", true, serde_json::json!({"threshold":0.0})).await.unwrap();
+        crate::db::searchable::enqueue_job(&pool, mid, "inference", "{}", Some(cfg_id)).await.unwrap();
+
+        let jobs = crate::db::searchable::claim_pending_jobs(&pool, 10).await.unwrap();
+        let mut worker = crate::models::worker::CandleWorker::new(Arc::new(pool.clone())).unwrap();
+        // Override resident with stub for the test.
+        worker.set_resident(Box::new(crate::models::stub::StubTagger::new("stub")), cfg_id);
+        worker.process_jobs(&jobs).await.unwrap();
+
+        let row: (String,) = sqlx::query_as("SELECT tags_json FROM media_files WHERE id = ?1")
+            .bind(mid).fetch_one(&pool).await.unwrap();
+        assert!(row.0.contains("stub_tag"));
+    }
+}
