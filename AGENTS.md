@@ -91,7 +91,7 @@ cargo test
 8. Changed files are written to the DB in **batches of 500** wrapped in explicit transactions, rather than one implicit transaction per file.
 9. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
 10. Start the filesystem watcher (`watcher::spawn`) for every configured folder. Watcher events are ignored while a manual scan is in flight to avoid races.
-11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`.
+11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`. Jobs are **not** enqueued automatically on scan/import; inference will be triggered manually via the UI in a later milestone.
 
 ---
 
@@ -283,7 +283,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 ## Known Gaps / TODOs
 
 - `ui/widgets.rs` — only contains a placeholder label helper.
-- ONNX inference for tags/embeddings/classifications is not yet implemented; `job_queue` and `SearchWorker` are stubs that mark jobs done.
+- ONNX inference for tags/embeddings/classifications is not yet implemented; `job_queue` and `SearchWorker` are stubs that mark jobs done. Inference jobs are intended to be triggered manually from the UI, not automatically on scan/import.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
 - Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.

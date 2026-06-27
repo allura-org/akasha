@@ -131,7 +131,6 @@ pub async fn scan_folder(
     let mut folder_paths: HashMap<i64, Vec<String>> = HashMap::new();
     let mut scanned_count = 0usize;
     let mut pending: Vec<PendingUpsert> = Vec::new();
-    let mut upserted_media_ids: Vec<i64> = Vec::new();
     const UPSERT_BATCH_SIZE: usize = 500;
 
     // Track directories currently being walked; mark them complete when we leave them
@@ -315,8 +314,7 @@ pub async fn scan_folder(
 
         // Flush batch when full
         if pending.len() >= UPSERT_BATCH_SIZE {
-            let ids = flush_batch(pool, &mut pending).await?;
-            upserted_media_ids.extend(ids);
+            flush_batch(pool, &mut pending).await?;
             tokio::task::yield_now().await;
         }
     }
@@ -334,12 +332,8 @@ pub async fn scan_folder(
 
     // Flush any remaining pending upserts
     if !pending.is_empty() {
-        let ids = flush_batch(pool, &mut pending).await?;
-        upserted_media_ids.extend(ids);
+        flush_batch(pool, &mut pending).await?;
     }
-
-    // Enqueue background inference jobs for any non-text Searchables.
-    enqueue_search_jobs(pool, &upserted_media_ids).await?;
 
     // Mark missing files per visited folder (avoids touching files in skipped complete subtrees)
     for (folder_id, paths) in &folder_paths {
@@ -413,39 +407,6 @@ async fn flush_batch(
     Ok(media_ids)
 }
 
-async fn enqueue_search_jobs(
-    pool: &sqlx::SqlitePool,
-    media_ids: &[i64],
-) -> anyhow::Result<()> {
-    if media_ids.is_empty() {
-        return Ok(());
-    }
-
-    let configs = crate::db::searchable::list_enabled_configs(pool).await?;
-    let job_configs: Vec<i64> = configs
-        .into_iter()
-        .filter(|c| c.kind != "text")
-        .map(|c| c.id)
-        .collect();
-
-    if job_configs.is_empty() {
-        return Ok(());
-    }
-
-    for media_id in media_ids {
-        for config_id in &job_configs {
-            crate::db::searchable::enqueue_job(pool, *media_id, *config_id).await?;
-        }
-    }
-
-    info!(
-        "Enqueued {} background inference jobs for {} media files",
-        job_configs.len() * media_ids.len(),
-        media_ids.len()
-    );
-    Ok(())
-}
-
 /// Process and upsert a single file incrementally. Used by the file watcher.
 pub async fn upsert_one(
     pool: &sqlx::SqlitePool,
@@ -491,8 +452,6 @@ pub async fn upsert_one(
         modified_at,
     )
     .await?;
-
-    enqueue_search_jobs(pool, &[id]).await?;
 
     Ok(id)
 }
