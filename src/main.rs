@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod db;
+mod models;
 mod scanner;
 mod searchables;
 mod theme;
