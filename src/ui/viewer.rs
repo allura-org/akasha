@@ -9,6 +9,7 @@ pub struct ViewerResponse {
     pub cycle_scale_mode: bool,
     pub show_in_file_manager: bool,
     pub copy_to_clipboard: bool,
+    pub process_with_ai: bool,
     pub context_menu_used: bool,
 }
 
@@ -26,6 +27,7 @@ pub fn show(
         cycle_scale_mode: false,
         show_in_file_manager: false,
         copy_to_clipboard: false,
+        process_with_ai: false,
         context_menu_used: false,
     };
 
@@ -103,6 +105,11 @@ pub fn show(
                                 .sense(egui::Sense::click()),
                         );
                         image_response.context_menu(|ui| {
+                            if ui.button("Process with AI…").clicked() {
+                                resp.process_with_ai = true;
+                                resp.context_menu_used = true;
+                                ui.close_menu();
+                            }
                             if ui.button("Show in file manager").clicked() {
                                 resp.show_in_file_manager = true;
                                 resp.context_menu_used = true;

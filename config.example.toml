@@ -74,3 +74,19 @@ cache_fallback = "disable"
 # In any case, a toast will pop up at startup, advising the user of the issue.
 # If "disable", disables writing new thumbnails.
 # If "global", use the global thumbnail cache.
+
+# AI model configuration for Media Processing.
+# Models are grouped by the kind of searchable data they produce.
+# You can define arbitrarily many models of each type; each gets its own searchable output channel.
+
+# [[models.tagger]]
+# name = "wd14"
+# type = "local"
+# source = "SmilingWolf/wd-v1-4-convnext-tagger-v2"
+
+# [[models.classifier]]
+# name = "nsfw"
+# type = "remote"
+# base_url = "http://localhost:8000/v1"
+# model_id = "my-classifier"
+# api_key = ""  # Optional; prefer env vars / keyring for real secrets

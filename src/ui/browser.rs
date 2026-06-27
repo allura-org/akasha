@@ -8,6 +8,7 @@ use crate::db;
 use crate::db::media::MediaSummary;
 use crate::searchables::SearchQuery;
 use crate::thumbnailer::Thumbnailer;
+use crate::ui::media_processing::MediaProcessingTarget;
 
 fn filename_of(media: &MediaSummary) -> String {
     std::path::Path::new(&media.relative_path)
@@ -68,6 +69,9 @@ pub struct BrowserPanel {
     pub search_available_names: Vec<String>,
     pub search_enabled_names: HashSet<String>,
     pub confirm_clear_missing: bool,
+    pub media_processing_open: bool,
+    pub media_processing_target: Option<MediaProcessingTarget>,
+    pub pending_jobs: usize,
 
     /// Maps folder id -> per-import thumbnail config for its import root.
     folder_thumbnail_info: HashMap<i64, (std::path::PathBuf, String, String, String)>,
@@ -119,6 +123,9 @@ impl BrowserPanel {
             search_available_names: Vec::new(),
             search_enabled_names: HashSet::new(),
             confirm_clear_missing: false,
+            media_processing_open: false,
+            media_processing_target: None,
+            pending_jobs: 0,
             folder_thumbnail_info: HashMap::new(),
             imports,
             last_sorted_key: sort_key,
@@ -260,6 +267,10 @@ impl BrowserPanel {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("⚙ Settings").clicked() {
                             actions.settings_toggled = true;
+                        }
+                        if ui.button("🛠 Media Processing").clicked() {
+                            self.media_processing_open = true;
+                            self.media_processing_target = None;
                         }
                         ui.menu_button("🗑 DB Management", |ui| {
                             if ui.button("Clear missing records...").clicked() {
@@ -447,6 +458,11 @@ impl BrowserPanel {
                                             };
                                             if media.is_present {
                                                 response.context_menu(|ui| {
+                                                    if ui.button("Process with AI…").clicked() {
+                                                        self.media_processing_open = true;
+                                                        self.media_processing_target = Some(MediaProcessingTarget::Single(media.id));
+                                                        ui.close_menu();
+                                                    }
                                                     if ui.button("Show in file manager").clicked() {
                                                         actions.show_in_file_manager = Some(media.absolute_path.clone());
                                                         ui.close_menu();
@@ -587,9 +603,22 @@ impl BrowserPanel {
                 egui::RichText::new(&name)
             };
 
-            if ui.selectable_label(selected, label).clicked() && !selected {
+            let label_response = ui.selectable_label(selected, label);
+            if label_response.clicked() && !selected {
                 *clicked_id = Some(folder_id);
             }
+            label_response.context_menu(|ui| {
+                if ui.button("Process with AI… (recursive)").clicked() {
+                    self.media_processing_open = true;
+                    self.media_processing_target = Some(MediaProcessingTarget::Folder(folder_id, true));
+                    ui.close_menu();
+                }
+                if ui.button("Process with AI… (this folder)").clicked() {
+                    self.media_processing_open = true;
+                    self.media_processing_target = Some(MediaProcessingTarget::Folder(folder_id, false));
+                    ui.close_menu();
+                }
+            });
         });
 
         let expand = filtering || self.expanded_folders.contains(&folder_id);
