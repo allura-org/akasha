@@ -17,6 +17,7 @@ pub fn show(
     media: &MediaSummary,
     texture: &Option<egui::TextureHandle>,
     scale_mode: ViewerScaleMode,
+    missing: bool,
 ) -> ViewerResponse {
     let mut resp = ViewerResponse {
         close: false,
@@ -72,7 +73,17 @@ pub fn show(
                 ui.painter().rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
 
                 // Image
-                if let Some(texture) = texture {
+                if missing {
+                    let text_rect = egui::Rect::from_center_size(
+                        content_rect.center(),
+                        egui::vec2(200.0, 100.0),
+                    );
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(egui::RichText::new("File is missing").size(24.0).color(egui::Color32::LIGHT_GRAY));
+                        });
+                    });
+                } else if let Some(texture) = texture {
                     let tex_w = texture.size()[0] as f32;
                     let tex_h = texture.size()[1] as f32;
                     if tex_w > 0.0 && tex_h > 0.0 {

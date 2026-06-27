@@ -24,7 +24,7 @@ pub struct WatcherChange {
 pub enum WatcherChangeKind {
     /// File was created or modified; upsert it into the DB.
     Upsert,
-    /// File was removed; delete it from the DB.
+    /// File was removed; mark it missing in the DB (metadata is preserved).
     Remove,
 }
 

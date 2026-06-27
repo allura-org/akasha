@@ -34,6 +34,7 @@ pub struct BrowserActions {
     pub sort_key_changed: Option<SortKey>,
     pub sort_order_changed: Option<SortOrder>,
     pub search_changed: Option<SearchQuery>,
+    pub clear_missing_requested: bool,
 }
 
 const MAX_CONCURRENT_THUMBNAILS: usize = 8;
@@ -66,6 +67,7 @@ pub struct BrowserPanel {
     pub search_active: bool,
     pub search_available_names: Vec<String>,
     pub search_enabled_names: HashSet<String>,
+    pub confirm_clear_missing: bool,
 
     /// Maps folder id -> per-import thumbnail config for its import root.
     folder_thumbnail_info: HashMap<i64, (std::path::PathBuf, String, String, String)>,
@@ -116,6 +118,7 @@ impl BrowserPanel {
             search_active: false,
             search_available_names: Vec::new(),
             search_enabled_names: HashSet::new(),
+            confirm_clear_missing: false,
             folder_thumbnail_info: HashMap::new(),
             imports,
             last_sorted_key: sort_key,
@@ -196,6 +199,7 @@ impl BrowserPanel {
             sort_key_changed: None,
             sort_order_changed: None,
             search_changed: None,
+            clear_missing_requested: false,
         };
 
         // Top bar
@@ -257,6 +261,12 @@ impl BrowserPanel {
                         if ui.button("⚙ Settings").clicked() {
                             actions.settings_toggled = true;
                         }
+                        ui.menu_button("🗑 DB Management", |ui| {
+                            if ui.button("Clear missing records...").clicked() {
+                                self.confirm_clear_missing = true;
+                                ui.close_menu();
+                            }
+                        });
                         if ui.button("⟳ Rescan").clicked() && !self.is_scanning {
                             actions.rescan_requested = true;
                         }
@@ -281,6 +291,27 @@ impl BrowserPanel {
                     });
                 });
             });
+
+        // Confirmation dialog for clearing missing records.
+        if self.confirm_clear_missing {
+            egui::Window::new("Clear missing records?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("This will permanently delete all library metadata for files that are currently marked missing.");
+                    ui.label("This cannot be undone.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_clear_missing = false;
+                        }
+                        if ui.button("Confirm").clicked() {
+                            actions.clear_missing_requested = true;
+                            self.confirm_clear_missing = false;
+                        }
+                    });
+                });
+        }
 
         // Left sidebar: folder tree
         egui::SidePanel::left("folders")
@@ -383,7 +414,18 @@ impl BrowserPanel {
                                         egui::Layout::top_down(egui::Align::Center),
                                         |ui| {
                                             ui.set_min_height(row_height);
-                                            let response = if let Some(texture) = self.textures.get(&media.blake3_hash) {
+                                            let response = if !media.is_present {
+                                                let (rect, resp) = ui.allocate_exact_size(item_size, egui::Sense::click());
+                                                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_gray(45));
+                                                let galley = ui.painter().layout_no_wrap(
+                                                    "missing".to_string(),
+                                                    egui::FontId::proportional(14.0),
+                                                    egui::Color32::LIGHT_GRAY,
+                                                );
+                                                let pos = rect.center() - galley.size() * 0.5;
+                                                ui.painter().galley(pos, galley, egui::Color32::LIGHT_GRAY);
+                                                resp
+                                            } else if let Some(texture) = self.textures.get(&media.blake3_hash) {
                                                 let mut size = item_size;
                                                 let tex_w = texture.size()[0] as f32;
                                                 let tex_h = texture.size()[1] as f32;
@@ -403,16 +445,18 @@ impl BrowserPanel {
                                             } else {
                                                 ui.add_sized(item_size, egui::Spinner::new())
                                             };
-                                            response.context_menu(|ui| {
-                                                if ui.button("Show in file manager").clicked() {
-                                                    actions.show_in_file_manager = Some(media.absolute_path.clone());
-                                                    ui.close_menu();
-                                                }
-                                                if ui.button("Copy to clipboard").clicked() {
-                                                    actions.copy_to_clipboard = Some(media.absolute_path.clone());
-                                                    ui.close_menu();
-                                                }
-                                            });
+                                            if media.is_present {
+                                                response.context_menu(|ui| {
+                                                    if ui.button("Show in file manager").clicked() {
+                                                        actions.show_in_file_manager = Some(media.absolute_path.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Copy to clipboard").clicked() {
+                                                        actions.copy_to_clipboard = Some(media.absolute_path.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                });
+                                            }
                                             let filename = std::path::Path::new(&media.relative_path)
                                                 .file_name()
                                                 .and_then(|n| n.to_str())
@@ -592,7 +636,11 @@ impl BrowserPanel {
 
         let mut to_queue = Vec::new();
         for i in start_idx..end_idx {
-            let hash = &self.media_summaries[i].blake3_hash;
+            let media = &self.media_summaries[i];
+            if !media.is_present {
+                continue;
+            }
+            let hash = &media.blake3_hash;
             if !self.textures.contains_key(hash)
                 && !self.pending_thumbnails.contains(hash)
             {

@@ -126,13 +126,20 @@ pub async fn enqueue_job(
     Ok(id)
 }
 
-/// Claim the next batch of pending jobs.
+/// Claim the next batch of pending jobs for media files that are still present.
+/// Jobs for missing files are left pending; they will be retried automatically
+/// if the file reappears, or dropped when the record is purged.
 pub async fn claim_pending_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<JobRow>> {
     let rows = sqlx::query_as::<_, JobRow>(
         "UPDATE job_queue
          SET status = 'running', updated_at = CURRENT_TIMESTAMP
          WHERE id IN (
-             SELECT id FROM job_queue WHERE status = 'pending' ORDER BY created_at LIMIT ?1
+             SELECT j.id
+             FROM job_queue j
+             JOIN media_files m ON m.id = j.media_file_id
+             WHERE j.status = 'pending' AND m.is_present = 1
+             ORDER BY j.created_at
+             LIMIT ?1
          )
          RETURNING id, media_file_id, searchable_config_id, status, attempts, error, created_at, updated_at"
     )
