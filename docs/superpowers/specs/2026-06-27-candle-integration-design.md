@@ -240,15 +240,6 @@ model_id = "nsfw-classifier"
 - `type = "remote"` means call an OpenAI-compatible endpoint using `base_url`, `model_id`, and optionally `api_key`.
 - A model can have multiple subtables if it can perform multiple tasks (e.g. a CLIP model might one day have both `[models.classification]` and `[models.vector]`).
 
-### Model Registry in the DB
-
-Repurpose `searchable_configs` to represent **sources** rather than abstract Searchable types:
-
-- `name`: model name from config (e.g. `wd-vit-tagger-v3`).
-- `kind`: the Searchable kind this source produces (`tags`, `description`, `classification`, `vector`).
-- `enabled`: whether the user has enabled this source.
-- `options`: model-specific JSON (threshold, prompt, etc.).
-
 ### Rust Config Struct
 
 Replace the existing `ModelsConfig` (with separate `tagger`, `classifier`, `visionlanguage` vectors) with a single `Vec<ModelConfig>`:
