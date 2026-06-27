@@ -12,12 +12,13 @@ pub struct SearchableConfig {
     #[sqlx(json)]
     pub options: serde_json::Value,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 /// Load every Searchable configuration from the database.
 pub async fn list_searchable_configs(pool: &SqlitePool) -> Result<Vec<SearchableConfig>> {
     let rows = sqlx::query_as::<_, SearchableConfig>(
-        "SELECT id, name, kind, enabled, options, created_at FROM searchable_configs ORDER BY name"
+        "SELECT id, name, kind, enabled, options, created_at, updated_at FROM searchable_configs ORDER BY name"
     )
     .fetch_all(pool)
     .await?;
@@ -27,7 +28,7 @@ pub async fn list_searchable_configs(pool: &SqlitePool) -> Result<Vec<Searchable
 /// Load only the enabled Searchable configurations.
 pub async fn list_enabled_configs(pool: &SqlitePool) -> Result<Vec<SearchableConfig>> {
     let rows = sqlx::query_as::<_, SearchableConfig>(
-        "SELECT id, name, kind, enabled, options, created_at FROM searchable_configs WHERE enabled = 1 ORDER BY name"
+        "SELECT id, name, kind, enabled, options, created_at, updated_at FROM searchable_configs WHERE enabled = 1 ORDER BY name"
     )
     .fetch_all(pool)
     .await?;
@@ -43,7 +44,7 @@ pub async fn insert_config(
     options: serde_json::Value,
 ) -> Result<i64> {
     let id = sqlx::query(
-        "INSERT INTO searchable_configs (name, kind, enabled, options) VALUES (?1, ?2, ?3, ?4)"
+        "INSERT INTO searchable_configs (name, kind, enabled, options, updated_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)"
     )
     .bind(name)
     .bind(kind)
@@ -66,8 +67,8 @@ pub async fn upsert_config(
     options: serde_json::Value,
 ) -> Result<i64> {
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO searchable_configs (name, kind, enabled, options)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO searchable_configs (name, kind, enabled, options, updated_at)
+         VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
          ON CONFLICT(name, kind) DO UPDATE SET
              enabled = excluded.enabled,
              options = excluded.options,
@@ -90,7 +91,7 @@ pub async fn get_config_by_name_kind(
     kind: &str,
 ) -> Result<Option<SearchableConfig>> {
     let row = sqlx::query_as::<_, SearchableConfig>(
-        "SELECT id, name, kind, enabled, options, created_at FROM searchable_configs
+        "SELECT id, name, kind, enabled, options, created_at, updated_at FROM searchable_configs
          WHERE name = ?1 AND kind = ?2"
     )
     .bind(name)
@@ -207,6 +208,9 @@ pub async fn update_description_json(
 
     // Mirror into FTS5. UPSERT is not supported on virtual tables, so use
     // INSERT OR REPLACE (rowid is the FTS5 docid and matches media_file_id).
+    // NOTE: Because rowid is tied directly to media_file_id, this design only
+    // supports a single description source per media file; a later call with a
+    // different `source` will overwrite the previous FTS5 row.
     sqlx::query(
         "INSERT OR REPLACE INTO searchable_text_fts (rowid, media_file_id, source, content)
          VALUES (?1, ?1, ?2, ?3)"

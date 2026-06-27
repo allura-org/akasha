@@ -1,19 +1,8 @@
 -- Add updated_at to searchable_configs for upsert tracking.
--- SQLite ALTER TABLE cannot add a DATETIME column with CURRENT_TIMESTAMP default,
--- so recreate the table while preserving IDs and data.
-CREATE TABLE searchable_configs_new (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 0,
-    options TEXT NOT NULL DEFAULT '{}',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(name, kind)
-);
+-- SQLite ALTER TABLE cannot accept a non-constant DEFAULT expression, so the
+-- column is added without a default and existing rows are back-filled.
+ALTER TABLE searchable_configs ADD COLUMN updated_at DATETIME;
+UPDATE searchable_configs SET updated_at = CURRENT_TIMESTAMP;
 
-INSERT INTO searchable_configs_new (id, name, kind, enabled, options, created_at, updated_at)
-SELECT id, name, kind, enabled, options, created_at, CURRENT_TIMESTAMP FROM searchable_configs;
-
-DROP TABLE searchable_configs;
-ALTER TABLE searchable_configs_new RENAME TO searchable_configs;
+-- Recreate the name index that was dropped when the table was recreated in migration 015.
+CREATE INDEX idx_searchable_config_name ON searchable_configs(name);
