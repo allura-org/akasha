@@ -245,6 +245,64 @@ pub async fn delete_values_for_config(pool: &SqlitePool, searchable_config_id: i
     Ok(rows)
 }
 
+/// Read the current `[[models]]` registry and upsert a `searchable_configs`
+/// row for each output kind declared by each model. Any existing rows that are
+/// no longer present in the registry are disabled (not deleted) so their values
+/// remain queryable but are no longer shown as active sources.
+pub async fn sync_model_configs(
+    pool: &SqlitePool,
+    models: &[crate::config::ModelConfig],
+) -> Result<()> {
+    let mut wanted = std::collections::HashSet::new();
+
+    for model in models {
+        let base_options = serde_json::json!({
+            "path": model.path,
+            "base_url": model.base_url,
+            "model_id": model.model_id,
+        });
+
+        if let Some(tags) = &model.tags {
+            let mut options = serde_json::to_value(tags)?;
+            merge_json(&mut options, base_options.clone());
+            upsert_config(pool, &model.name, "tags", true, options).await?;
+            wanted.insert((model.name.clone(), "tags".to_string()));
+        }
+        if let Some(description) = &model.description {
+            let mut options = serde_json::to_value(description)?;
+            merge_json(&mut options, base_options.clone());
+            upsert_config(pool, &model.name, "description", true, options).await?;
+            wanted.insert((model.name.clone(), "description".to_string()));
+        }
+        if let Some(classification) = &model.classification {
+            let mut options = serde_json::to_value(classification)?;
+            merge_json(&mut options, base_options);
+            upsert_config(pool, &model.name, "classification", true, options).await?;
+            wanted.insert((model.name.clone(), "classification".to_string()));
+        }
+    }
+
+    fn merge_json(target: &mut serde_json::Value, source: serde_json::Value) {
+        if let (serde_json::Value::Object(t), serde_json::Value::Object(s)) = (target, source) {
+            for (k, v) in s {
+                t.insert(k, v);
+            }
+        }
+    }
+
+    let existing = list_searchable_configs(pool).await?;
+    for cfg in existing {
+        if !wanted.contains(&(cfg.name.clone(), cfg.kind.clone())) {
+            sqlx::query("UPDATE searchable_configs SET enabled = 0 WHERE id = ?1")
+                .bind(cfg.id)
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Enqueue a background processing job for a media file.
 pub async fn enqueue_job(
     pool: &SqlitePool,
@@ -507,5 +565,87 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count.0, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_model_configs_upserts_and_disables_stale() {
+        use crate::config::{
+            ModelClassificationOptions, ModelConfig, ModelDescriptionOptions, ModelKind,
+            ModelTagsOptions,
+        };
+
+        let pool = setup_pool().await;
+
+        let model = ModelConfig {
+            name: "test-model".into(),
+            kind: ModelKind::Local,
+            path: Some("/models/test".into()),
+            base_url: None,
+            model_id: Some("id1".into()),
+            api_key: None,
+            tags: Some(ModelTagsOptions::default()),
+            description: None,
+            classification: Some(ModelClassificationOptions {}),
+        };
+        sync_model_configs(&pool, &[model]).await.unwrap();
+
+        let configs = list_searchable_configs(&pool).await.unwrap();
+        // The seed `filename` config is also present.
+        assert_eq!(configs.len(), 3);
+
+        let tags = configs.iter().find(|c| c.kind == "tags").expect("tags config");
+        assert_eq!(tags.name, "test-model");
+        assert!(tags.enabled);
+        assert_eq!(tags.options["path"].as_str(), Some("/models/test"));
+        assert_eq!(tags.options["model_id"].as_str(), Some("id1"));
+        assert!(tags.options["threshold"].as_f64().is_some());
+
+        let classification = configs
+            .iter()
+            .find(|c| c.kind == "classification")
+            .expect("classification config");
+        assert!(classification.enabled);
+        assert_eq!(classification.options["model_id"].as_str(), Some("id1"));
+        assert_eq!(classification.options["path"].as_str(), Some("/models/test"));
+
+        // Re-sync with a different output kind; previous rows should be disabled.
+        let model2 = ModelConfig {
+            name: "test-model".into(),
+            kind: ModelKind::Local,
+            path: Some("/models/test".into()),
+            base_url: None,
+            model_id: Some("id1".into()),
+            api_key: None,
+            tags: None,
+            description: Some(ModelDescriptionOptions {
+                prompt: Some("describe".into()),
+            }),
+            classification: None,
+        };
+        sync_model_configs(&pool, &[model2]).await.unwrap();
+
+        let configs = list_searchable_configs(&pool).await.unwrap();
+        // Stale rows are disabled but remain in the table.
+        assert_eq!(configs.len(), 4);
+
+        let tags = configs
+            .iter()
+            .find(|c| c.kind == "tags" && c.name == "test-model")
+            .unwrap();
+        assert!(!tags.enabled);
+
+        let classification = configs
+            .iter()
+            .find(|c| c.kind == "classification" && c.name == "test-model")
+            .unwrap();
+        assert!(!classification.enabled);
+
+        let description = configs
+            .iter()
+            .find(|c| c.kind == "description" && c.name == "test-model")
+            .unwrap();
+        assert!(description.enabled);
+        assert_eq!(description.options["prompt"].as_str(), Some("describe"));
+        assert_eq!(description.options["path"].as_str(), Some("/models/test"));
     }
 }

@@ -89,6 +89,17 @@ impl AkashaApp {
 
         let pool_arc = Arc::new(pool);
         let rt_arc = Arc::new(rt);
+
+        // Sync the configured model registry into searchable_configs so the UI
+        // and SearchWorker see the current set of output kinds.
+        let models_for_sync = config.models.models.clone();
+        let pool_for_sync = Arc::clone(&pool_arc);
+        rt_arc.spawn(async move {
+            if let Err(e) = crate::db::searchable::sync_model_configs(&pool_for_sync, &models_for_sync).await {
+                tracing::error!("Failed to sync model configs: {e}");
+            }
+        });
+
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
