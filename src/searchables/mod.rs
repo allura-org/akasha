@@ -110,6 +110,8 @@ impl SearchableRegistry {
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();
         reg.register(Arc::new(filename::FilenameSearchable));
+        reg.register(Arc::new(tags::TagsSearchable));
+        reg.register(Arc::new(description::DescriptionSearchable));
         reg
     }
 
@@ -130,8 +132,10 @@ impl SearchableRegistry {
     }
 }
 
+pub mod description;
 pub mod engine;
 pub mod filename;
+pub mod tags;
 pub mod worker;
 
 pub use engine::SearchEngine;
