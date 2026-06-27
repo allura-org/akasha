@@ -6,7 +6,7 @@ use tokio::runtime::Runtime;
 
 use crate::config::{Config, ImportConfig};
 use crate::db;
-use crate::searchables::{SearchEngine, SearchQuery};
+use crate::searchables::{SearchEngine, SearchQuery, SearchableRegistry};
 use crate::watcher::{WatcherChangeKind, WatcherEvent, WatcherHandle};
 use crate::thumbnailer::Thumbnailer;
 use crate::ui::browser::BrowserPanel;
@@ -46,8 +46,6 @@ pub struct AkashaApp {
     pub media_rx: std::sync::mpsc::Receiver<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>,
     pub folders_tx: std::sync::mpsc::Sender<Result<Vec<db::folder::Folder>, String>>,
     pub folders_rx: std::sync::mpsc::Receiver<Result<Vec<db::folder::Folder>, String>>,
-    pub search_names_tx: std::sync::mpsc::Sender<Result<Vec<String>, String>>,
-    pub search_names_rx: std::sync::mpsc::Receiver<Result<Vec<String>, String>>,
     pub viewer_image_tx: std::sync::mpsc::Sender<(String, Result<egui::ColorImage, String>)>,
     pub viewer_image_rx: std::sync::mpsc::Receiver<(String, Result<egui::ColorImage, String>)>,
 
@@ -91,21 +89,18 @@ impl AkashaApp {
         let rt_arc = Arc::new(rt);
 
         // Sync the configured model registry into searchable_configs so the UI
-        // and SearchWorker see the current set of output kinds.
+        // and SearchWorker see the current set of output kinds. This is awaited
+        // during startup to avoid a race with the Media Processing model list.
         let models_for_sync = config.models.models.clone();
-        let pool_for_sync = Arc::clone(&pool_arc);
-        rt_arc.spawn(async move {
-            if let Err(e) = crate::db::searchable::sync_model_configs(&pool_for_sync, &models_for_sync).await {
-                tracing::error!("Failed to sync model configs: {e}");
-            }
-        });
+        if let Err(e) = rt_arc.block_on(crate::db::searchable::sync_model_configs(&pool_arc, &models_for_sync)) {
+            tracing::error!("Failed to sync model configs: {e}");
+        }
 
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (thumb_tx, thumbnail_rx) = std::sync::mpsc::channel::<(String, u64, Result<egui::ColorImage, String>)>();
         let (viewer_img_tx, viewer_img_rx) = std::sync::mpsc::channel::<(String, Result<egui::ColorImage, String>)>();
         let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
-        let (search_names_tx, search_names_rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
         let (jobs_count_tx, jobs_count_rx) = std::sync::mpsc::channel::<usize>();
 
         // Background ticker: report pending/running job count every few seconds.
@@ -247,8 +242,6 @@ impl AkashaApp {
             media_rx,
             folders_tx,
             folders_rx,
-            search_names_tx,
-            search_names_rx,
             viewer_image_tx: viewer_img_tx,
             viewer_image_rx: viewer_img_rx,
             watcher_rx: std::sync::mpsc::channel().1,
@@ -270,9 +263,15 @@ impl AkashaApp {
         }
 
         app.refresh_folders_async();
-        app.refresh_searchable_names_async();
 
-        // Start the background Searchables worker stub.
+        // Search toggles use the fixed registry channel names, not model sources.
+        app.browser.search_available_names = SearchableRegistry::with_defaults()
+            .names()
+            .map(|s| s.to_string())
+            .collect();
+        app.browser.search_enabled_names = app.browser.search_available_names.iter().cloned().collect();
+
+        // Start the background Searchables worker.
         let worker_pool = Arc::clone(&app.pool);
         app.rt.spawn(async move {
             crate::searchables::SearchWorker::new(worker_pool).run().await;
@@ -314,17 +313,6 @@ impl AkashaApp {
         self.rt.spawn(async move {
             let result = db::folder::list_all(&pool).await;
             let _ = tx.send(result.map_err(|e| e.to_string()));
-        });
-    }
-
-    fn refresh_searchable_names_async(&mut self) {
-        let pool = Arc::clone(&self.pool);
-        let tx = self.search_names_tx.clone();
-        self.rt.spawn(async move {
-            let result = db::searchable::list_enabled_configs(&pool).await;
-            let _ = tx.send(result.map_err(|e| e.to_string()).map(|configs| {
-                configs.into_iter().map(|c| c.name).collect()
-            }));
         });
     }
 
@@ -380,18 +368,6 @@ impl AkashaApp {
     }
 
 
-
-    fn poll_search_names_events(&mut self) {
-        if let Ok(result) = self.search_names_rx.try_recv() {
-            match result {
-                Ok(names) => {
-                    self.browser.search_available_names = names.clone();
-                    self.browser.search_enabled_names = names.into_iter().collect();
-                }
-                Err(e) => tracing::warn!("Failed to load Searchable names: {e}"),
-            }
-        }
-    }
 
     fn poll_watcher_events(&mut self) {
         if self.browser.is_scanning {
@@ -1021,7 +997,6 @@ impl eframe::App for AkashaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_events();
         self.poll_folders_events();
-        self.poll_search_names_events();
         self.poll_watcher_events();
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);

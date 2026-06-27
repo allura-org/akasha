@@ -11,8 +11,8 @@ pub fn image_to_tensor(path: &Path, size: usize, device: &Device) -> Result<Tens
         let r = p[0] as f32 / 255.0;
         let g = p[1] as f32 / 255.0;
         let b = p[2] as f32 / 255.0;
-        // Normalize with ImageNet mean/std.
-        [(r - 0.48145466) / 0.26862954, (g - 0.4578275) / 0.26130258, (b - 0.40821073) / 0.27577711]
+        // Normalize with standard ImageNet mean/std.
+        [(r - 0.485) / 0.229, (g - 0.456) / 0.224, (b - 0.406) / 0.225]
     }).collect();
 
     let tensor = Tensor::from_vec(pixels, (size, size, 3), device)?

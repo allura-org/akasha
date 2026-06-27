@@ -18,9 +18,21 @@ pub struct CandleWorker {
 
 impl CandleWorker {
     pub fn new(pool: Arc<SqlitePool>) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("CUDA device unavailable, falling back to CPU: {e}");
+                Device::Cpu
+            }
+        };
+
+        #[cfg(not(feature = "cuda"))]
+        let device = Device::Cpu;
+
         Ok(Self {
             pool,
-            device: Device::Cpu,
+            device,
             resident: None,
             resident_config_id: None,
         })
@@ -32,8 +44,15 @@ impl CandleWorker {
         self.resident_config_id = Some(config_id);
     }
 
+    pub fn resident_config_id(&self) -> Option<i64> {
+        self.resident_config_id
+    }
+
     pub async fn process_jobs(&mut self, jobs: &[crate::db::searchable::JobRow]) -> Result<()> {
-        for job in jobs {
+        for (i, job) in jobs.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
             if let Err(e) = self.process_one(job).await {
                 let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
             }
@@ -94,12 +113,24 @@ async fn load_model_for_config(
     device: &Device,
 ) -> Result<Box<dyn CandleModel>> {
     let options_value = cfg.options.clone();
+
+    if options_value
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        anyhow::bail!("remote inference is not implemented in the candle worker");
+    }
+
     let path = options_value
         .get("path")
         .and_then(|v| v.as_str())
         .unwrap_or(&cfg.name);
     let source = loader::resolve_source(path)?;
-    let files = loader::load_model_files(&source)?;
+    let files = tokio::task::spawn_blocking(move || loader::load_model_files(&source))
+        .await
+        .map_err(|e| anyhow::anyhow!("model loading task panicked: {e}"))?
+        .with_context(|| format!("failed to load model files for {}", cfg.name))?;
 
     match cfg.kind.as_str() {
         "tags" => {

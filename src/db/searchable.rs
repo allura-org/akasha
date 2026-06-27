@@ -25,16 +25,6 @@ pub async fn list_searchable_configs(pool: &SqlitePool) -> Result<Vec<Searchable
     Ok(rows)
 }
 
-/// Load only the enabled Searchable configurations.
-pub async fn list_enabled_configs(pool: &SqlitePool) -> Result<Vec<SearchableConfig>> {
-    let rows = sqlx::query_as::<_, SearchableConfig>(
-        "SELECT id, name, kind, enabled, options, created_at, updated_at FROM searchable_configs WHERE enabled = 1 ORDER BY name"
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
 /// Insert a new Searchable configuration. Used by migrations and future model installers.
 pub async fn insert_config(
     pool: &SqlitePool,
@@ -364,7 +354,7 @@ pub async fn claim_pending_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<Job
              FROM job_queue j
              JOIN media_files m ON m.id = j.media_file_id
              WHERE j.status = 'pending' AND m.is_present = 1
-             ORDER BY j.created_at
+             ORDER BY j.searchable_config_id, j.created_at
              LIMIT ?1
          )
          RETURNING id, media_file_id, searchable_config_id, job_kind, params_json, status, attempts, error, created_at, updated_at"

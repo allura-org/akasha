@@ -6,11 +6,15 @@ use tokio::time::interval;
 
 /// Background worker that polls the `job_queue` table.
 ///
-/// For now this only dispatches AI inference jobs as dummy work (log + sleep).
-/// Real ONNX/remote inference will be plugged into `process_ai_job` later.
+/// When the `candle` feature is enabled, the worker owns a resident
+/// `CandleWorker` and reuses it across ticks. Jobs are clustered by
+/// `searchable_config_id` so the same model stays loaded for consecutive
+/// jobs. Without `candle`, AI jobs are processed as no-ops (log + mark done).
 pub struct SearchWorker {
     pool: Arc<SqlitePool>,
     batch_size: i64,
+    #[cfg(feature = "candle")]
+    candle: Option<crate::models::worker::CandleWorker>,
 }
 
 impl SearchWorker {
@@ -18,10 +22,12 @@ impl SearchWorker {
         Self {
             pool,
             batch_size: 4,
+            #[cfg(feature = "candle")]
+            candle: None,
         }
     }
 
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         let mut ticker = interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
@@ -34,26 +40,44 @@ impl SearchWorker {
     }
 
     #[cfg(feature = "candle")]
-    async fn tick(&self) -> anyhow::Result<usize> {
-        let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
+    async fn tick(&mut self) -> anyhow::Result<usize> {
+        let mut jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
         let count = jobs.len();
         if count == 0 {
             return Ok(0);
         }
 
-        let mut candle = crate::models::worker::CandleWorker::new(Arc::clone(&self.pool))?;
+        let resident_id = self.candle.as_ref().and_then(|c| c.resident_config_id());
+        cluster_jobs(&mut jobs, resident_id);
+
+        if self.candle.is_none() {
+            match crate::models::worker::CandleWorker::new(Arc::clone(&self.pool)) {
+                Ok(c) => self.candle = Some(c),
+                Err(e) => {
+                    for job in &jobs {
+                        let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+                    }
+                    return Ok(count);
+                }
+            }
+        }
+
+        let candle = self.candle.as_mut().unwrap();
         candle.process_jobs(&jobs).await?;
         Ok(count)
     }
 
     #[cfg(not(feature = "candle"))]
-    async fn tick(&self) -> anyhow::Result<usize> {
+    async fn tick(&mut self) -> anyhow::Result<usize> {
         let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
         let count = jobs.len();
-        for job in jobs {
+        for (i, job) in jobs.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
             match job.job_kind.as_str() {
                 "tagger" | "classifier" | "visionlanguage" => {
-                    if let Err(e) = self.process_ai_job(&job).await {
+                    if let Err(e) = self.process_ai_job(job).await {
                         let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
                     }
                 }
@@ -101,4 +125,12 @@ impl SearchWorker {
         crate::db::searchable::complete_job(&self.pool, job.id).await?;
         Ok(())
     }
+}
+
+#[cfg(feature = "candle")]
+fn cluster_jobs(jobs: &mut [crate::db::searchable::JobRow], resident_id: Option<i64>) {
+    jobs.sort_by_key(|j| {
+        let is_resident = resident_id == j.searchable_config_id;
+        (!is_resident, j.searchable_config_id, j.created_at)
+    });
 }

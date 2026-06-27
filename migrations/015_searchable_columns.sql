@@ -1,3 +1,5 @@
+PRAGMA foreign_keys = OFF;
+
 -- Add raw Searchable storage columns to media_files.
 ALTER TABLE media_files ADD COLUMN tags_json TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE media_files ADD COLUMN descriptions_json TEXT NOT NULL DEFAULT '{}';
@@ -36,9 +38,7 @@ CREATE TABLE searchable_configs_new (
 INSERT INTO searchable_configs_new (id, name, kind, enabled, options, created_at)
 SELECT id, name, kind, enabled, options, created_at FROM searchable_configs;
 
--- NOTE: This DROP relies on SQLite foreign_keys being OFF, which is the
--- default used by the sqlx migration runner. If foreign keys are ever enabled
--- during migrations, this migration will need to be revisited (e.g. drop
--- dependent tables/values first or otherwise break the FK cycle).
 DROP TABLE searchable_configs;
 ALTER TABLE searchable_configs_new RENAME TO searchable_configs;
+
+PRAGMA foreign_keys = ON;

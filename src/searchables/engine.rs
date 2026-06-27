@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use sqlx::SqlitePool;
 
-use crate::db::{media, searchable};
+use crate::db::media;
 
 use super::{SearchHit, SearchQuery, SearchableRegistry};
 
@@ -37,13 +37,8 @@ impl SearchEngine {
             return Ok(Vec::new());
         }
 
-        // Load enabled configs from the DB and intersect with the registry.
-        let configs = searchable::list_enabled_configs(pool).await?;
-        let enabled_names: std::collections::HashSet<&str> = configs
-            .iter()
-            .map(|c| c.name.as_str())
-            .filter(|name| query.enabled_searchables.iter().any(|e| e == *name))
-            .collect();
+        let enabled_names: std::collections::HashSet<&str> =
+            query.enabled_searchables.iter().map(|s| s.as_str()).collect();
 
         if enabled_names.is_empty() {
             return Ok(Vec::new());
@@ -218,5 +213,51 @@ mod tests {
             .collect();
         assert_eq!(by_id[&m1], 1.0);
         assert_eq!(by_id[&m2], 2.0);
+    }
+
+    #[tokio::test]
+    async fn engine_runs_fixed_tags_and_descriptions_searchables() {
+        use std::collections::HashMap;
+
+        let pool = setup_pool().await;
+        let fid = folder::insert(&pool, None, "/tmp", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+
+        let tagged = media::upsert(
+            &pool, fid, "tagged.jpg", "/tmp/tagged.jpg", "hash1",
+            None, None, None, Some(0), Some(chrono::Local::now().naive_local()),
+        )
+        .await
+        .unwrap();
+        let described = media::upsert(
+            &pool, fid, "described.jpg", "/tmp/described.jpg", "hash2",
+            None, None, None, Some(0), Some(chrono::Local::now().naive_local()),
+        )
+        .await
+        .unwrap();
+
+        let mut tags = HashMap::new();
+        tags.insert("cat".to_string(), 0.9f32);
+        searchable::update_tags_json(&pool, tagged, "wd-vit", tags)
+            .await
+            .unwrap();
+        searchable::update_description_json(&pool, described, "blip", "a cat on a mat")
+            .await
+            .unwrap();
+
+        let engine = SearchEngine::with_defaults();
+        let query = SearchQuery {
+            text: "cat".into(),
+            enabled_searchables: vec!["tags".into(), "descriptions".into()],
+        };
+        let hits = engine.execute(&pool, fid, false, &query).await.unwrap();
+
+        let by_id: std::collections::HashMap<i64, f32> = hits
+            .into_iter()
+            .map(|h| (h.media_summary.id, h.score))
+            .collect();
+        assert!(by_id.contains_key(&tagged), "tags searchable should match");
+        assert!(by_id.contains_key(&described), "descriptions searchable should match");
     }
 }
