@@ -76,17 +76,33 @@ cache_fallback = "disable"
 # If "global", use the global thumbnail cache.
 
 # AI model configuration for Media Processing.
-# Models are grouped by the kind of searchable data they produce.
-# You can define arbitrarily many models of each type; each gets its own searchable output channel.
+# Models are declared as a unified [[models]] list. Each model can produce one or more
+# searchable output channels by including the relevant subtable(s):
+#   [models.tags], [models.description], [models.classification]
+#
+# Local models require akasha to be built with the `candle` feature:
+#   cargo build --features candle
+# They are downloaded on first use via `hf-hub` into the standard Hugging Face cache
+# (`$HF_HOME`, default `~/.cache/huggingface`).
 
-# [[models.tagger]]
-# name = "wd14"
+# Example: a standard Hugging Face ViT image-classification model used as a tagger.
+# Note: SmilingWolf/wd-vit-tagger-v3 uses a timm-style config and is not directly
+# compatible with candle_transformers::models::vit; use HF ViT checkpoints instead.
+# [[models]]
+# name = "vit-base-patch16-224"
 # type = "local"
-# source = "SmilingWolf/wd-v1-4-convnext-tagger-v2"
+# path = "google/vit-base-patch16-224"
+#
+# [models.tags]
+# threshold = 0.35
 
-# [[models.classifier]]
-# name = "nsfw"
+# Example: a remote vision-language or classification endpoint.
+# [[models]]
+# name = "my-remote"
 # type = "remote"
 # base_url = "http://localhost:8000/v1"
-# model_id = "my-classifier"
+# model_id = "my-model"
 # api_key = ""  # Optional; prefer env vars / keyring for real secrets
+#
+# [models.description]
+# prompt = "Describe this image in one sentence."

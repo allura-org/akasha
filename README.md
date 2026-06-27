@@ -86,6 +86,23 @@ sudo apt install libwebp-dev
 sudo dnf install libwebp-devel
 ```
 
+#### Local AI inference (candle)
+
+`candle`
+
+enables local inference using Hugging Face `candle`. Models are downloaded on first use via `hf-hub` and cached in `$HF_HOME` (default `~/.cache/huggingface`). Add a `[[models]]` entry to `config.toml` with `type = "local"` and the relevant output subtable (`[models.tags]`, `[models.description]`, etc.).
+
+```bash
+cargo build --features candle
+# or with CUDA support:
+cargo build --features candle,cuda
+```
+
+**notes:**
+
+- Local CPU inference can be very slow on large collections and only runs while Akasha is open.
+- The popular `SmilingWolf/wd-vit-tagger-v3` checkpoint uses a `timm`-style model config and is not directly compatible with `candle_transformers::models::vit`; use standard Hugging Face ViT checkpoints (e.g. `google/vit-base-patch16-224`) for the current scaffold.
+
 ## setup
 
 `~.config/akasha/config.toml` should be generated on first launch.

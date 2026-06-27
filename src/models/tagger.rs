@@ -181,4 +181,47 @@ mod manual_tests {
         assert!(!sorted.is_empty(), "expected at least one tag above threshold");
         Ok(())
     }
+
+    /// Manual performance baseline: run inference on 10 images and report total / per-image time.
+    /// Run with `cargo test --features candle --release -- --ignored --nocapture vit_base_tagger_baseline`.
+    #[test]
+    #[ignore = "manual: benchmarks google/vit-base-patch16-224 CPU inference"]
+    fn vit_base_tagger_baseline() -> Result<()> {
+        let source = loader::resolve_source("google/vit-base-patch16-224")?;
+        let files = loader::load_model_files(&source)?;
+        let tagger = WdViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+
+        let image_paths: Vec<&str> = vec![
+            "test_imgs/dagnpats.png",
+            "test_imgs/dagnscritchies.png",
+            "test_imgs/noise_0001_295694.png",
+            "test_imgs/noise_0002_899443.png",
+            "test_imgs/Th105Yuyuko.png",
+            "test_imgs/tmpnc1whtei.png",
+            "test_imgs/dagnpats.png",
+            "test_imgs/dagnscritchies.png",
+            "test_imgs/noise_0001_295694.png",
+            "test_imgs/noise_0002_899443.png",
+        ];
+
+        let start = std::time::Instant::now();
+        let mut tag_counts = Vec::new();
+        for path in &image_paths {
+            let output = tagger.infer(Path::new(path))?;
+            let ModelOutput::Tags(tags) = output else {
+                anyhow::bail!("expected tag output");
+            };
+            tag_counts.push(tags.len());
+        }
+        let elapsed = start.elapsed();
+
+        println!(
+            "baseline: {} images in {:.2}s ({:.2}s / image)",
+            image_paths.len(),
+            elapsed.as_secs_f64(),
+            elapsed.as_secs_f64() / image_paths.len() as f64
+        );
+        println!("tags per image: {:?}", tag_counts);
+        Ok(())
+    }
 }
