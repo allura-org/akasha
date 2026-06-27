@@ -89,9 +89,26 @@ New migration `migrations/015_searchable_columns.sql`:
 1. Adds the four JSON columns to `media_files`.
 2. Creates `searchable_tags` and `searchable_text_fts`.
 3. Changes `searchable_configs` so a source can have multiple rows (one per output kind):
-   - Drop the old `name` unique constraint.
-   - Add `UNIQUE(name, kind)`.
-   - SQLite requires recreating the table to drop a unique constraint; the migration copies existing rows into a temporary table, drops the old table, and renames the temporary table.
+   - Recreate the table with `UNIQUE(name, kind)` and preserve existing `id` values so foreign keys from `job_queue` and `searchable_values` remain valid:
+     ```sql
+     CREATE TABLE searchable_configs_new (
+         id INTEGER PRIMARY KEY,
+         name TEXT NOT NULL,
+         kind TEXT NOT NULL,
+         enabled INTEGER NOT NULL DEFAULT 0,
+         options TEXT NOT NULL DEFAULT '{}',
+         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+         UNIQUE(name, kind)
+     );
+
+     INSERT INTO searchable_configs_new (id, name, kind, enabled, options, created_at)
+     SELECT id, name, kind, enabled, options, created_at FROM searchable_configs;
+
+     PRAGMA foreign_keys = OFF;
+     DROP TABLE searchable_configs;
+     ALTER TABLE searchable_configs_new RENAME TO searchable_configs;
+     PRAGMA foreign_keys = ON;
+     ```
 4. Leaves `searchable_values` untouched for now (rollback path).
 
 Once the redesign is stable, a follow-up migration drops `searchable_values` and any unused indexes.
@@ -281,6 +298,10 @@ Repurpose `searchable_configs` to represent **sources** rather than abstract Sea
 - `options`: model-specific JSON (threshold, prompt, etc.).
 
 A source can have multiple rows if it produces multiple Searchable kinds. The unique constraint is on `(name, kind)` rather than `name` alone.
+
+`enabled` semantics for this milestone:
+- A disabled source is hidden from the Media Processing UI and cannot be enqueued.
+- Search still considers all data in the side tables; per-source enable/disable for search is deferred.
 
 On startup:
 1. Parse `config.models`.
