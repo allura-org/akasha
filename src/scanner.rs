@@ -341,11 +341,11 @@ pub async fn scan_folder(
     // Enqueue background inference jobs for any non-text Searchables.
     enqueue_search_jobs(pool, &upserted_media_ids).await?;
 
-    // Delete orphans per visited folder (avoids deleting files in skipped complete subtrees)
+    // Mark missing files per visited folder (avoids touching files in skipped complete subtrees)
     for (folder_id, paths) in &folder_paths {
-        let deleted = crate::db::media::delete_orphans(pool, *folder_id, paths).await?;
-        if deleted > 0 {
-            info!("Deleted {} orphan records from folder {}", deleted, folder_id);
+        let marked = crate::db::media::mark_missing(pool, *folder_id, paths).await?;
+        if marked > 0 {
+            info!("Marked {} missing records in folder {}", marked, folder_id);
         }
     }
 
@@ -381,8 +381,8 @@ async fn flush_batch(
     for item in batch.iter() {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO media_files
-             (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             (folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, modified_at, is_present, missing_since)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, NULL)
              ON CONFLICT(folder_id, relative_path) DO UPDATE SET
                  absolute_path = excluded.absolute_path,
                  blake3_hash = excluded.blake3_hash,
@@ -390,7 +390,9 @@ async fn flush_batch(
                  height = excluded.height,
                  format = excluded.format,
                  file_size = excluded.file_size,
-                 modified_at = excluded.modified_at
+                 modified_at = excluded.modified_at,
+                 is_present = 1,
+                 missing_since = NULL
              RETURNING id"
         )
         .bind(item.folder_id)

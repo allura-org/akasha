@@ -389,7 +389,7 @@ impl AkashaApp {
 
         self.rt.spawn(async move {
             let mut upserted = 0usize;
-            let mut removed = 0usize;
+            let mut marked_missing = 0usize;
             let mut affected_folder_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
             for change in changes {
@@ -417,19 +417,19 @@ impl AkashaApp {
                         }
                     }
                     WatcherChangeKind::Remove => {
-                        match db::media::delete_by_path(&pool, folder_id, &relative_path).await {
+                        match db::media::mark_missing_by_path(&pool, folder_id, &relative_path).await {
                             Ok(n) => {
-                                removed += n as usize;
+                                marked_missing += n as usize;
                                 affected_folder_ids.insert(folder_id);
                             }
-                            Err(e) => tracing::warn!("Watcher delete failed for {}: {e}", change.absolute_path.display()),
+                            Err(e) => tracing::warn!("Watcher mark-missing failed for {}: {e}", change.absolute_path.display()),
                         }
                     }
                 }
             }
 
-            if upserted > 0 || removed > 0 {
-                tracing::info!("Watcher processed {upserted} upserts and {removed} deletes");
+            if upserted > 0 || marked_missing > 0 {
+                tracing::info!("Watcher processed {upserted} upserts and {marked_missing} mark-missing events");
 
                 // If the currently selected folder was affected, refresh its media list.
                 if let Some(selected) = selected_folder_id {
@@ -662,6 +662,11 @@ impl AkashaApp {
     fn load_viewer_image(&mut self) {
         if let Some(idx) = self.viewer_index {
             if let Some(media) = self.browser.media_summaries.get(idx) {
+                if !media.is_present {
+                    self.viewer_texture = None;
+                    self.pending_viewer_images.clear();
+                    return;
+                }
                 let hash = media.blake3_hash.clone();
                 if self.pending_viewer_images.contains(&hash) {
                     return;
@@ -951,6 +956,24 @@ impl eframe::App for AkashaApp {
         if actions.settings_toggled {
             self.browser.settings_open = !self.browser.settings_open;
         }
+        if actions.clear_missing_requested {
+            let pool = Arc::clone(&self.pool);
+            let media_tx = self.media_tx.clone();
+            let epoch = self.browser.media_epoch;
+            let selected_folder_id = self.browser.selected_folder_id;
+            self.rt.spawn(async move {
+                match db::media::delete_missing(&pool).await {
+                    Ok(n) => {
+                        tracing::info!("Cleared {} missing records", n);
+                        if let Some(folder_id) = selected_folder_id {
+                            let result = db::media::list_summaries_by_folder(&pool, folder_id).await;
+                            let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to clear missing records: {e}"),
+                }
+            });
+        }
         if let Some(path) = actions.show_in_file_manager {
             if let Err(e) = crate::ui::context_menu::open_containing_folder(&path) {
                 self.push_toast(format!("Failed to open folder: {e}"), ToastLevel::Error);
@@ -985,6 +1008,7 @@ impl eframe::App for AkashaApp {
                         &media,
                         &self.viewer_texture,
                         self.viewer_scale_mode,
+                        !media.is_present,
                     );
                     if resp.close && !self.viewer_just_opened {
                         self.close_viewer();
