@@ -767,12 +767,34 @@ impl AkashaApp {
     fn enqueue_media_processing_jobs(&self, action: crate::ui::media_processing::MediaProcessingAction) {
         use crate::ui::media_processing::MediaProcessingTarget;
 
+        let job_kind = match action.output_kind.as_str() {
+            "tags" => "tagger",
+            "description" => "visionlanguage",
+            "classification" => "classifier",
+            _ => {
+                tracing::warn!("Unknown media processing output kind: {}", action.output_kind);
+                return;
+            }
+        };
+
         let pool = Arc::clone(&self.pool);
         let media_tx = self.media_tx.clone();
         let epoch = self.browser.media_epoch;
         let selected_folder_id = self.browser.selected_folder_id;
 
         self.rt.spawn(async move {
+            let config = match db::searchable::get_config_by_name_kind(&pool, &action.source_name, &action.output_kind).await {
+                Ok(Some(cfg)) => cfg,
+                Ok(None) => {
+                    tracing::warn!("No searchable config found for {} / {}", action.source_name, action.output_kind);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to look up searchable config: {e}");
+                    return;
+                }
+            };
+
             let media_ids: Vec<i64> = match action.target {
                 MediaProcessingTarget::Single(id) => vec![id],
                 MediaProcessingTarget::Folder(folder_id, recursive) => {
@@ -794,13 +816,13 @@ impl AkashaApp {
             let params = serde_json::json!({ "model_name": action.model_name }).to_string();
             let mut enqueued = 0usize;
             for media_id in media_ids {
-                match db::searchable::enqueue_job(&pool, media_id, &action.job_kind, &params, None).await {
+                match db::searchable::enqueue_job(&pool, media_id, job_kind, &params, Some(config.id)).await {
                     Ok(_) => enqueued += 1,
                     Err(e) => tracing::warn!("Failed to enqueue job for media {}: {e}", media_id),
                 }
             }
 
-            tracing::info!("Enqueued {} {} jobs for model {}", enqueued, action.job_kind, action.model_name);
+            tracing::info!("Enqueued {} {} jobs for model {}", enqueued, job_kind, action.model_name);
 
             // Refresh the current folder view so any status changes are visible.
             if let Some(folder_id) = selected_folder_id {

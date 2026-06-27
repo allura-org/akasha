@@ -26,7 +26,8 @@ impl MediaProcessingTarget {
 #[derive(Debug, Clone)]
 pub struct MediaProcessingAction {
     pub target: MediaProcessingTarget,
-    pub job_kind: String,
+    pub source_name: String,
+    pub output_kind: String,
     pub model_name: String,
 }
 
@@ -46,11 +47,11 @@ impl AiSubTab {
         }
     }
 
-    fn job_kind(&self) -> &'static str {
+    fn output_kind(&self) -> &'static str {
         match self {
-            AiSubTab::VisionLanguage => "visionlanguage",
-            AiSubTab::Tagger => "tagger",
-            AiSubTab::Classifier => "classifier",
+            AiSubTab::VisionLanguage => "description",
+            AiSubTab::Tagger => "tags",
+            AiSubTab::Classifier => "classification",
         }
     }
 
@@ -131,7 +132,7 @@ pub fn show(
                 ));
             } else {
                 ui.label("Model:");
-                let selected_key = format!("media_processing_model_{}", sub_tab.job_kind());
+                let selected_key = format!("media_processing_model_{}", sub_tab.output_kind());
                 let mut selected: usize = ctx.memory_mut(|mem| {
                     mem.data
                         .get_persisted(egui::Id::new(&selected_key))
@@ -143,9 +144,12 @@ pub fn show(
                     .selected_text(&models[selected].name)
                     .show_ui(ui, |ui| {
                         for (i, model) in models.iter().enumerate() {
-                            if ui.selectable_label(selected == i, &model.name).clicked() {
-                                selected = i;
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(selected == i, &model.name).clicked() {
+                                    selected = i;
+                                }
+                                ui.label(model.kind_label());
+                            });
                         }
                     });
 
@@ -154,10 +158,6 @@ pub fn show(
                 });
 
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label("Kind:");
-                    ui.label(models[selected].kind_label());
-                });
                 if let Some(path) = &models[selected].path {
                     ui.horizontal(|ui| {
                         ui.label("Path:");
@@ -177,13 +177,36 @@ pub fn show(
                     });
                 }
 
+                let any_local_configured = config
+                    .models
+                    .models
+                    .iter()
+                    .any(|m| m.kind == crate::config::ModelKind::Local);
+                if any_local_configured && !cfg!(feature = "candle") {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Local models are configured, but candle support was not compiled in. \
+                         Enable the 'candle' feature and rebuild to run them.",
+                    );
+                }
+
+                if models[selected].kind == crate::config::ModelKind::Local {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        "Local CPU inference can take days on very large collections and only runs while Akasha is open.",
+                    );
+                }
+
                 ui.add_space(16.0);
                 let can_go = target.is_some();
                 if ui.add_enabled(can_go, egui::Button::new("Go")).clicked() {
                     if let Some(target) = target {
                         action = Some(MediaProcessingAction {
                             target: target.clone(),
-                            job_kind: sub_tab.job_kind().to_string(),
+                            source_name: models[selected].name.clone(),
+                            output_kind: sub_tab.output_kind().to_string(),
                             model_name: models[selected].name.clone(),
                         });
                         close = true;

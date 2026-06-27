@@ -7,6 +7,7 @@ edition = "2024"
 default = ["simd-thumbnails"]
 hevc = ["dep:libheif-rs"]
 simd-thumbnails = ["dep:fast_image_resize", "dep:webp"]
+candle = []
 
 [dependencies]
 # UI
