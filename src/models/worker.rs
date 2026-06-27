@@ -1,8 +1,114 @@
 //! Background worker for candle inference jobs.
 
-use anyhow::Result;
+use std::path::Path;
+use std::sync::Arc;
 
-/// Placeholder worker entry point.
-pub async fn run_worker() -> Result<()> {
-    Ok(())
+use anyhow::{Context, Result};
+use candle_core::Device;
+use sqlx::SqlitePool;
+
+use super::{loader, CandleModel, ModelOutput};
+
+pub struct CandleWorker {
+    pool: Arc<SqlitePool>,
+    device: Device,
+    resident: Option<Box<dyn CandleModel>>,
+    resident_config_id: Option<i64>,
+}
+
+impl CandleWorker {
+    pub fn new(pool: Arc<SqlitePool>) -> Result<Self> {
+        Ok(Self {
+            pool,
+            device: Device::Cpu,
+            resident: None,
+            resident_config_id: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_resident(&mut self, model: Box<dyn CandleModel>, config_id: i64) {
+        self.resident = Some(model);
+        self.resident_config_id = Some(config_id);
+    }
+
+    pub async fn process_jobs(&mut self, jobs: &[crate::db::searchable::JobRow]) -> Result<()> {
+        for job in jobs {
+            if let Err(e) = self.process_one(job).await {
+                let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_one(&mut self, job: &crate::db::searchable::JobRow) -> Result<()> {
+        let cfg = crate::db::searchable::get_config_by_id(
+            &self.pool,
+            job.searchable_config_id.unwrap_or(0),
+        )
+        .await?
+        .context("missing searchable_config for job")?;
+
+        // Load/replace model if needed.
+        if self.resident_config_id != Some(cfg.id) {
+            self.resident = Some(load_model_for_config(&cfg, &self.device).await?);
+            self.resident_config_id = Some(cfg.id);
+        }
+
+        let model = self.resident.as_ref().unwrap();
+        let media = crate::db::media::get_by_id(&self.pool, job.media_file_id)
+            .await?
+            .context("missing media file")?;
+
+        let output = model.infer(Path::new(&media.absolute_path))?;
+
+        match output {
+            ModelOutput::Tags(tags) => {
+                crate::db::searchable::update_tags_json(
+                    &self.pool,
+                    job.media_file_id,
+                    &cfg.name,
+                    tags,
+                )
+                .await?;
+            }
+            ModelOutput::Description(text) => {
+                crate::db::searchable::update_description_json(
+                    &self.pool,
+                    job.media_file_id,
+                    &cfg.name,
+                    &text,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+
+        crate::db::searchable::complete_job(&self.pool, job.id).await?;
+        Ok(())
+    }
+}
+
+async fn load_model_for_config(
+    cfg: &crate::db::searchable::SearchableConfig,
+    device: &Device,
+) -> Result<Box<dyn CandleModel>> {
+    let options_value = cfg.options.clone();
+    let path = options_value
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&cfg.name);
+    let source = loader::resolve_source(path)?;
+    let files = loader::load_model_files(&source)?;
+
+    match cfg.kind.as_str() {
+        "tags" => {
+            let options: crate::config::ModelTagsOptions =
+                serde_json::from_value(options_value).unwrap_or_default();
+            let tagger =
+                super::tagger::WdViTTagger::load(&cfg.name, &files, device.clone(), options.threshold)?;
+            Ok(Box::new(tagger))
+        }
+        other => anyhow::bail!("unsupported model kind: {other}"),
+    }
 }

@@ -33,6 +33,20 @@ impl SearchWorker {
         }
     }
 
+    #[cfg(feature = "candle")]
+    async fn tick(&self) -> anyhow::Result<usize> {
+        let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
+        let count = jobs.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let mut candle = crate::models::worker::CandleWorker::new(Arc::clone(&self.pool))?;
+        candle.process_jobs(&jobs).await?;
+        Ok(count)
+    }
+
+    #[cfg(not(feature = "candle"))]
     async fn tick(&self) -> anyhow::Result<usize> {
         let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
         let count = jobs.len();
@@ -56,6 +70,7 @@ impl SearchWorker {
         Ok(count)
     }
 
+    #[cfg(not(feature = "candle"))]
     async fn process_ai_job(&self, job: &crate::db::searchable::JobRow) -> anyhow::Result<()> {
         let model_name: String = job
             .params_json

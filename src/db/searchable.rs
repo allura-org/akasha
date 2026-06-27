@@ -101,6 +101,18 @@ pub async fn get_config_by_name_kind(
     Ok(row)
 }
 
+/// Fetch a Searchable configuration by its database id.
+pub async fn get_config_by_id(pool: &SqlitePool, id: i64) -> Result<Option<SearchableConfig>> {
+    let row = sqlx::query_as::<_, SearchableConfig>(
+        "SELECT id, name, kind, enabled, options, created_at, updated_at FROM searchable_configs
+         WHERE id = ?1"
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Upsert a computed Searchable value for a media file.
 pub async fn upsert_value(
     pool: &SqlitePool,
