@@ -56,7 +56,7 @@ Shape:
 - `tags_json`: `{ "model-name": { "tag": confidence, ... } }`
 - `descriptions_json`: `{ "model-name": "caption text" }`
 - `classifications_json`: `{ "model-name": { label details } }` (shape TBD when first classifier is added)
-- `embeddings_json`: `{ "model-name": [float, ...] }` (storage/serialization only; search deferred)
+- `embeddings_json`: `{ "model-name": [float, ...] }` (storage/serialization only; search deferred). When vector search is implemented, store embeddings as base64/binary rather than JSON floats to reduce size.
 
 Add search-optimized side tables:
 
@@ -74,8 +74,7 @@ CREATE INDEX idx_searchable_tags_media ON searchable_tags(media_file_id);
 CREATE VIRTUAL TABLE searchable_text_fts USING fts5(
     media_file_id UNINDEXED,
     source UNINDEXED,
-    content,
-    content_rowid=media_file_id
+    content
 );
 ```
 
@@ -85,9 +84,17 @@ Classifications and vectors are intentionally deferred:
 
 ### Migration Strategy
 
-- New migration `migrations/015_searchable_columns.sql` adds the columns and side tables.
-- Existing `searchable_values` and `searchable_configs` are left untouched for now (rollback path).
-- Once the redesign is stable, a follow-up migration drops the old EAV table and any unused indexes.
+New migration `migrations/015_searchable_columns.sql`:
+
+1. Adds the four JSON columns to `media_files`.
+2. Creates `searchable_tags` and `searchable_text_fts`.
+3. Changes `searchable_configs` so a source can have multiple rows (one per output kind):
+   - Drop the old `name` unique constraint.
+   - Add `UNIQUE(name, kind)`.
+   - SQLite requires recreating the table to drop a unique constraint; the migration copies existing rows into a temporary table, drops the old table, and renames the temporary table.
+4. Leaves `searchable_values` untouched for now (rollback path).
+
+Once the redesign is stable, a follow-up migration drops `searchable_values` and any unused indexes.
 
 ### DB Layer Changes (`src/db/`)
 
@@ -113,18 +120,18 @@ Classifications and vectors are intentionally deferred:
 
 ### Module Layout
 
-Add a new module `src/inference/` (or `src/models/`) that is independent of the UI and the `Searchable` registry:
+Add a new module `src/models/` that is independent of the UI and the `Searchable` registry:
 
 ```
-src/inference/
-  mod.rs          — public API: `InferenceEngine`, `ModelHandle`
+src/models/
+  mod.rs          — public API: `ModelEngine`, `ModelHandle`
   loader.rs       — resolve model source (HF slug or local path), download/cache
   preprocess.rs   — image decoding, resize, normalize, tensorize
   tagger.rs       — concrete ViT-based tagger pipeline
   worker.rs       — `CandleWorker` that consumes `job_queue` rows and runs inference
 ```
 
-`src/searchables/worker.rs` keeps polling the queue but delegates AI jobs to `src/inference/worker.rs` when the `candle` feature is enabled.
+`src/searchables/worker.rs` keeps polling the queue but delegates AI jobs to `src/models/worker.rs` when the `candle` feature is enabled.
 
 ### Cargo Feature
 
@@ -183,7 +190,7 @@ If `wd-vit-tagger-v3` turns out to need a custom head not present in candle-tran
 
 ### Model Loading & Caching
 
-`src/inference/loader.rs` resolves `ModelSource::HfSlug("SmilingWolf/wd-vit-tagger-v3")` or `ModelSource::LocalPath("/path/to/model")`:
+`src/models/loader.rs` resolves `ModelSource::HfSlug("SmilingWolf/wd-vit-tagger-v3")` or `ModelSource::LocalPath("/path/to/model")`:
 
 - For HF slugs, use the `hf-hub` crate. It respects the `HF_HOME` environment variable and uses the same cache layout as the Python `huggingface_hub` library (default `~/.cache/huggingface`). No separate Akasha cache is required.
 - For local paths, read files directly.
@@ -195,8 +202,8 @@ If `wd-vit-tagger-v3` turns out to need a custom head not present in candle-tran
 
 - Maintain one resident `Box<dyn CandleModel>` (or an `Option<ModelKind, Box<dyn CandleModel>>` map if we later allow multiple resident models).
 - On each claimed job:
-  1. Parse `params_json` for `source` and `output_kind`.
-  2. If the resident model does not match the job's source, load/replace it.
+  1. Join `searchable_config_id → searchable_configs` to get the source `name` and `kind`; parse `params_json` for model-specific options.
+  2. If the resident model does not match the source, load/replace it.
   3. Run `infer(absolute_path)`.
   4. Write the result via `db::searchable` helpers inside a transaction (JSON column + side table).
   5. Mark the job done.
@@ -273,13 +280,14 @@ Repurpose `searchable_configs` to represent **sources** rather than abstract Sea
 - `enabled`: whether the user has enabled this source.
 - `options`: model-specific JSON (threshold, prompt, etc.).
 
-A source can have multiple rows if it produces multiple Searchable kinds.
+A source can have multiple rows if it produces multiple Searchable kinds. The unique constraint is on `(name, kind)` rather than `name` alone.
 
 On startup:
 1. Parse `config.models`.
 2. For each model, inspect its populated option fields (`tags`, `description`, `classification`) to derive output kinds.
 3. For each output kind, upsert a row in `searchable_configs` keyed by `(name, kind)`.
 4. Disable any DB rows whose `(name, kind)` no longer appears in config.
+5. The worker uses `job_queue.searchable_config_id` to join back to `searchable_configs` and identify the source name and kind.
 
 ### Media Processing UI
 
@@ -290,22 +298,21 @@ Keep the existing `Tagger`/`Classifier`/`VisionLanguage` subtabs in `src/ui/medi
 - Show each model's name, `path`/`base_url`, and whether it is local or remote.
 - When the user clicks **Go**, enqueue jobs for the selected model and target.
 - Add a small "candle not compiled in" hint if the user configures local models but the `candle` feature is disabled.
+- Add a warning that local CPU inference on large collections is a long-running background task (potentially days for 420k images) and runs only while the app is open.
 
 ### Job Queue Row Shape
 
-Encode the model source and options in `params_json` (no schema change to `job_queue`):
+Use the existing `job_queue.searchable_config_id` column to identify the model source and output kind. Encode only model-specific options in `params_json`:
 
 ```json
 {
-  "source": "wd-vit-tagger-v3",
-  "output_kind": "tags",
   "threshold": 0.35
 }
 ```
 
-The worker parses `params_json` to determine which model to load. If it doesn't recognize the source, the job fails with a clear error.
+The worker joins `job_queue.searchable_config_id → searchable_configs.id` to get the source `name` and `kind`.
 
-For clustering, the claim query can order by `json_extract(params_json, '$.source')` so jobs for the same model are returned together.
+Duplicate pending jobs are deduplicated on `(media_file_id, searchable_config_id)`.
 
 ---
 
@@ -323,20 +330,19 @@ For clustering, the claim query can order by `json_extract(params_json, '$.sourc
 
 1. User opens Media Processing, picks a subtab (Tagger/Classifier/VisionLanguage), selects a model, and picks a target (single file or folder).
 2. `app.rs` expands folder targets into a list of present media file IDs.
-3. For each media file, call `db::searchable::enqueue_job(media_id, job_kind, params_json, config_id)`.
-4. `params_json` contains `source`, `output_kind`, and model-specific options (threshold, prompt, etc.).
-5. Duplicate pending jobs for the same `(media_id, source)` are skipped.
+3. For each media file, call `db::searchable::enqueue_job(media_id, job_kind, params_json, config_id)` where `config_id` is the `searchable_configs.id` for the model's output kind.
+4. `params_json` contains only model-specific options (threshold, prompt, etc.).
+5. Duplicate pending jobs for the same `(media_id, searchable_config_id)` are skipped.
 
 ### Job Processing
 
-1. `SearchWorker::tick()` claims a batch of pending jobs that reference present files.
+1. `SearchWorker::tick()` claims a batch of pending jobs that reference present files, ordering by `searchable_config_id, created_at`.
 2. The worker **clusters jobs by model** to minimize model load/unload:
-   - If a model is already resident, claim pending jobs for that `source` first.
-   - If no resident model exists or no pending jobs match it, claim jobs for the most-represented pending `source`.
-   - The claim query orders pending jobs by `source` and creation time, then the worker reorders the claimed batch so same-source jobs are contiguous and the currently resident source is at the front.
+   - After claiming the batch, reorder it in Rust so jobs with the same `searchable_config_id` are contiguous.
+   - If a model is already resident, move any jobs for that `searchable_config_id` to the front of the batch.
 3. For each job:
-   - Parse `params_json`.
-   - If the resident `CandleModel`'s name does not match `source`, drop the old model and load the new one from cache/disk.
+   - Join `searchable_config_id → searchable_configs` to get the source `name` and `kind`.
+   - If the resident `CandleModel`'s name does not match the source, drop the old model and load the new one from cache/disk.
    - Run `infer(absolute_path)`.
    - On success, write the result:
      - `ModelOutput::Tags` → `update_tags_json(media_id, source, tags)` (updates `tags_json` + `searchable_tags`).
@@ -348,11 +354,11 @@ For clustering, the claim query can order by `json_extract(params_json, '$.sourc
 
 ### Search Flow
 
-1. User types a query and selects enabled Searchables.
-2. `SearchEngine::execute()` loads enabled source configs from `searchable_configs`.
+1. User types a query and selects enabled Searchables (e.g. `filename`, `tags`, `descriptions`).
+2. `SearchEngine::execute()` iterates over the fixed Searchable implementations (`FilenameSearchable`, `TagsSearchable`, `DescriptionSearchable`). Per-source enable/disable is out of scope for this milestone; if a source's data is in the side table it is searched.
 3. For each enabled Searchable:
-   - `TagsSearchable` queries `searchable_tags` for tag matches and sums scores per media file.
-   - `DescriptionSearchable` queries `searchable_text_fts` for token matches and sums scores.
+   - `TagsSearchable` queries `searchable_tags` for tag matches. Each matched tag contributes `1.0` to the media file's score for this Searchable.
+   - `DescriptionSearchable` queries `searchable_text_fts` using `MATCH` and uses `bm25(searchable_text_fts)` as the score contribution.
    - `FilenameSearchable` queries `media_files.relative_path` as today.
 4. Scores are aggregated per media file ID.
 5. Matching IDs are hydrated into `MediaSummary` rows scoped to the current folder.
@@ -417,14 +423,15 @@ For clustering, the claim query can order by `json_extract(params_json, '$.sourc
   - Deleting a media file cascades to side tables.
   - Upserting a config disables stale sources.
 - `searchables::TagsSearchable` and `DescriptionSearchable` return correct scores.
-- `inference::loader` resolves HF slug vs local path and returns the expected file paths.
-- `inference::preprocess` produces tensors of the expected shape and dtype for a given input image.
+- `models::loader` resolves HF slug vs local path and returns the expected file paths.
+- `models::preprocess` produces tensors of the expected shape and dtype for a given input image.
 
 ### Integration Tests
 
+- Use a test-only stub `CandleModel` that returns deterministic fake tags so `cargo test` does not download real weights.
 - Enqueue a tagger job in `job_queue`, run `SearchWorker`/`CandleWorker` end-to-end, and verify:
   - Job status becomes `done`.
-  - `tags_json` is populated.
+  - `tags_json` is populated with the stub output.
   - `searchable_tags` contains the expected rows.
   - Tag search returns the media file.
 
