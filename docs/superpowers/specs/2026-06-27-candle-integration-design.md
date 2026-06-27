@@ -214,21 +214,31 @@ If `wd-vit-tagger-v3` turns out to need a custom head not present in candle-tran
 
 ### Config Format
 
-Keep the existing `[[models.tagger]]`, `[[models.classifier]]`, `[[models.visionlanguage]]` shape for this milestone to avoid config migration risk. Extend each entry with model-specific parameter tables:
+Use a single unified `[[models]]` list. The output kinds a model produces are implied by which parameter subtables it has (`[models.tags]`, `[models.description]`, `[models.classification]`):
 
 ```toml
-[[models.tagger]]
+[[models]]
 name = "wd-vit-tagger-v3"
 type = "local"
-source = "SmilingWolf/wd-vit-tagger-v3"
+path = "SmilingWolf/wd-vit-tagger-v3"
 
-[models.tagger.tags]
+[models.tags]
 threshold = 0.35
+
+[[models]]
+name = "nsfw-classifier"
+type = "remote"
+base_url = "http://localhost:8000/v1"
+model_id = "nsfw-classifier"
+
+[models.classification]
+# classifier-specific params
 ```
 
-A unified `[[models]]` list (where each model declares its `output` kinds) is the long-term target and is deferred to a later milestone.
-
-For backwards compatibility, the old fields (`source`, `base_url`, `model_id`, `api_key`) continue to work; the new `[models.tagger.tags]`/`[models.classifier.classification]`/`[models.visionlanguage.description]` tables are optional.
+- `path` accepts either a Hugging Face model slug or an absolute/local directory path.
+- `type = "local"` means run via candle (when the feature is enabled).
+- `type = "remote"` means call an OpenAI-compatible endpoint using `base_url`, `model_id`, and optionally `api_key`.
+- A model can have multiple subtables if it can perform multiple tasks (e.g. a CLIP model might one day have both `[models.classification]` and `[models.vector]`).
 
 ### Model Registry in the DB
 
@@ -239,19 +249,54 @@ Repurpose `searchable_configs` to represent **sources** rather than abstract Sea
 - `enabled`: whether the user has enabled this source.
 - `options`: model-specific JSON (threshold, prompt, etc.).
 
-A source can have multiple rows if it produces multiple Searchable kinds (e.g. a CLIP model could produce both `vector` and `classification`).
+### Rust Config Struct
+
+Replace the existing `ModelsConfig` (with separate `tagger`, `classifier`, `visionlanguage` vectors) with a single `Vec<ModelConfig>`:
+
+```rust
+pub struct ModelsConfig {
+    pub models: Vec<ModelConfig>,
+}
+
+pub struct ModelConfig {
+    pub name: String,
+    pub kind: ModelKind, // Local | Remote
+    pub path: Option<String>, // HF slug or local directory for Local models
+    pub base_url: Option<String>, // for Remote models
+    pub model_id: Option<String>, // for Remote models
+    pub api_key: Option<String>, // for Remote models
+    pub tags: Option<ModelTagsOptions>,
+    pub description: Option<ModelDescriptionOptions>,
+    pub classification: Option<ModelClassificationOptions>,
+}
+```
+
+The presence of `tags`, `description`, or `classification` determines which output kinds the model produces and which Media Processing subtabs it appears in.
+
+### Model Registry in the DB
+
+Repurpose `searchable_configs` to represent **sources** rather than abstract Searchable types:
+
+- `name`: model name from config (e.g. `wd-vit-tagger-v3`).
+- `kind`: the Searchable kind this source produces (`tags`, `description`, `classification`, `vector`).
+- `enabled`: whether the user has enabled this source.
+- `options`: model-specific JSON (threshold, prompt, etc.).
+
+A source can have multiple rows if it produces multiple Searchable kinds.
 
 On startup:
 1. Parse `config.models`.
-2. For each `(model, output_kind)`, upsert a row in `searchable_configs`.
-3. Disable any DB rows whose source no longer appears in config.
+2. For each model, inspect its populated option fields (`tags`, `description`, `classification`) to derive output kinds.
+3. For each output kind, upsert a row in `searchable_configs` keyed by `(name, kind)`.
+4. Disable any DB rows whose `(name, kind)` no longer appears in config.
 
 ### Media Processing UI
 
 Keep the existing `Tagger`/`Classifier`/`VisionLanguage` subtabs in `src/ui/media_processing.rs`; they are good separate surfaces for the three task types:
 
-- Each subtab lists only the models configured for that output kind (`config.models.tagger`, `config.models.classifier`, `config.models.visionlanguage`).
-- Show each model's name, source, and whether it is local or remote.
+- Each subtab lists only the models that have the matching parameter subtable (`[models.tags]`, `[models.classification]`, `[models.description]`).
+- A model with multiple subtables appears in every matching subtab.
+- Show each model's name, `path`/`base_url`, and whether it is local or remote.
 - When the user clicks **Go**, enqueue jobs for the selected model and target.
 - Add a small "candle not compiled in" hint if the user configures local models but the `candle` feature is disabled.
 
