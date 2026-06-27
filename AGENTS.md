@@ -109,8 +109,8 @@ src/
   theme.rs       — Custom flat egui theme
   db/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
-    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `update_flatten`
-    media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `delete_orphans`, `search_summaries`
+    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`
+    media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `mark_missing`, `mark_missing_by_path`, `mark_present_by_path`, `delete_missing`, `delete_by_path`, `search_summaries`
     searchable.rs — Searchable config/value CRUD and `job_queue` helpers
   ui/
     mod.rs       — Re-exports `browser`, `viewer`, `widgets`
@@ -150,9 +150,11 @@ Migrations live in `migrations/` and are embedded at compile time.
 - `id`, `folder_id` (FK, cascade delete)
 - `relative_path`, `absolute_path`
 - `blake3_hash`, `width`, `height`, `format`, `file_size`, `modified_at`
+- `is_present` (bool, DEFAULT 1) — `0` means the file was missing the last time the scanner/watcher checked; metadata is preserved
+- `missing_since` (datetime) — set to `CURRENT_TIMESTAMP` when `is_present` becomes `0`
 - `created_at`
 - Unique on `(folder_id, relative_path)`
-- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at), `idx_media_summary` (covering index for lightweight grid queries)
+- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at), `idx_media_summary` (covering index for lightweight grid queries), `idx_media_present` (folder_id, is_present)
 
 ### `searchable_configs`
 - `id`, `name` (unique), `kind` (`text` | `tags` | `vector` | `classification`)
@@ -180,6 +182,7 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Summary queries (`list_summaries_by_folder*`) stream rows incrementally via `sqlx::query_as().fetch()` rather than `.fetch_all()`, avoiding a massive allocation spike for large folders.
 - Search results are hydrated with `search_summaries()`, which uses `json_each()` to match a batch of media IDs.
 - The thumbnail cache uses a 2-level hash prefix (`aa/bb/{hash}_{size}.webp`) to avoid ext4/xfs metadata stress with hundreds of thousands of files.
+- Missing files: rows with `is_present = 0` are preserved in `media_files` so metadata (hashes, Searchable values, embeddings, etc.) survives temporary unavailability. Any bulk operation or background job that touches media rows must skip `is_present = 0` records (the thumbnail queue, viewer, and `claim_pending_jobs` already do this).
 - The bare-minimum Searchable is `filename` (kind `text`), seeded by migration `008_seed_filename_searchable.sql`.
 
 ---
@@ -285,7 +288,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
 - Cross-root file moves appear as a Remove + Create pair; no move deduplication.
-- `delete_orphans_for_root` in `db/media.rs` is no longer called (replaced by per-folder cleanup) and has a bug (only matches direct children, not all descendants).
+- Missing files (`is_present = 0`) are still shown in the grid and search results with a badge/placeholder; a dedicated hide-missing filter is not yet implemented.
 - **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.
 - **Thumbnail queue velocity tuning:** the scroll-velocity thresholds (60/240 rows/sec) are initial guesses and may need adjustment based on real-world feel.
 
