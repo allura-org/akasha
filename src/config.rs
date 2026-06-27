@@ -7,6 +7,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub thumbnails: ThumbnailsConfig,
     pub debug: DebugConfig,
+    pub models: ModelsConfig,
     #[serde(alias = "folders")]
     pub imports: Vec<ImportConfig>,
 }
@@ -105,6 +106,36 @@ pub struct DebugConfig {
     pub no_cache_read: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelsConfig {
+    pub tagger: Vec<ModelConfig>,
+    pub classifier: Vec<ModelConfig>,
+    pub visionlanguage: Vec<ModelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: ModelKind,
+    /// Local model: HuggingFace slug or on-disk directory.
+    pub source: Option<String>,
+    /// Remote OpenAI-compatible base URL.
+    pub base_url: Option<String>,
+    /// Remote model identifier.
+    pub model_id: Option<String>,
+    /// API key for remote models. Prefer env vars / keyring in production.
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    Local,
+    Remote,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImportConfig {
@@ -138,6 +169,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             thumbnails: ThumbnailsConfig::default(),
             debug: DebugConfig::default(),
+            models: ModelsConfig::default(),
             imports: Vec::new(),
         }
     }
@@ -232,5 +264,38 @@ impl Config {
         let dirs = directories::ProjectDirs::from("", "", "akasha")
             .ok_or_else(|| anyhow::anyhow!("Could not determine project directories"))?;
         Ok(dirs.data_dir().to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_models_config() {
+        let text = r#"
+[ui]
+theme = "dark"
+
+[[models.tagger]]
+name = "wd14"
+type = "local"
+source = "SmilingWolf/wd-v1-4-convnext-tagger-v2"
+
+[[models.classifier]]
+name = "nsfw"
+type = "remote"
+base_url = "http://localhost:8000/v1"
+model_id = "my-classifier"
+"#;
+
+        let config: Config = toml::from_str(text).unwrap();
+        assert_eq!(config.models.tagger.len(), 1);
+        assert_eq!(config.models.tagger[0].name, "wd14");
+        assert_eq!(config.models.tagger[0].kind, ModelKind::Local);
+        assert_eq!(config.models.tagger[0].source.as_deref(), Some("SmilingWolf/wd-v1-4-convnext-tagger-v2"));
+        assert_eq!(config.models.classifier.len(), 1);
+        assert_eq!(config.models.classifier[0].kind, ModelKind::Remote);
+        assert_eq!(config.models.classifier[0].base_url.as_deref(), Some("http://localhost:8000/v1"));
     }
 }

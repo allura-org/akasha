@@ -101,7 +101,7 @@ cargo test
 src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
-  config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ImportConfig`
+  config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ModelsConfig`, `ImportConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
   searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename` Searchable, background worker stub
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
@@ -111,10 +111,11 @@ src/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
     folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`
     media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `mark_missing`, `mark_missing_by_path`, `mark_present_by_path`, `delete_missing`, `delete_by_path`, `search_summaries`
-    searchable.rs — Searchable config/value CRUD and `job_queue` helpers
+    searchable.rs — Searchable config/value CRUD and generic `job_queue` helpers
   ui/
     mod.rs       — Re-exports `browser`, `viewer`, `widgets`
     browser.rs   — `BrowserPanel` placeholder (unused; browser UI is inline in `app.rs`)
+    media_processing.rs — Media Processing window: AI tabs/subtabs, model selection, manual job enqueueing
     viewer.rs    — Full-screen viewer overlay: zoom fit/1:1, prev/next, info ticker, keyboard shortcuts (Escape, ArrowLeft, ArrowRight)
     widgets.rs   — Shared UI helpers (currently a single placeholder fn)
 ```
@@ -169,7 +170,10 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Indexes: `idx_searchable_values_media`, `idx_searchable_values_config`
 
 ### `job_queue`
-- `id`, `media_file_id` (FK), `searchable_config_id` (FK)
+- `id`, `media_file_id` (FK → `media_files`)
+- `searchable_config_id` (FK → `searchable_configs`, nullable) — the Searchable slot the job will write into, if any
+- `job_kind` (e.g. `tagger`, `classifier`, `visionlanguage`, or future non-AI kinds)
+- `params_json` — job-specific JSON (e.g. `{"model_name":"wd14"}`)
 - `status` (`pending` | `running` | `done` | `failed`), `attempts`, `error`
 - `created_at`, `updated_at`
 - Index: `idx_job_queue_pending`
@@ -283,7 +287,8 @@ The full original plan (database evaluation, Searchables trait definition, exten
 ## Known Gaps / TODOs
 
 - `ui/widgets.rs` — only contains a placeholder label helper.
-- ONNX inference for tags/embeddings/classifications is not yet implemented; `job_queue` and `SearchWorker` are stubs that mark jobs done. Inference jobs are intended to be triggered manually from the UI, not automatically on scan/import.
+- Media Processing UI and generic `job_queue` scaffolding are in place, but real ONNX/remote inference is not yet implemented; the worker currently logs and marks jobs done.
+- Inference jobs must be triggered manually from the Media Processing window or context menus; they are not enqueued automatically on scan/import.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
 - Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
@@ -308,10 +313,11 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
 | `src/searchables/engine.rs` | Search orchestration and score aggregation |
 | `src/searchables/filename.rs` | Built-in filename Searchable |
-| `src/searchables/worker.rs` | Background `job_queue` worker stub |
+| `src/searchables/worker.rs` | Background `job_queue` worker; dispatches AI dummy jobs (real ONNX/remote inference deferred) |
 | `src/db/searchable.rs` | Searchable config/value and job queue queries |
 | `src/thumbnailer.rs` | Thumbnail generation and cache path resolution |
 | `src/ui/browser.rs` | Folder tree, thumbnail grid, and search bar |
+| `src/ui/media_processing.rs` | Media Processing window for manual AI job enqueueing |
 | `src/ui/viewer.rs` | Full-screen image viewer overlay |
 | `src/watcher.rs` | Filesystem watcher and event classification |
 | `generate_test_noise.py` | Helper script to create random noise PNGs for watcher testing |

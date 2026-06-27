@@ -96,18 +96,22 @@ pub async fn delete_values_for_config(pool: &SqlitePool, searchable_config_id: i
     Ok(rows)
 }
 
-/// Enqueue a background inference job for a media file / Searchable pair.
+/// Enqueue a background processing job for a media file.
 pub async fn enqueue_job(
     pool: &SqlitePool,
     media_file_id: i64,
-    searchable_config_id: i64,
+    job_kind: &str,
+    params_json: &str,
+    searchable_config_id: Option<i64>,
 ) -> Result<i64> {
-    // Avoid duplicate pending jobs.
+    // Avoid duplicate pending jobs for the same media/kind/params combination.
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM job_queue WHERE media_file_id = ?1 AND searchable_config_id = ?2 AND status = 'pending'"
+        "SELECT id FROM job_queue
+         WHERE media_file_id = ?1 AND job_kind = ?2 AND params_json = ?3 AND status = 'pending'"
     )
     .bind(media_file_id)
-    .bind(searchable_config_id)
+    .bind(job_kind)
+    .bind(params_json)
     .fetch_optional(pool)
     .await?;
 
@@ -116,10 +120,13 @@ pub async fn enqueue_job(
     }
 
     let id = sqlx::query(
-        "INSERT INTO job_queue (media_file_id, searchable_config_id, status, attempts) VALUES (?1, ?2, 'pending', 0)"
+        "INSERT INTO job_queue (media_file_id, searchable_config_id, job_kind, params_json, status, attempts)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0)"
     )
     .bind(media_file_id)
     .bind(searchable_config_id)
+    .bind(job_kind)
+    .bind(params_json)
     .execute(pool)
     .await?
     .last_insert_rowid();
@@ -141,12 +148,22 @@ pub async fn claim_pending_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<Job
              ORDER BY j.created_at
              LIMIT ?1
          )
-         RETURNING id, media_file_id, searchable_config_id, status, attempts, error, created_at, updated_at"
+         RETURNING id, media_file_id, searchable_config_id, job_kind, params_json, status, attempts, error, created_at, updated_at"
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// Count jobs that are either pending or running.
+pub async fn count_pending_jobs(pool: &SqlitePool) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM job_queue WHERE status IN ('pending', 'running')"
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
 }
 
 /// Mark a job as completed.
@@ -176,10 +193,65 @@ pub async fn fail_job(pool: &SqlitePool, job_id: i64, error: &str) -> Result<()>
 pub struct JobRow {
     pub id: i64,
     pub media_file_id: i64,
-    pub searchable_config_id: i64,
+    pub searchable_config_id: Option<i64>,
+    pub job_kind: String,
+    pub params_json: Option<String>,
     pub status: String,
     pub attempts: i64,
     pub error: Option<String>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn enqueue_and_claim_ai_job_round_trip() {
+        let pool = setup_pool().await;
+
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+
+        let media_id = crate::db::media::upsert(
+            &pool,
+            fid,
+            "foo.jpg",
+            "/tmp/root/foo.jpg",
+            "hash",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let params = r#"{"model_name":"wd14"}"#;
+        let job_id = enqueue_job(&pool, media_id, "tagger", params, None)
+            .await
+            .unwrap();
+
+        let pending = count_pending_jobs(&pool).await.unwrap();
+        assert_eq!(pending, 1);
+
+        let jobs = claim_pending_jobs(&pool, 10).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, job_id);
+        assert_eq!(jobs[0].media_file_id, media_id);
+        assert_eq!(jobs[0].job_kind, "tagger");
+        assert_eq!(jobs[0].params_json.as_deref(), Some(params));
+        assert!(jobs[0].searchable_config_id.is_none());
+    }
 }

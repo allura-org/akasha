@@ -54,6 +54,8 @@ pub struct AkashaApp {
     pub watcher_rx: std::sync::mpsc::Receiver<WatcherEvent>,
     pub watcher_handle: Option<WatcherHandle>,
 
+    pub jobs_count_rx: std::sync::mpsc::Receiver<usize>,
+
     pub media_refresh_in_flight: bool,
     pub last_refresh: std::time::Instant,
 
@@ -93,6 +95,28 @@ impl AkashaApp {
         let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
         let (search_names_tx, search_names_rx) = std::sync::mpsc::channel::<Result<Vec<String>, String>>();
+        let (jobs_count_tx, jobs_count_rx) = std::sync::mpsc::channel::<usize>();
+
+        // Background ticker: report pending/running job count every few seconds.
+        {
+            let pool_clone = Arc::clone(&pool_arc);
+            rt_arc.spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    interval.tick().await;
+                    match db::searchable::count_pending_jobs(&pool_clone).await {
+                        Ok(n) => {
+                            if jobs_count_tx.send(n as usize).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to count pending jobs: {e}");
+                        }
+                    }
+                }
+            });
+        }
 
         // On startup: scan any configured imports that are new or incomplete.
         // Unreachable imports are ignored and a toast is queued.
@@ -218,6 +242,7 @@ impl AkashaApp {
             viewer_image_rx: viewer_img_rx,
             watcher_rx: std::sync::mpsc::channel().1,
             watcher_handle: None,
+            jobs_count_rx,
             media_refresh_in_flight: false,
             last_refresh: std::time::Instant::now(),
             viewer_open: false,
@@ -728,6 +753,52 @@ impl AkashaApp {
         });
     }
 
+    fn enqueue_media_processing_jobs(&self, action: crate::ui::media_processing::MediaProcessingAction) {
+        use crate::ui::media_processing::MediaProcessingTarget;
+
+        let pool = Arc::clone(&self.pool);
+        let media_tx = self.media_tx.clone();
+        let epoch = self.browser.media_epoch;
+        let selected_folder_id = self.browser.selected_folder_id;
+
+        self.rt.spawn(async move {
+            let media_ids: Vec<i64> = match action.target {
+                MediaProcessingTarget::Single(id) => vec![id],
+                MediaProcessingTarget::Folder(folder_id, recursive) => {
+                    let result = if recursive {
+                        db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
+                    } else {
+                        db::media::list_summaries_by_folder(&pool, folder_id).await
+                    };
+                    match result {
+                        Ok(summaries) => summaries.into_iter().filter(|m| m.is_present).map(|m| m.id).collect(),
+                        Err(e) => {
+                            tracing::warn!("Failed to resolve media processing target: {e}");
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let params = serde_json::json!({ "model_name": action.model_name }).to_string();
+            let mut enqueued = 0usize;
+            for media_id in media_ids {
+                match db::searchable::enqueue_job(&pool, media_id, &action.job_kind, &params, None).await {
+                    Ok(_) => enqueued += 1,
+                    Err(e) => tracing::warn!("Failed to enqueue job for media {}: {e}", media_id),
+                }
+            }
+
+            tracing::info!("Enqueued {} {} jobs for model {}", enqueued, action.job_kind, action.model_name);
+
+            // Refresh the current folder view so any status changes are visible.
+            if let Some(folder_id) = selected_folder_id {
+                let _ = db::media::list_summaries_by_folder(&pool, folder_id).await
+                    .map(|result| media_tx.send((epoch, false, Ok(result))));
+            }
+        });
+    }
+
     fn prune_toasts(&mut self) {
         let now = std::time::Instant::now();
         self.toasts.retain(|t| now.duration_since(t.created_at).as_secs() < 5);
@@ -922,6 +993,9 @@ impl eframe::App for AkashaApp {
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
+        while let Ok(count) = self.jobs_count_rx.try_recv() {
+            self.browser.pending_jobs = count;
+        }
         self.browser.process_thumbnail_queue(&self.thumbnailer);
 
         if self.browser.is_scanning && self.last_refresh.elapsed() > std::time::Duration::from_secs(2) {
@@ -1037,6 +1111,10 @@ impl eframe::App for AkashaApp {
                             self.push_toast("Image copied to clipboard".to_string(), ToastLevel::Info);
                         }
                     }
+                    if resp.process_with_ai {
+                        self.browser.media_processing_open = true;
+                        self.browser.media_processing_target = Some(crate::ui::media_processing::MediaProcessingTarget::Single(media.id));
+                    }
                 } else {
                     self.close_viewer();
                 }
@@ -1085,6 +1163,19 @@ impl eframe::App for AkashaApp {
                 if let Err(e) = self.config.save() {
                     self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
                 }
+            }
+        }
+
+        if self.browser.media_processing_open {
+            if let Some(action) = crate::ui::media_processing::show(
+                ctx,
+                &mut self.browser.media_processing_open,
+                &self.config,
+                self.browser.media_processing_target.as_ref(),
+                self.browser.pending_jobs,
+            ) {
+                self.push_toast("Enqueuing media processing jobs…".to_string(), ToastLevel::Info);
+                self.enqueue_media_processing_jobs(action);
             }
         }
 
