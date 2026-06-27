@@ -9,7 +9,9 @@ pub enum ModelSource {
 pub struct ModelFiles {
     pub config_path: PathBuf,
     pub weights_path: PathBuf,
-    pub labels_path: PathBuf,
+    /// Optional per-model label list. Some models (e.g. standard HF ViT classifiers)
+    /// store labels in `config.json` instead of a separate file.
+    pub labels_path: Option<PathBuf>,
 }
 
 pub fn resolve_source(path: &str) -> Result<ModelSource> {
@@ -27,17 +29,19 @@ pub fn load_model_files(source: &ModelSource) -> Result<ModelFiles> {
         ModelSource::HfSlug(slug) => {
             let api = hf_hub::api::sync::Api::new()?;
             let repo = api.model(slug.clone());
+            let labels_path = repo.get("selected_tags.csv").ok();
             Ok(ModelFiles {
                 config_path: repo.get("config.json")?,
                 weights_path: repo.get("model.safetensors")?,
-                labels_path: repo.get("selected_tags.csv")?,
+                labels_path,
             })
         }
         ModelSource::LocalPath(dir) => {
+            let labels_path = dir.join("selected_tags.csv");
             Ok(ModelFiles {
                 config_path: dir.join("config.json"),
                 weights_path: dir.join("model.safetensors"),
-                labels_path: dir.join("selected_tags.csv"),
+                labels_path: labels_path.exists().then_some(labels_path),
             })
         }
     }
