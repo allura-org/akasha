@@ -55,6 +55,51 @@ pub async fn insert_config(
     Ok(id)
 }
 
+/// Insert or update a Searchable configuration, keyed by its (name, kind) pair.
+/// Returns the configuration's row id, regardless of whether it was inserted or
+/// updated.
+pub async fn upsert_config(
+    pool: &SqlitePool,
+    name: &str,
+    kind: &str,
+    enabled: bool,
+    options: serde_json::Value,
+) -> Result<i64> {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO searchable_configs (name, kind, enabled, options)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(name, kind) DO UPDATE SET
+             enabled = excluded.enabled,
+             options = excluded.options,
+             updated_at = CURRENT_TIMESTAMP
+         RETURNING id"
+    )
+    .bind(name)
+    .bind(kind)
+    .bind(enabled)
+    .bind(options)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Fetch a Searchable configuration by its (name, kind) pair.
+pub async fn get_config_by_name_kind(
+    pool: &SqlitePool,
+    name: &str,
+    kind: &str,
+) -> Result<Option<SearchableConfig>> {
+    let row = sqlx::query_as::<_, SearchableConfig>(
+        "SELECT id, name, kind, enabled, options, created_at FROM searchable_configs
+         WHERE name = ?1 AND kind = ?2"
+    )
+    .bind(name)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Upsert a computed Searchable value for a media file.
 pub async fn upsert_value(
     pool: &SqlitePool,
@@ -73,6 +118,106 @@ pub async fn upsert_value(
     .bind(value)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Update the `tags_json` column for a media file and mirror the tags into
+/// `searchable_tags`. Both writes happen in a single transaction.
+pub async fn update_tags_json(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    source: &str,
+    tags: std::collections::HashMap<String, f32>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    // Read existing tags_json, update the source entry.
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT tags_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let mut map: serde_json::Map<String, serde_json::Value> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    map.insert(source.to_string(), serde_json::to_value(&tags)?);
+
+    sqlx::query("UPDATE media_files SET tags_json = ?1 WHERE id = ?2")
+        .bind(serde_json::to_string(&map)?)
+        .bind(media_file_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Mirror into searchable_tags.
+    sqlx::query("DELETE FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2")
+        .bind(media_file_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
+    for (tag, score) in tags {
+        sqlx::query(
+            "INSERT INTO searchable_tags (media_file_id, source, tag, score)
+             VALUES (?1, ?2, ?3, ?4)"
+        )
+        .bind(media_file_id)
+        .bind(source)
+        .bind(tag)
+        .bind(score)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Update the `descriptions_json` column for a media file and mirror the
+/// description into the FTS5 side table. Both writes happen in a single
+/// transaction.
+pub async fn update_description_json(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    source: &str,
+    description: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT descriptions_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let mut map: serde_json::Map<String, serde_json::Value> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    map.insert(source.to_string(), serde_json::Value::String(description.to_string()));
+
+    sqlx::query("UPDATE media_files SET descriptions_json = ?1 WHERE id = ?2")
+        .bind(serde_json::to_string(&map)?)
+        .bind(media_file_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Mirror into FTS5. UPSERT is not supported on virtual tables, so use
+    // INSERT OR REPLACE (rowid is the FTS5 docid and matches media_file_id).
+    sqlx::query(
+        "INSERT OR REPLACE INTO searchable_text_fts (rowid, media_file_id, source, content)
+         VALUES (?1, ?1, ?2, ?3)"
+    )
+    .bind(media_file_id)
+    .bind(source)
+    .bind(description)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -253,5 +398,110 @@ mod tests {
         assert_eq!(jobs[0].job_kind, "tagger");
         assert_eq!(jobs[0].params_json.as_deref(), Some(params));
         assert!(jobs[0].searchable_config_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_config_round_trip() {
+        let pool = setup_pool().await;
+
+        let id1 = upsert_config(
+            &pool,
+            "filename",
+            "text",
+            true,
+            serde_json::json!({"boost": 1.0}),
+        )
+        .await
+        .unwrap();
+
+        let id2 = upsert_config(
+            &pool,
+            "filename",
+            "text",
+            false,
+            serde_json::json!({"boost": 2.0}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(id1, id2);
+
+        let cfg = get_config_by_name_kind(&pool, "filename", "text")
+            .await
+            .unwrap()
+            .expect("config should exist");
+        assert_eq!(cfg.id, id1);
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.options["boost"], 2.0);
+    }
+
+    #[tokio::test]
+    async fn update_tags_json_writes_column_and_side_table() {
+        let pool = setup_pool().await;
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+        let mid = crate::db::media::upsert(
+            &pool, fid, "a.jpg", "/tmp/a.jpg", "hash", None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("cat".to_string(), 0.9f32);
+        update_tags_json(&pool, mid, "wd-vit", tags).await.unwrap();
+
+        let row: (String,) = sqlx::query_as("SELECT tags_json FROM media_files WHERE id = ?1")
+            .bind(mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.0.contains("cat"));
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM searchable_tags WHERE media_file_id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1);
+    }
+
+    #[tokio::test]
+    async fn update_description_json_writes_column_and_fts() {
+        let pool = setup_pool().await;
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+        let mid = crate::db::media::upsert(
+            &pool, fid, "b.jpg", "/tmp/b.jpg", "hash", None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        update_description_json(&pool, mid, "blip", "a cat on a mat")
+            .await
+            .unwrap();
+
+        let row: (String,) =
+            sqlx::query_as("SELECT descriptions_json FROM media_files WHERE id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0.contains("cat"));
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM searchable_text_fts WHERE media_file_id = ?1"
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1);
     }
 }
