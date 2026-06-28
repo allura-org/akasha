@@ -80,10 +80,10 @@ cache_fallback = "disable"
 # searchable output channels by including the relevant subtable(s):
 #   [models.tags], [models.description], [models.classification]
 #
-# Local models require akasha to be built with the `candle` feature:
-#   cargo build --features candle
-# They are downloaded on first use via `hf-hub` into the standard Hugging Face cache
-# (`$HF_HOME`, default `~/.cache/huggingface`).
+# Local models can use either the Candle backend (built with the `candle` feature) or
+# the ONNX backend (built with the `onnx` feature, enabled by default). Both are
+# downloaded on first use via `hf-hub`; ONNX models are stored under
+# `~/.local/share/akasha/models/onnx/<slug-with-dashes>/`.
 
 # Example: a standard Hugging Face ViT image-classification model used as a tagger.
 # Note: SmilingWolf/wd-vit-tagger-v3 uses a timm-style config and is not directly
@@ -95,6 +95,24 @@ cache_fallback = "disable"
 #
 # [models.tags]
 # threshold = 0.35
+
+# Example: an ONNX tagger. The model files are downloaded from HuggingFace on first use
+# and cached under `~/.local/share/akasha/models/onnx/SmilingWolf-wd-vit-tagger-v3/`.
+# `path` can also be an absolute path to a local model directory.
+# [[models]]
+# name = "wd-vit-tagger-v3"
+# type = "local"
+# backend = "onnx"
+# path = "SmilingWolf/wd-vit-tagger-v3"
+#
+# [models.tags]
+# threshold = 0.35
+#
+# [models.onnx]
+# # Optional explicit overrides; leave commented to auto-detect.
+# # model_file = "model.onnx"
+# # tags_file = "selected_tags.csv"
+# # config_file = "config.json"
 
 # Example: a remote vision-language or classification endpoint.
 # [[models]]
