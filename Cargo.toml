@@ -9,7 +9,7 @@ hevc = ["dep:libheif-rs"]
 simd-thumbnails = ["dep:fast_image_resize", "dep:webp"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub"]
 remote = ["dep:reqwest", "dep:base64"]
-onnx = ["dep:ort", "dep:ndarray", "dep:csv"]
+onnx = ["dep:ort", "dep:ndarray", "dep:csv", "dep:hf-hub"]
 cuda = ["candle", "candle-core/cuda"]
 
 [dependencies]

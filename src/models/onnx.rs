@@ -95,7 +95,7 @@ impl Default for Preprocessing {
 impl OrtModel {
     fn load(config: &ModelConfig) -> Result<Self> {
         let path = config.path.as_deref().context("onnx model missing path")?;
-        let dir = resolve_model_dir(path)?;
+        let dir = ensure_model_dir(path)?;
         tracing::info!(dir = %dir.display(), "Loading ONNX model");
 
         let onnx_opts = config.onnx.clone().unwrap_or_default();
@@ -232,6 +232,95 @@ impl Model for OrtModel {
 ///
 /// If `path` is already absolute, use it directly. Otherwise, treat it as a
 /// slug under `~/.local/share/akasha/models/onnx/`.
+/// Ensure a model directory exists, downloading from HuggingFace if necessary.
+///
+/// If `path` is already absolute, return it directly. Otherwise, treat it as a
+/// HuggingFace model slug, resolve the target directory under
+/// `~/.local/share/akasha/models/onnx/<slug-with-dashes>/`, and download any
+/// missing model files from the Hub.
+fn ensure_model_dir(path: &str) -> Result<PathBuf> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+
+    let slug = path.replace('/', "-");
+    let data_dir = crate::config::Config::data_dir()?;
+    let target_dir = data_dir.join(ONNX_MODELS_DIR).join(&slug);
+
+    // If a model file already exists locally, don't re-download.
+    if find_model_file(&target_dir, None).is_ok() {
+        return Ok(target_dir);
+    }
+
+    // Without a slash, this isn't a HuggingFace slug; just return the empty dir
+    // and let the caller fail cleanly if nothing is there.
+    if !path.contains('/') {
+        return Ok(target_dir);
+    }
+
+    tracing::info!(slug = path, dir = %target_dir.display(), "Downloading ONNX model from HuggingFace");
+
+    std::fs::create_dir_all(&target_dir)
+        .with_context(|| format!("failed to create model directory {}", target_dir.display()))?;
+
+    let api = hf_hub::api::sync::Api::new()?;
+    let repo = api.model(path.to_string());
+
+    let info = repo.info().with_context(|| format!("failed to fetch repo info for {path}"))?;
+
+    let wanted = [
+        ("model.onnx", "model.onnx"),
+        ("onnx/model.onnx", "model.onnx"),
+        ("vision_model.onnx", "vision_model.onnx"),
+        ("onnx/vision_model.onnx", "vision_model.onnx"),
+        ("text_model.onnx", "text_model.onnx"),
+        ("onnx/text_model.onnx", "text_model.onnx"),
+        ("config.json", "config.json"),
+        ("preprocess.json", "preprocess.json"),
+        ("preprocessor_config.json", "preprocessor_config.json"),
+        ("selected_tags.csv", "selected_tags.csv"),
+        ("categories.json", "categories.json"),
+        ("tags.json", "tags.json"),
+        ("labels.txt", "labels.txt"),
+    ];
+
+    let available: std::collections::HashSet<String> = info
+        .siblings
+        .into_iter()
+        .map(|s| s.rfilename)
+        .collect();
+
+    let mut downloaded_model = false;
+    for (remote, local) in &wanted {
+        if !available.contains(*remote) {
+            continue;
+        }
+        match repo.get(remote) {
+            Ok(src) => {
+                let dst = target_dir.join(local);
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    tracing::warn!(src = %src.display(), dst = %dst.display(), error = %e, "Failed to copy downloaded file");
+                } else {
+                    tracing::info!(file = remote, "Downloaded");
+                    if local.ends_with(".onnx") {
+                        downloaded_model = true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(file = remote, error = %e, "Failed to download file");
+            }
+        }
+    }
+
+    if !downloaded_model {
+        anyhow::bail!("no ONNX model file could be downloaded from {path}");
+    }
+
+    Ok(target_dir)
+}
+
 /// Inspect the session's input type to decide whether the model expects NHWC (channels-last)
 /// or NCHW (channels-first) image input. We assume a 4-D input where one of the dimensions is 3.
 fn infer_channels_last(dtype: &ort::value::ValueType) -> bool {
@@ -275,27 +364,33 @@ fn find_model_file(dir: &Path, explicit: Option<&str>) -> Result<PathBuf> {
         "model_optimized.onnx",
     ];
     for name in &candidates {
-        let path = dir.join(name);
-        if path.is_file() {
-            return Ok(path);
+        for base in [dir, &dir.join("onnx")] {
+            let path = base.join(name);
+            if path.is_file() {
+                return Ok(path);
+            }
         }
     }
 
-    // Fall back to any top-level `.onnx` file that isn't obviously a text/encoder variant.
+    // Fall back to any `.onnx` file that isn't obviously a quantized/external variant.
     let mut fallback: Option<PathBuf> = None;
-    for entry in std::fs::read_dir(dir).context("failed to read model directory")? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("onnx") {
-            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            // Avoid quantized/external variants as a default; explicit config can override.
-            if name.contains("quantized") || name.contains("external") || name.contains("_data") {
-                if fallback.is_none() {
-                    fallback = Some(path);
+    for base in [dir.to_path_buf(), dir.join("onnx")] {
+        if !base.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&base).context("failed to read model directory")? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("onnx") {
+                let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                if name.contains("quantized") || name.contains("external") || name.contains("_data") {
+                    if fallback.is_none() {
+                        fallback = Some(path);
+                    }
+                    continue;
                 }
-                continue;
+                return Ok(path);
             }
-            return Ok(path);
         }
     }
 
