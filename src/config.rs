@@ -117,6 +117,7 @@ pub struct ModelConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: ModelKind,
+    pub backend: Option<String>,
     pub path: Option<String>,
     pub base_url: Option<String>,
     pub model_id: Option<String>,

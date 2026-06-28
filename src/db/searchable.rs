@@ -589,6 +589,7 @@ mod tests {
         let model = ModelConfig {
             name: "test-model".into(),
             kind: ModelKind::Local,
+            backend: None,
             path: Some("/models/test".into()),
             base_url: None,
             model_id: Some("id1".into()),
@@ -622,6 +623,7 @@ mod tests {
         let model2 = ModelConfig {
             name: "test-model".into(),
             kind: ModelKind::Local,
+            backend: None,
             path: Some("/models/test".into()),
             base_url: None,
             model_id: Some("id1".into()),
@@ -668,6 +670,7 @@ mod tests {
         let model = ModelConfig {
             name: "test-model".into(),
             kind: ModelKind::Local,
+            backend: None,
             path: Some("/models/test".into()),
             base_url: None,
             model_id: Some("id1".into()),
