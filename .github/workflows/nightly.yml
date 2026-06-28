@@ -56,6 +56,8 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.cargo-features }}
 
       - name: Build (release)
         run: cargo build --release --no-default-features --features ${{ matrix.cargo-features }}
