@@ -229,6 +229,7 @@ impl AkashaApp {
         let sort_key = config.ui.sort_key;
         let sort_order = config.ui.sort_order;
         let browser_imports = config.imports.clone();
+        let remote_config = config.remote.clone();
         let mut app = Self {
             config,
             pool: pool_arc.clone(),
@@ -274,7 +275,7 @@ impl AkashaApp {
         // Start the background Searchables worker.
         let worker_pool = Arc::clone(&app.pool);
         app.rt.spawn(async move {
-            crate::searchables::SearchWorker::new(worker_pool).run().await;
+            crate::searchables::SearchWorker::new(worker_pool, remote_config).run().await;
         });
 
         // Start the filesystem watcher immediately. Events that arrive while a

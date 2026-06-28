@@ -45,7 +45,6 @@ fn labels_from_config(config: &serde_json::Value) -> Result<Vec<String>> {
 /// independently. It is *not* compatible with timm-style checkpoints such as
 /// `SmilingWolf/wd-vit-tagger-v3`.
 pub struct ViTTagger {
-    name: String,
     model: VitModel,
     labels: Vec<String>,
     device: Device,
@@ -55,7 +54,7 @@ pub struct ViTTagger {
 
 impl ViTTagger {
     pub fn load(
-        name: &str,
+        _name: &str,
         files: &loader::ModelFiles,
         device: Device,
         threshold: f32,
@@ -118,7 +117,6 @@ impl ViTTagger {
             .with_context(|| "failed to build ViT model")?;
 
         Ok(Self {
-            name: name.to_string(),
             model,
             labels,
             device,

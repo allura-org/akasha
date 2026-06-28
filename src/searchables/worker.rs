@@ -5,6 +5,7 @@ use anyhow::Context;
 use sqlx::SqlitePool;
 use tokio::time::interval;
 
+use crate::config::RemoteConfig;
 use crate::models::{BackendRegistry, Model};
 
 /// Background worker that polls the `job_queue` table and runs AI inference
@@ -23,11 +24,11 @@ struct ResidentModel {
 }
 
 impl SearchWorker {
-    pub fn new(pool: Arc<SqlitePool>) -> Self {
+    pub fn new(pool: Arc<SqlitePool>, remote: RemoteConfig) -> Self {
         Self {
             pool,
             batch_size: 4,
-            registry: BackendRegistry::default(),
+            registry: BackendRegistry::with_remote(remote),
             resident: None,
         }
     }
@@ -188,7 +189,7 @@ fn cluster_jobs(jobs: &mut [crate::db::searchable::JobRow], resident_config_id: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ModelConfig, ModelKind, ModelTagsOptions};
+    use crate::config::ModelConfig;
     use crate::models::{Backend, Model, ModelOutput};
     use std::collections::HashMap;
     use std::path::Path;

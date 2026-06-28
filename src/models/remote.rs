@@ -6,10 +6,18 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::Engine;
 
-use crate::config::{ModelConfig, ModelKind};
+use crate::config::{ModelConfig, ModelKind, RemoteConfig};
 use super::{Backend, Model, ModelOutput};
 
-pub struct RemoteBackend;
+pub struct RemoteBackend {
+    global: RemoteConfig,
+}
+
+impl RemoteBackend {
+    pub fn new(global: RemoteConfig) -> Self {
+        Self { global }
+    }
+}
 
 impl Backend for RemoteBackend {
     fn id(&self) -> &'static str { "remote" }
@@ -20,6 +28,10 @@ impl Backend for RemoteBackend {
     }
 
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
+        if config.tags.is_none() {
+            anyhow::bail!("remote backend only supports tags output kind right now");
+        }
+
         let base_url = config.base_url.as_deref().context("remote model missing base_url")?;
         let model_id = config.model_id.as_deref().context("remote model missing model_id")?;
         let client = reqwest::blocking::Client::builder()
@@ -27,12 +39,19 @@ impl Backend for RemoteBackend {
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .context("failed to build remote HTTP client")?;
+
+        let endpoints = config.remote.clone().unwrap_or_else(|| crate::config::ModelRemoteOptions {
+            chat_endpoint: self.global.chat_endpoint.clone(),
+            tag_endpoint: self.global.tag_endpoint.clone(),
+            classify_endpoint: self.global.classify_endpoint.clone(),
+        });
+
         Ok(Arc::new(RemoteModel {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             model_id: model_id.to_string(),
             api_key: config.api_key.clone(),
-            endpoints: config.remote.clone().unwrap_or_default(),
+            endpoints,
         }))
     }
 }
@@ -69,6 +88,8 @@ impl RemoteModel {
 
         let response: serde_json::Value = req.send()
             .context("remote tag request failed")?
+            .error_for_status()
+            .context("remote tag request returned error status")?
             .json()
             .context("failed to parse remote tag response")?;
 
@@ -93,7 +114,7 @@ mod tests {
 
     #[test]
     fn remote_backend_supports_base_url() {
-        let backend = RemoteBackend;
+        let backend = RemoteBackend::new(RemoteConfig::default());
         let cfg = ModelConfig {
             name: "remote".into(),
             kind: ModelKind::Remote,
@@ -145,7 +166,7 @@ mod tests {
             remote: Some(ModelRemoteOptions::default()),
         };
 
-        let output = RemoteBackend
+        let output = RemoteBackend::new(RemoteConfig::default())
             .load(&config)
             .expect("load")
             .infer(&temp_path)

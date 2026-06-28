@@ -85,5 +85,5 @@ candle-transformers = { version = "0.8", optional = true }
 hf-hub = { version = "0.4", optional = true }
 
 # Remote inference (opt-in)
-reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 base64 = { version = "0.22", optional = true }

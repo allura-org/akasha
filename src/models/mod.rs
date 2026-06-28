@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use anyhow::Result;
-use crate::config::ModelConfig;
+use crate::config::{ModelConfig, RemoteConfig};
 
 pub mod loader;
 #[cfg(feature = "candle")]
@@ -15,14 +15,6 @@ pub mod candle;
 pub mod stub;
 #[cfg(feature = "remote")]
 pub mod remote;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelOutputKind {
-    Tags,
-    Description,
-    Classification,
-    Vector,
-}
 
 #[derive(Debug, Clone)]
 pub enum ModelOutput {
@@ -57,11 +49,15 @@ impl BackendRegistry {
     }
 
     pub fn default() -> Self {
+        Self::with_remote(RemoteConfig::default())
+    }
+
+    pub fn with_remote(remote: RemoteConfig) -> Self {
         let mut reg = Self::empty();
         #[cfg(feature = "candle")]
         reg.register(candle::CandleBackend);
         #[cfg(feature = "remote")]
-        reg.register(remote::RemoteBackend);
+        reg.register(remote::RemoteBackend::new(remote));
         reg
     }
 
@@ -83,8 +79,6 @@ impl BackendRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::path::Path;
     use crate::config::{ModelConfig, ModelKind};
 
     struct AlwaysBackend;

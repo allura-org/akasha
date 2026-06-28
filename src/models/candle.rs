@@ -29,6 +29,17 @@ impl Backend for CandleBackend {
         let source = loader::resolve_source(path)?;
         let files = loader::load_model_files(&source)
             .with_context(|| format!("failed to load model files for {}", config.name))?;
+        #[cfg(feature = "cuda")]
+        let device = {
+            match Device::new_cuda(0) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("CUDA device unavailable, falling back to CPU: {e}");
+                    Device::Cpu
+                }
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
         let device = Device::Cpu;
 
         match config.tags.as_ref() {

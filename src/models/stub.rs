@@ -2,13 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use anyhow::Result;
 
-pub struct StubTagger {
-    name: String,
-}
-
-impl StubTagger {
-    pub fn new(name: &str) -> Self { Self { name: name.to_string() } }
-}
+pub struct StubTagger;
 
 impl super::Model for StubTagger {
     fn infer(&self, _image_path: &Path) -> Result<super::ModelOutput> {
