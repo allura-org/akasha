@@ -20,14 +20,19 @@ jobs:
       matrix:
         include:
           # Standard build: older glibc for max compatibility.
+          # ONNX is kept out of release binaries for now because packaging
+          # ONNX Runtime (glibc requirements + static/dynamic linking) is a
+          # time sink; local `cargo run` still gets it via default features.
           - os: ubuntu-22.04
             feature-flag: ""
             suffix: ""
+            cargo-features: "simd-thumbnails,remote,candle"
           # HEVC build: needs libheif >= 1.17, which Ubuntu 24.04 provides.
           # Slightly newer glibc, but HEVC users likely run modern distros anyway.
           - os: ubuntu-24.04
             feature-flag: "hevc"
             suffix: "-hevc"
+            cargo-features: "simd-thumbnails,remote,candle,hevc"
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -44,37 +49,7 @@ jobs:
             libxcb-xfixes0-dev \
             libegl1-mesa-dev \
             libheif-dev \
-            libde265-dev \
-            cmake \
-            build-essential \
-            python3-dev
-
-      - name: Restore ONNX Runtime build cache
-        id: cache-ort
-        uses: actions/cache@v4
-        with:
-          path: /opt/onnxruntime-static
-          key: onnxruntime-static-1.24.2-${{ matrix.os }}-${{ runner.arch }}
-
-      - name: Build ONNX Runtime from source
-        if: steps.cache-ort.outputs.cache-hit != 'true'
-        run: |
-          ORT_VERSION=1.24.2
-          git clone --recursive --depth 1 --branch "v${ORT_VERSION}" https://github.com/microsoft/onnxruntime.git /tmp/onnxruntime
-          cd /tmp/onnxruntime
-          ./build.sh \
-            --config Release \
-            --parallel \
-            --compile_no_warning_as_error \
-            --skip_tests \
-            --disable_rtti \
-            --cmake_extra_defines CMAKE_CXX_STANDARD=17
-          sudo mkdir -p /opt/onnxruntime-static/lib /opt/onnxruntime-static/include
-          sudo cp "build/Linux/Release/libonnxruntime.a" /opt/onnxruntime-static/lib/
-          sudo cp -r include/* /opt/onnxruntime-static/include/
-
-      - name: Expose ONNX Runtime to ort
-        run: echo "ORT_LIB_PATH=/opt/onnxruntime-static" >> "$GITHUB_ENV"
+            libde265-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -83,19 +58,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build (release)
-        run: |
-          if [ -n "${{ matrix.feature-flag }}" ]; then
-            cargo build --release --features ${{ matrix.feature-flag }}
-          else
-            cargo build --release
-          fi
+        run: cargo build --release --no-default-features --features ${{ matrix.cargo-features }}
 
-      - name: Upload binary
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/akasha dist/akasha${{ matrix.suffix }}
+          cd dist
+          tar -czf akasha${{ matrix.suffix }}-linux-x86_64.tar.gz akasha${{ matrix.suffix }}
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: akasha${{ matrix.suffix }}
-          path: target/release/akasha
-          if-no-files-found: error
+          name: akasha${{ matrix.suffix }}-linux-x86_64
+          path: dist/akasha${{ matrix.suffix }}-linux-x86_64.tar.gz
 
   # Only publish a GitHub release once all builds finish successfully.
   publish:
@@ -114,11 +90,6 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Rename artifacts
-        run: |
-          mv artifacts/akasha artifacts/akasha-linux-x86_64
-          mv artifacts/akasha-hevc artifacts/akasha-hevc-linux-x86_64
-
       - name: Move the nightly tag
         run: |
           git config user.name "github-actions[bot]"
@@ -135,6 +106,6 @@ jobs:
             Automated nightly build from the latest `dev` branch.
             - Built on: ${{ github.sha }}
           prerelease: true
-          files: artifacts/akasha*-linux-x86_64
+          files: artifacts/*.tar.gz
           # Overwrite existing assets on the release rather than erroring.
           fail_on_unmatched_files: false
