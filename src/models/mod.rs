@@ -48,10 +48,6 @@ impl BackendRegistry {
         self.backends.push(Arc::new(backend));
     }
 
-    pub fn default() -> Self {
-        Self::with_remote(RemoteConfig::default())
-    }
-
     pub fn with_remote(remote: RemoteConfig) -> Self {
         #[allow(unused_mut)]
         let mut reg = Self::empty();
