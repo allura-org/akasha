@@ -144,6 +144,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "blake3",
  "candle-core",
  "candle-nn",
@@ -161,6 +162,7 @@ dependencies = [
  "libheif-rs",
  "notify",
  "notify-debouncer-full",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -4269,6 +4271,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

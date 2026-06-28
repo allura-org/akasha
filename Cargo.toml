@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["simd-thumbnails"]
+default = ["hevc", "candle", "remote"]
 hevc = ["dep:libheif-rs"]
 simd-thumbnails = ["dep:fast_image_resize", "dep:webp"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub"]
+remote = ["dep:reqwest", "dep:base64"]
 cuda = ["candle", "candle-core/cuda"]
 
 [dependencies]
@@ -82,3 +83,7 @@ candle-core = { version = "0.8", optional = true }
 candle-nn = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
 hf-hub = { version = "0.4", optional = true }
+
+# Remote inference (opt-in)
+reqwest = { version = "0.12", features = ["blocking", "json"], optional = true }
+base64 = { version = "0.22", optional = true }
