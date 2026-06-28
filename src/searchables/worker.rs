@@ -33,34 +33,6 @@ impl SearchWorker {
         }
     }
 
-    #[cfg(feature = "candle")]
-    async fn tick(&mut self) -> anyhow::Result<usize> {
-        let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
-        let count = jobs.len();
-        for (i, job) in jobs.iter().enumerate() {
-            if i > 0 {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            match job.job_kind.as_str() {
-                "tagger" | "classifier" | "visionlanguage" => {
-                    if let Err(e) = self.process_ai_job(job).await {
-                        let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
-                    }
-                }
-                other => {
-                    tracing::warn!("SearchWorker: unknown job kind '{}' for job {}", other, job.id);
-                    let _ = crate::db::searchable::fail_job(
-                        &self.pool,
-                        job.id,
-                        &format!("unknown job kind: {}", other),
-                    ).await;
-                }
-            }
-        }
-        Ok(count)
-    }
-
-    #[cfg(not(feature = "candle"))]
     async fn tick(&mut self) -> anyhow::Result<usize> {
         let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
         let count = jobs.len();
@@ -96,7 +68,7 @@ impl SearchWorker {
             .unwrap_or_else(|| "unknown".to_string());
 
         tracing::info!(
-            "SearchWorker: failing {} job {} for media {} (model: {}) — candle feature not enabled",
+            "SearchWorker: failing {} job {} for media {} (model: {}) — backend-registry integration pending (Task 5)",
             job.job_kind,
             job.id,
             job.media_file_id,
@@ -104,7 +76,7 @@ impl SearchWorker {
         );
 
         anyhow::bail!(
-            "AI inference requires the 'candle' feature. Rebuild with --features candle."
+            "AI inference is temporarily disabled; backend-registry integration is pending (Task 5)."
         )
     }
 }
