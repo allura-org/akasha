@@ -145,6 +145,7 @@ pub struct ModelConfig {
     pub description: Option<ModelDescriptionOptions>,
     pub classification: Option<ModelClassificationOptions>,
     pub remote: Option<ModelRemoteOptions>,
+    pub onnx: Option<ModelOnnxOptions>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +171,16 @@ impl Default for ModelRemoteOptions {
 fn default_chat_endpoint() -> String { "/chat/completions".into() }
 fn default_tag_endpoint() -> String { "/tags".into() }
 fn default_classify_endpoint() -> String { "/classify".into() }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelOnnxOptions {
+    /// Explicit ONNX model file name. If omitted, OrtBackend searches the model folder.
+    pub model_file: Option<String>,
+    /// Explicit tags/labels file. If omitted, OrtBackend searches the model folder.
+    pub tags_file: Option<String>,
+    /// Explicit preprocessing config file. If omitted, OrtBackend searches the model folder.
+    pub config_file: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTagsOptions {

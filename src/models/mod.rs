@@ -15,6 +15,8 @@ pub mod candle;
 pub mod stub;
 #[cfg(feature = "remote")]
 pub mod remote;
+#[cfg(feature = "onnx")]
+pub mod onnx;
 
 #[derive(Debug, Clone)]
 pub enum ModelOutput {
@@ -55,6 +57,8 @@ impl BackendRegistry {
         reg.register(remote::RemoteBackend::new(remote));
         #[cfg(feature = "candle")]
         reg.register(candle::CandleBackend);
+        #[cfg(feature = "onnx")]
+        reg.register(onnx::OrtBackend);
         #[cfg(not(feature = "remote"))]
         let _ = remote;
         reg
@@ -137,6 +141,7 @@ mod tests {
             description: None,
             classification: None,
             remote: None,
+            onnx: None,
         };
         assert!(reg.select(&config).is_some());
     }
@@ -156,6 +161,7 @@ mod tests {
             description: None,
             classification: None,
             remote: None,
+            onnx: None,
         };
         assert!(reg.select(&config).is_none());
     }

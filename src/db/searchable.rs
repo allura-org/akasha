@@ -265,6 +265,7 @@ pub async fn sync_model_configs(
             "api_key": model.api_key,
             "backend": model.backend,
             "remote": model.remote,
+            "onnx": model.onnx,
             "kind": model.kind,
         });
 
@@ -333,6 +334,10 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         .get("remote")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let onnx: Option<crate::config::ModelOnnxOptions> = opts
+        .get("onnx")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
     let tags: Option<crate::config::ModelTagsOptions> = opts
         .get("threshold")
         .and_then(|t| serde_json::from_value(serde_json::json!({ "threshold": t })).ok());
@@ -357,6 +362,7 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         model_id: opts.get("model_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
         api_key: opts.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()),
         remote,
+        onnx,
         tags,
         description,
         classification,
@@ -650,6 +656,7 @@ mod tests {
             description: None,
             classification: Some(ModelClassificationOptions {}),
             remote: None,
+            onnx: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -687,6 +694,7 @@ mod tests {
             }),
             classification: None,
             remote: None,
+            onnx: None,
         };
         sync_model_configs(&pool, &[model2]).await.unwrap();
 
@@ -733,6 +741,7 @@ mod tests {
             description: None,
             classification: None,
             remote: None,
+            onnx: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -767,6 +776,7 @@ mod tests {
                 tag_endpoint: "/v1/tag".into(),
                 classify_endpoint: "/v1/classify".into(),
             }),
+            onnx: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 

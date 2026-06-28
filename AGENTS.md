@@ -44,6 +44,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Date/time | `chrono` (with serde support) |
 | File system watching | `notify` 8, `notify-debouncer-full` 0.5 |
 | Local inference (optional) | `candle-core` 0.8, `candle-nn` 0.8, `candle-transformers` 0.8, `hf-hub` 0.4 |
+| Local ONNX inference (default) | `ort` 2.0.0-rc.12 (ONNX Runtime 1.24), `ndarray` 0.17 |
 | Remote inference (optional) | `reqwest` 0.12 (`blocking` + `rustls-tls`), `base64` 0.22 |
 
 ---
@@ -73,6 +74,7 @@ cargo test
 - `candle` (default) — Enables local inference via Candle (`candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`). Used by the `CandleBackend` for tag/classification/description models. Disable with `--no-default-features` for a lighter build.
 - `cuda` — Enables CUDA support in Candle (requires `candle` feature and a CUDA toolkit). Build with `cargo build --features cuda`.
 - `remote` (default) — Enables remote HTTP inference via `reqwest::blocking` and `base64`. Used by the `RemoteBackend` for OpenAI-compatible or custom endpoints. Disable with `--no-default-features`.
+- `onnx` (default) — Enables local ONNX inference via `ort` and `ndarray`. Used by the `OrtBackend` for running ONNX models (e.g., WD VIT taggers, SigLIP). Disable with `--no-default-features`.
 - `hevc` — Enables HEVC-coded media. Currently covers HEIF/HEIC images; will extend to HEVC video in MP4 when video support lands. Requires system libraries:
   - `libheif-dev` >= 1.17.0 (and its dependency `libde265-dev` for HEVC decoding)
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
@@ -107,7 +109,7 @@ src/
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ModelsConfig`, `ImportConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
-  models/        — Backend-agnostic model plugin interface (`Model`, `Backend`, `BackendRegistry`) plus `CandleBackend` and `RemoteBackend` implementations
+  models/        — Backend-agnostic model plugin interface (`Model`, `Backend`, `BackendRegistry`) plus `CandleBackend`, `RemoteBackend`, and `OrtBackend` implementations
   searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename`/`tags`/`description` Searchables, background `SearchWorker`
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
   watcher.rs     — Filesystem watcher using `notify-debouncer-full`; emits batched Create/Modify/Remove events to `app.rs`
@@ -285,7 +287,7 @@ no_cache_read = false    # Force thumbnail regeneration
 | — | **MVP Complete** — usable gallery | ✅ Complete |
 | 7 | `notify` file watcher, incremental updates | ✅ Complete (debounced watcher, single-file upsert/delete, subfolder creation) |
 | 8 | Searchables trait + filename baseline | ✅ Complete (trait, registry, and `filename` Searchable implemented) |
-| 9 | Backend-agnostic model plugin interface + Candle/Remote backends | ✅ Complete (`Model`/`Backend` traits, `BackendRegistry`, `CandleBackend`, `RemoteBackend`; SearchWorker runs inference generically) |
+| 9 | Backend-agnostic model plugin interface + Candle/Remote/ONNX backends | ✅ Complete (`Model`/`Backend` traits, `BackendRegistry`, `CandleBackend`, `RemoteBackend`, `OrtBackend`; SearchWorker runs inference generically) |
 | 10 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
 | 11 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
 
@@ -321,6 +323,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/models/mod.rs` | Generic `Model`/`Backend` traits and `BackendRegistry` |
 | `src/models/candle.rs` | `CandleBackend` for local Candle-based inference |
 | `src/models/remote.rs` | `RemoteBackend` for HTTP inference endpoints |
+| `src/models/onnx.rs` | `OrtBackend` for local ONNX inference; heuristic preprocessing/tag discovery |
 | `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
 | `src/searchables/engine.rs` | Search orchestration and score aggregation |
 | `src/searchables/filename.rs` | Built-in filename Searchable |

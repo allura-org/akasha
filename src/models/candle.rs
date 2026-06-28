@@ -79,6 +79,7 @@ mod tests {
             description: None,
             classification: None,
             remote: None,
+            onnx: None,
         };
         assert!(backend.supports(&cfg));
     }
