@@ -147,7 +147,7 @@ pub struct ModelConfig {
     pub remote: Option<ModelRemoteOptions>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRemoteOptions {
     #[serde(default = "default_chat_endpoint")]
     pub chat_endpoint: String,
@@ -155,6 +155,16 @@ pub struct ModelRemoteOptions {
     pub tag_endpoint: String,
     #[serde(default = "default_classify_endpoint")]
     pub classify_endpoint: String,
+}
+
+impl Default for ModelRemoteOptions {
+    fn default() -> Self {
+        Self {
+            chat_endpoint: default_chat_endpoint(),
+            tag_endpoint: default_tag_endpoint(),
+            classify_endpoint: default_classify_endpoint(),
+        }
+    }
 }
 
 fn default_chat_endpoint() -> String { "/chat/completions".into() }
