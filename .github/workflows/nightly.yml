@@ -46,14 +46,15 @@ jobs:
             libheif-dev \
             libde265-dev
 
-      - name: Install ONNX Runtime (standard build)
-        if: matrix.os == 'ubuntu-22.04'
+      - name: Install ONNX Runtime
         run: |
-          wget -qO packages-microsoft-prod.deb https://packages.microsoft.com/config/ubuntu/22.04/packages-microsoft-prod.deb
-          sudo dpkg -i packages-microsoft-prod.deb
-          sudo apt-get update
-          sudo apt-get install -y libonnxruntime-dev
-          echo "ORT_LIB_PATH=/usr/lib/x86_64-linux-gnu" >> "$GITHUB_ENV"
+          ORT_VERSION=1.27.0
+          wget -qO onnxruntime.tgz "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          sudo mkdir -p /opt/onnxruntime
+          sudo tar -xzf onnxruntime.tgz -C /opt/onnxruntime --strip-components=1
+          rm onnxruntime.tgz
+          echo "ORT_LIB_PATH=/opt/onnxruntime/lib" >> "$GITHUB_ENV"
+          echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -69,12 +70,17 @@ jobs:
             cargo build --release
           fi
 
+      - name: Install patchelf
+        run: sudo apt-get install -y patchelf
+
       - name: Package binary
         run: |
           mkdir -p dist
           cp target/release/akasha dist/akasha${{ matrix.suffix }}
+          cp -a /opt/onnxruntime/lib/libonnxruntime.so* dist/
+          patchelf --set-rpath '$ORIGIN' dist/akasha${{ matrix.suffix }}
           cd dist
-          tar -czf akasha${{ matrix.suffix }}-linux-x86_64.tar.gz akasha${{ matrix.suffix }}
+          tar -czf akasha${{ matrix.suffix }}-linux-x86_64.tar.gz akasha${{ matrix.suffix }} libonnxruntime.so*
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
