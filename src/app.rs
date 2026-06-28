@@ -447,7 +447,7 @@ impl AkashaApp {
                 // If the currently selected folder was affected, refresh its media list.
                 if let Some(selected) = selected_folder_id {
                     if affected_folder_ids.contains(&selected) {
-                        let result = db::media::list_summaries_by_folder(&pool, selected).await;
+                        let result = db::media::list_summaries_by_folder_recursive(&pool, selected).await;
                         let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));
                     }
                 }
@@ -803,7 +803,7 @@ impl AkashaApp {
 
             // Refresh the current folder view so any status changes are visible.
             if let Some(folder_id) = selected_folder_id {
-                let _ = db::media::list_summaries_by_folder(&pool, folder_id).await
+                let _ = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
                     .map(|result| media_tx.send((epoch, false, Ok(result))));
             }
         });
@@ -1049,7 +1049,7 @@ impl eframe::App for AkashaApp {
                     Ok(n) => {
                         tracing::info!("Cleared {} missing records", n);
                         if let Some(folder_id) = selected_folder_id {
-                            let result = db::media::list_summaries_by_folder(&pool, folder_id).await;
+                            let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await;
                             let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));
                         }
                     }
