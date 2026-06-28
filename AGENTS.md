@@ -42,7 +42,9 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Error handling | `anyhow` |
 | XDG directories | `directories` 6 |
 | Date/time | `chrono` (with serde support) |
-| File system watching (planned) | `notify` 8, `notify-debouncer-full` 0.5 |
+| File system watching | `notify` 8, `notify-debouncer-full` 0.5 |
+| Local inference (optional) | `candle-core` 0.8, `candle-nn` 0.8, `candle-transformers` 0.8, `hf-hub` 0.4 |
+| Remote inference (optional) | `reqwest` 0.12 (`blocking` + `rustls-tls`), `base64` 0.22 |
 
 ---
 
@@ -63,18 +65,20 @@ cargo build --release
 # With SIMD thumbnail acceleration (requires libwebp-dev / libwebp-devel)
 cargo build --release --features simd-thumbnails
 
-# Tests (none exist yet, but this is the command)
 cargo test
 ```
 
 ### Feature flags
 
+- `candle` (default) — Enables local inference via Candle (`candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`). Used by the `CandleBackend` for tag/classification/description models. Disable with `--no-default-features` for a lighter build.
+- `cuda` — Enables CUDA support in Candle (requires `candle` feature and a CUDA toolkit). Build with `cargo build --features cuda`.
+- `remote` (default) — Enables remote HTTP inference via `reqwest::blocking` and `base64`. Used by the `RemoteBackend` for OpenAI-compatible or custom endpoints. Disable with `--no-default-features`.
 - `hevc` — Enables HEVC-coded media. Currently covers HEIF/HEIC images; will extend to HEVC video in MP4 when video support lands. Requires system libraries:
   - `libheif-dev` >= 1.17.0 (and its dependency `libde265-dev` for HEVC decoding)
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
   - Build with the feature: `cargo build --features hevc`
-  - If the libraries are missing, disable the feature: `cargo build --no-default-features` (or remove `hevc` from `default` in `Cargo.toml`)
-- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Opt-in; enable with `cargo build --features simd-thumbnails`. Requires `libwebp-dev` (Debian/Ubuntu) or `libwebp-devel` (Fedora).
+  - This feature is **excluded from default builds** for license reasons and is only included in the dedicated HEVC binary.
+- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; requires `libwebp-dev` (Debian/Ubuntu) or `libwebp-devel` (Fedora).
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
@@ -103,7 +107,8 @@ src/
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ModelsConfig`, `ImportConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
-  searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename` Searchable, background worker stub
+  models/        — Backend-agnostic model plugin interface (`Model`, `Backend`, `BackendRegistry`) plus `CandleBackend` and `RemoteBackend` implementations
+  searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename`/`tags`/`description` Searchables, background `SearchWorker`
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
   watcher.rs     — Filesystem watcher using `notify-debouncer-full`; emits batched Create/Modify/Remove events to `app.rs`
   theme.rs       — Custom flat egui theme
@@ -114,7 +119,7 @@ src/
     searchable.rs — Searchable config/value CRUD and generic `job_queue` helpers
   ui/
     mod.rs       — Re-exports `browser`, `viewer`, `widgets`
-    browser.rs   — `BrowserPanel` placeholder (unused; browser UI is inline in `app.rs`)
+    browser.rs   — `BrowserPanel`: folder tree, thumbnail grid, search bar, and scroll/thumbnail queue state
     media_processing.rs — Media Processing window: AI tabs/subtabs, model selection, manual job enqueueing
     viewer.rs    — Full-screen viewer overlay: zoom fit/1:1, prev/next, info ticker, keyboard shortcuts (Escape, ArrowLeft, ArrowRight)
     widgets.rs   — Shared UI helpers (currently a single placeholder fn)
@@ -124,10 +129,11 @@ src/
 - `main.rs` depends on all top-level modules.
 - `app.rs` is the orchestrator: holds config, DB pool, Tokio runtime, thumbnailer, Searchables engine, and all UI state.
 - `db::folder`, `db::media`, and `db::searchable` are the DB access layers.
+- `models` provides the `BackendRegistry`; `SearchWorker` selects a backend from the registry and loads/runs `dyn Model` instances.
 - `scanner` and `thumbnailer` are called from async tasks spawned by `app.rs`.
 - `searchables::SearchWorker` runs as a background tokio task started from `app.rs`.
 - `watcher::spawn` is called from `app.rs` on startup; watcher events are polled each frame.
-- `ui::viewer` is a pure function called from `app.rs` viewer state; `ui::browser` now owns the folder tree and search bar.
+- `ui::viewer` is a pure function called from `app.rs` viewer state; `ui::browser` owns the folder tree, thumbnail grid, and search bar.
 
 ---
 
@@ -278,17 +284,19 @@ no_cache_read = false    # Force thumbnail regeneration
 | 6 | Polish: theme, error toasts, settings UI | ✅ Complete |
 | — | **MVP Complete** — usable gallery | ✅ Complete |
 | 7 | `notify` file watcher, incremental updates | ✅ Complete (debounced watcher, single-file upsert/delete, subfolder creation) |
-| 8 | Searchables trait + filename baseline | ✅ Complete (trait, registry, and `filename` Searchable implemented; ONNX deferred) |
-| 9 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
-| 10 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
+| 8 | Searchables trait + filename baseline | ✅ Complete (trait, registry, and `filename` Searchable implemented) |
+| 9 | Backend-agnostic model plugin interface + Candle/Remote backends | ✅ Complete (`Model`/`Backend` traits, `BackendRegistry`, `CandleBackend`, `RemoteBackend`; SearchWorker runs inference generically) |
+| 10 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
+| 11 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
 
 The full original plan (database evaluation, Searchables trait definition, extensibility hooks, open questions) lives in `SESSION_NOTES.md` under "Full Architectural Roadmap".
 
 ## Known Gaps / TODOs
 
 - `ui/widgets.rs` — only contains a placeholder label helper.
-- Media Processing UI and generic `job_queue` scaffolding are in place, but real ONNX/remote inference is not yet implemented; the worker currently logs and marks jobs done.
+- Media Processing UI and generic `job_queue` are in place. `CandleBackend` (local ViT tagger) and `RemoteBackend` (HTTP tag endpoint) are implemented; description/classification endpoints for remote are deferred.
 - Inference jobs must be triggered manually from the Media Processing window or context menus; they are not enqueued automatically on scan/import.
+- Remote backend currently uploads the full raw image without resize/compress; image preprocessing for remote endpoints is deferred.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
 - Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
@@ -310,10 +318,15 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/db/folder.rs` | Folder queries and `Folder` struct |
 | `src/app.rs` | Central app state and `eframe::App` implementation |
 | `src/scanner.rs` | Directory scanning with per-subfolder resume |
+| `src/models/mod.rs` | Generic `Model`/`Backend` traits and `BackendRegistry` |
+| `src/models/candle.rs` | `CandleBackend` for local Candle-based inference |
+| `src/models/remote.rs` | `RemoteBackend` for HTTP inference endpoints |
 | `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
 | `src/searchables/engine.rs` | Search orchestration and score aggregation |
 | `src/searchables/filename.rs` | Built-in filename Searchable |
-| `src/searchables/worker.rs` | Background `job_queue` worker; dispatches AI dummy jobs (real ONNX/remote inference deferred) |
+| `src/searchables/tags.rs` | Built-in tags Searchable backed by `searchable_tags` side table |
+| `src/searchables/description.rs` | Built-in description Searchable backed by FTS5 side table |
+| `src/searchables/worker.rs` | Background `job_queue` worker; selects a backend from `BackendRegistry` and runs inference |
 | `src/db/searchable.rs` | Searchable config/value and job queue queries |
 | `src/thumbnailer.rs` | Thumbnail generation and cache path resolution |
 | `src/ui/browser.rs` | Folder tree, thumbnail grid, and search bar |
