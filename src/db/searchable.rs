@@ -262,6 +262,10 @@ pub async fn sync_model_configs(
             "path": model.path,
             "base_url": model.base_url,
             "model_id": model.model_id,
+            "api_key": model.api_key,
+            "backend": model.backend,
+            "remote": model.remote,
+            "kind": model.kind,
         });
 
         if let Some(tags) = &model.tags {
@@ -309,6 +313,54 @@ pub async fn sync_model_configs(
     }
 
     Ok(())
+}
+
+/// Reconstruct a `ModelConfig` from a persisted `SearchableConfig` row.
+///
+/// The `SearchableConfig` options are expected to contain the base model
+/// fields written by `sync_model_configs`. Output-kind specific options such
+/// as `threshold` and `prompt` are mapped back to their respective option
+/// structs.
+pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<crate::config::ModelConfig> {
+    let opts = &cfg.options;
+
+    let kind = opts
+        .get("kind")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(crate::config::ModelKind::Local);
+
+    let remote: Option<crate::config::ModelRemoteOptions> = opts
+        .get("remote")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    let tags: Option<crate::config::ModelTagsOptions> = opts
+        .get("threshold")
+        .and_then(|t| serde_json::from_value(serde_json::json!({ "threshold": t })).ok());
+
+    let description: Option<crate::config::ModelDescriptionOptions> = opts
+        .get("prompt")
+        .and_then(|p| serde_json::from_value(serde_json::json!({ "prompt": p })).ok());
+
+    let classification: Option<crate::config::ModelClassificationOptions> =
+        if cfg.kind == "classification" {
+            Some(crate::config::ModelClassificationOptions {})
+        } else {
+            None
+        };
+
+    Ok(crate::config::ModelConfig {
+        name: cfg.name.clone(),
+        kind,
+        backend: opts.get("backend").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        path: opts.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        base_url: opts.get("base_url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        model_id: opts.get("model_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        api_key: opts.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        remote,
+        tags,
+        description,
+        classification,
+    })
 }
 
 /// Enqueue a background processing job for a media file.
@@ -597,6 +649,7 @@ mod tests {
             tags: Some(ModelTagsOptions::default()),
             description: None,
             classification: Some(ModelClassificationOptions {}),
+            remote: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -633,6 +686,7 @@ mod tests {
                 prompt: Some("describe".into()),
             }),
             classification: None,
+            remote: None,
         };
         sync_model_configs(&pool, &[model2]).await.unwrap();
 
@@ -678,6 +732,7 @@ mod tests {
             tags: None,
             description: None,
             classification: None,
+            remote: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -686,5 +741,51 @@ mod tests {
             .unwrap()
             .expect("filename config should exist");
         assert!(filename.enabled);
+    }
+
+    #[tokio::test]
+    async fn model_config_from_searchable_config_reconstructs_remote_options() {
+        use crate::config::{
+            ModelConfig, ModelKind, ModelRemoteOptions, ModelTagsOptions,
+        };
+
+        let pool = setup_pool().await;
+
+        let model = ModelConfig {
+            name: "remote-test".into(),
+            kind: ModelKind::Remote,
+            backend: Some("remote".into()),
+            path: None,
+            base_url: Some("https://example.com".into()),
+            model_id: Some("m1".into()),
+            api_key: Some("secret".into()),
+            tags: Some(ModelTagsOptions::default()),
+            description: None,
+            classification: None,
+            remote: Some(ModelRemoteOptions {
+                chat_endpoint: "/v1/chat".into(),
+                tag_endpoint: "/v1/tag".into(),
+                classify_endpoint: "/v1/classify".into(),
+            }),
+        };
+        sync_model_configs(&pool, &[model]).await.unwrap();
+
+        let cfg = get_config_by_name_kind(&pool, "remote-test", "tags")
+            .await
+            .unwrap()
+            .expect("tags config should exist");
+
+        let reconstructed = model_config_from_searchable_config(&cfg).unwrap();
+        assert_eq!(reconstructed.name, "remote-test");
+        assert_eq!(reconstructed.kind, ModelKind::Remote);
+        assert_eq!(reconstructed.backend.as_deref(), Some("remote"));
+        assert_eq!(reconstructed.base_url.as_deref(), Some("https://example.com"));
+        assert_eq!(reconstructed.model_id.as_deref(), Some("m1"));
+        assert_eq!(reconstructed.api_key.as_deref(), Some("secret"));
+        let remote = reconstructed.remote.expect("remote options should exist");
+        assert_eq!(remote.chat_endpoint, "/v1/chat");
+        assert_eq!(remote.tag_endpoint, "/v1/tag");
+        assert_eq!(remote.classify_endpoint, "/v1/classify");
+        assert!(reconstructed.tags.is_some());
     }
 }

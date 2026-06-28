@@ -8,8 +8,27 @@ pub struct Config {
     pub thumbnails: ThumbnailsConfig,
     pub debug: DebugConfig,
     pub models: ModelsConfig,
+    pub remote: RemoteConfig,
     #[serde(alias = "folders")]
     pub imports: Vec<ImportConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    pub chat_endpoint: String,
+    pub tag_endpoint: String,
+    pub classify_endpoint: String,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            chat_endpoint: "/chat/completions".into(),
+            tag_endpoint: "/tags".into(),
+            classify_endpoint: "/classify".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +144,22 @@ pub struct ModelConfig {
     pub tags: Option<ModelTagsOptions>,
     pub description: Option<ModelDescriptionOptions>,
     pub classification: Option<ModelClassificationOptions>,
+    pub remote: Option<ModelRemoteOptions>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelRemoteOptions {
+    #[serde(default = "default_chat_endpoint")]
+    pub chat_endpoint: String,
+    #[serde(default = "default_tag_endpoint")]
+    pub tag_endpoint: String,
+    #[serde(default = "default_classify_endpoint")]
+    pub classify_endpoint: String,
+}
+
+fn default_chat_endpoint() -> String { "/chat/completions".into() }
+fn default_tag_endpoint() -> String { "/tags".into() }
+fn default_classify_endpoint() -> String { "/classify".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelTagsOptions {
@@ -194,6 +228,7 @@ impl Default for Config {
             thumbnails: ThumbnailsConfig::default(),
             debug: DebugConfig::default(),
             models: ModelsConfig::default(),
+            remote: RemoteConfig::default(),
             imports: Vec::new(),
         }
     }
@@ -316,5 +351,31 @@ threshold = 0.35
         assert_eq!(config.models.models[0].kind, ModelKind::Local);
         assert_eq!(config.models.models[0].path.as_deref(), Some("SmilingWolf/wd-vit-tagger-v3"));
         assert_eq!(config.models.models[0].tags.as_ref().unwrap().threshold, 0.35);
+    }
+
+    #[test]
+    fn parse_model_with_backend_and_remote_options() {
+        let text = r#"
+[remote]
+chat_endpoint = "/v1/chat"
+tag_endpoint = "/v1/tag"
+
+[[models]]
+name = "remote-model"
+type = "remote"
+backend = "remote"
+base_url = "https://example.com"
+model_id = "m1"
+api_key = "secret"
+
+[models.remote]
+classify_endpoint = "/v1/classify"
+"#;
+
+        let config: Config = toml::from_str(text).unwrap();
+        let model = &config.models.models[0];
+        assert_eq!(model.backend.as_deref(), Some("remote"));
+        assert_eq!(model.remote.as_ref().unwrap().classify_endpoint.as_str(), "/v1/classify");
+        assert_eq!(config.remote.chat_endpoint.as_str(), "/v1/chat");
     }
 }

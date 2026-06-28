@@ -65,6 +65,7 @@ mod tests {
             tags: Some(ModelTagsOptions { threshold: 0.1 }),
             description: None,
             classification: None,
+            remote: None,
         };
         assert!(backend.supports(&cfg));
     }

@@ -112,6 +112,7 @@ mod tests {
             tags: None,
             description: None,
             classification: None,
+            remote: None,
         };
         assert!(reg.select(&config).is_some());
     }
@@ -130,6 +131,7 @@ mod tests {
             tags: None,
             description: None,
             classification: None,
+            remote: None,
         };
         assert!(reg.select(&config).is_none());
     }
