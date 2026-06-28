@@ -64,7 +64,6 @@ jobs:
           cd /tmp/onnxruntime
           ./build.sh \
             --config Release \
-            --build_shared_lib off \
             --parallel \
             --compile_no_warning_as_error \
             --skip_tests \
