@@ -103,10 +103,7 @@ impl SearchWorker {
         .context("missing searchable_config for job")?;
 
         let model_config = crate::db::searchable::model_config_from_searchable_config(&cfg)?;
-        let backend = self
-            .registry
-            .select(&model_config)
-            .with_context(|| format!("no backend available for model {}", model_config.name))?;
+        let backend = self.registry.select_with_error(&model_config)?;
 
         let backend_id = backend.id().to_string();
         let needs_load = self
@@ -165,7 +162,12 @@ impl SearchWorker {
                 )
                 .await?;
             }
-            _ => {}
+            _ => {
+                anyhow::bail!(
+                    "model {} returned unsupported output kind {:?}; only Tags and Description are implemented",
+                    model_config.name, output
+                );
+            }
         }
 
         crate::db::searchable::complete_job(&self.pool, job.id).await?;
@@ -261,5 +263,16 @@ mod tests {
             .await
             .unwrap();
         assert!(row.0.contains("mock_tag"));
+
+        let tag_row: (String, f32) = sqlx::query_as(
+            "SELECT tag, score FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2"
+        )
+        .bind(mid)
+        .bind("mock")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tag_row.0, "mock_tag");
+        assert!((tag_row.1 - 0.99).abs() < f32::EPSILON);
     }
 }

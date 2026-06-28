@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crate::config::{ModelConfig, RemoteConfig};
 
 pub mod loader;
@@ -72,6 +72,37 @@ impl BackendRegistry {
                 .iter()
                 .find(|b| b.is_available() && b.supports(config))
                 .cloned()
+        }
+    }
+
+    pub fn select_with_error(&self, config: &ModelConfig) -> Result<Arc<dyn Backend>> {
+        if let Some(id) = &config.backend {
+            match self.backends.iter().find(|b| b.id() == id) {
+                Some(b) if !b.is_available() => {
+                    anyhow::bail!("backend '{}' is not available", id)
+                }
+                Some(b) if !b.supports(config) => {
+                    anyhow::bail!("backend '{}' does not support this model configuration", id)
+                }
+                Some(b) => Ok(b.clone()),
+                None => {
+                    anyhow::bail!(
+                        "backend '{}' is not compiled in. Rebuild with the matching feature flag",
+                        id
+                    )
+                }
+            }
+        } else {
+            self.backends
+                .iter()
+                .find(|b| b.is_available() && b.supports(config))
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "no backend available for model {}. Add `backend = \"...\"` or check feature flags",
+                        config.name
+                    )
+                })
         }
     }
 }
