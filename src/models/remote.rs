@@ -22,7 +22,11 @@ impl Backend for RemoteBackend {
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
         let base_url = config.base_url.as_deref().context("remote model missing base_url")?;
         let model_id = config.model_id.as_deref().context("remote model missing model_id")?;
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .context("failed to build remote HTTP client")?;
         Ok(Arc::new(RemoteModel {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -84,6 +88,8 @@ impl RemoteModel {
 mod tests {
     use super::*;
     use crate::config::{ModelConfig, ModelKind, ModelRemoteOptions, ModelTagsOptions};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     #[test]
     fn remote_backend_supports_base_url() {
@@ -102,5 +108,56 @@ mod tests {
             remote: Some(ModelRemoteOptions::default()),
         };
         assert!(backend.supports(&cfg));
+    }
+
+    #[test]
+    fn remote_backend_http_stub_returns_tags() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"tag_a": 0.9, "tag_b": 0.5}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        let temp_path = std::env::temp_dir().join("akasha_remote_stub_test.bin");
+        std::fs::write(&temp_path, b"fake-image-bytes").expect("write temp file");
+
+        let config = ModelConfig {
+            name: "remote-stub".into(),
+            kind: ModelKind::Remote,
+            backend: None,
+            path: None,
+            base_url: Some(format!("http://127.0.0.1:{}", port)),
+            model_id: Some("stub-model".into()),
+            api_key: None,
+            tags: Some(ModelTagsOptions { threshold: 0.35 }),
+            description: None,
+            classification: None,
+            remote: Some(ModelRemoteOptions::default()),
+        };
+
+        let output = RemoteBackend
+            .load(&config)
+            .expect("load")
+            .infer(&temp_path)
+            .expect("infer");
+        std::fs::remove_file(&temp_path).ok();
+
+        match output {
+            ModelOutput::Tags(tags) => {
+                assert!((tags.get("tag_a").copied().unwrap_or(0.0) - 0.9).abs() < 1e-6);
+                assert!((tags.get("tag_b").copied().unwrap_or(0.0) - 0.5).abs() < 1e-6);
+            }
+            other => panic!("expected ModelOutput::Tags, got {:?}", other),
+        }
     }
 }
