@@ -21,7 +21,9 @@ impl Backend for CandleBackend {
 
     fn supports(&self, config: &ModelConfig) -> bool {
         // Candle only handles local models with a path right now.
-        config.kind == crate::config::ModelKind::Local && config.path.is_some()
+        config.kind == crate::config::ModelKind::Local
+            && config.path.is_some()
+            && config.base_url.is_none()
     }
 
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {

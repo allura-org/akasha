@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use base64::Engine;
 
-use crate::config::{ModelConfig, ModelKind, RemoteConfig};
+use crate::config::{ModelConfig, RemoteConfig};
 use super::{Backend, Model, ModelOutput};
 
 pub struct RemoteBackend {
@@ -24,7 +24,7 @@ impl Backend for RemoteBackend {
     fn is_available(&self) -> bool { true }
 
     fn supports(&self, config: &ModelConfig) -> bool {
-        config.kind == ModelKind::Remote || config.base_url.is_some()
+        config.base_url.is_some()
     }
 
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
