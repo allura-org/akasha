@@ -10,11 +10,7 @@ impl StubTagger {
     pub fn new(name: &str) -> Self { Self { name: name.to_string() } }
 }
 
-#[async_trait::async_trait]
-impl super::CandleModel for StubTagger {
-    fn name(&self) -> &str { &self.name }
-    fn kind(&self) -> super::ModelOutputKind { super::ModelOutputKind::Tags }
-
+impl super::Model for StubTagger {
     fn infer(&self, _image_path: &Path) -> Result<super::ModelOutput> {
         let mut tags = HashMap::new();
         tags.insert("stub_tag".to_string(), 0.99f32);

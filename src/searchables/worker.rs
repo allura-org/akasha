@@ -6,15 +6,11 @@ use tokio::time::interval;
 
 /// Background worker that polls the `job_queue` table.
 ///
-/// When the `candle` feature is enabled, the worker owns a resident
-/// `CandleWorker` and reuses it across ticks. Jobs are clustered by
-/// `searchable_config_id` so the same model stays loaded for consecutive
-/// jobs. Without `candle`, AI jobs are processed as no-ops (log + mark done).
+/// AI jobs are currently processed as no-ops (log + mark done) while the
+/// backend-agnostic inference path is being refactored.
 pub struct SearchWorker {
     pool: Arc<SqlitePool>,
     batch_size: i64,
-    #[cfg(feature = "candle")]
-    candle: Option<crate::models::worker::CandleWorker>,
 }
 
 impl SearchWorker {
@@ -22,8 +18,6 @@ impl SearchWorker {
         Self {
             pool,
             batch_size: 4,
-            #[cfg(feature = "candle")]
-            candle: None,
         }
     }
 
@@ -42,51 +36,27 @@ impl SearchWorker {
     #[cfg(feature = "candle")]
     async fn tick(&mut self) -> anyhow::Result<usize> {
         let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
-        if jobs.is_empty() {
-            return Ok(0);
-        }
-
-        let ai_kinds = ["tagger", "classifier", "visionlanguage"];
-        let (mut to_process, ignored): (Vec<_>, Vec<_>) = jobs
-            .into_iter()
-            .partition(|j| ai_kinds.contains(&j.job_kind.as_str()));
-
-        for job in ignored {
-            tracing::warn!(
-                job_id = job.id,
-                job_kind = job.job_kind,
-                "SearchWorker: unknown job kind, failing"
-            );
-            let _ = crate::db::searchable::fail_job(
-                &self.pool,
-                job.id,
-                &format!("unknown job kind: {}", job.job_kind),
-            )
-            .await;
-        }
-
-        let count = to_process.len();
-        if count == 0 {
-            return Ok(0);
-        }
-
-        let resident_id = self.candle.as_ref().and_then(|c| c.resident_config_id());
-        cluster_jobs(&mut to_process, resident_id);
-
-        if self.candle.is_none() {
-            match crate::models::worker::CandleWorker::new(Arc::clone(&self.pool)) {
-                Ok(c) => self.candle = Some(c),
-                Err(e) => {
-                    for job in &to_process {
+        let count = jobs.len();
+        for (i, job) in jobs.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            match job.job_kind.as_str() {
+                "tagger" | "classifier" | "visionlanguage" => {
+                    if let Err(e) = self.process_ai_job(job).await {
                         let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
                     }
-                    return Ok(count);
+                }
+                other => {
+                    tracing::warn!("SearchWorker: unknown job kind '{}' for job {}", other, job.id);
+                    let _ = crate::db::searchable::fail_job(
+                        &self.pool,
+                        job.id,
+                        &format!("unknown job kind: {}", other),
+                    ).await;
                 }
             }
         }
-
-        let candle = self.candle.as_mut().unwrap();
-        candle.process_jobs(&to_process).await?;
         Ok(count)
     }
 
@@ -117,7 +87,6 @@ impl SearchWorker {
         Ok(count)
     }
 
-    #[cfg(not(feature = "candle"))]
     async fn process_ai_job(&self, job: &crate::db::searchable::JobRow) -> anyhow::Result<()> {
         let model_name: String = job
             .params_json
@@ -138,12 +107,4 @@ impl SearchWorker {
             "AI inference requires the 'candle' feature. Rebuild with --features candle."
         )
     }
-}
-
-#[cfg(feature = "candle")]
-fn cluster_jobs(jobs: &mut [crate::db::searchable::JobRow], resident_id: Option<i64>) {
-    jobs.sort_by_key(|j| {
-        let is_resident = resident_id == j.searchable_config_id;
-        (!is_resident, j.searchable_config_id, j.created_at)
-    });
 }

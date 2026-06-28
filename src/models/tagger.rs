@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use candle_core::Device;
 use candle_transformers::models::vit::{Config, Model as VitModel};
 
-use super::{loader, preprocess, CandleModel, ModelOutput, ModelOutputKind};
+use super::{loader, preprocess, Model, ModelOutput};
 
 /// Extract label names from a Hugging Face ViT-style `id2label` config field.
 /// The field is an object mapping stringified indices to label strings, e.g.
@@ -128,16 +128,7 @@ impl ViTTagger {
     }
 }
 
-#[async_trait::async_trait]
-impl CandleModel for ViTTagger {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn kind(&self) -> ModelOutputKind {
-        ModelOutputKind::Tags
-    }
-
+impl Model for ViTTagger {
     fn infer(&self, image_path: &Path) -> Result<ModelOutput> {
         let tensor = preprocess::image_to_tensor(image_path, self.input_size, &self.device)?;
         let logits = self.model.forward(&tensor)?.squeeze(0)?;
