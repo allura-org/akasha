@@ -319,14 +319,16 @@ pub async fn enqueue_job(
     params_json: &str,
     searchable_config_id: Option<i64>,
 ) -> Result<i64> {
-    // Avoid duplicate pending jobs for the same media/kind/params combination.
+    // Avoid duplicate pending jobs for the same media/config/kind/params combination.
     let existing: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM job_queue
-         WHERE media_file_id = ?1 AND job_kind = ?2 AND params_json = ?3 AND status = 'pending'"
+         WHERE media_file_id = ?1 AND job_kind = ?2 AND params_json = ?3
+           AND searchable_config_id IS ?4 AND status = 'pending'"
     )
     .bind(media_file_id)
     .bind(job_kind)
     .bind(params_json)
+    .bind(searchable_config_id)
     .fetch_optional(pool)
     .await?;
 

@@ -38,7 +38,13 @@ fn labels_from_config(config: &serde_json::Value) -> Result<Vec<String>> {
     Ok(pairs.into_iter().map(|(_, label)| label).collect())
 }
 
-pub struct WdViTTagger {
+/// Standard Hugging Face ViT image-classifier tagger.
+///
+/// This uses the `candle_transformers` ViT implementation and applies a
+/// sigmoid over the classifier logits so any label can be returned
+/// independently. It is *not* compatible with timm-style checkpoints such as
+/// `SmilingWolf/wd-vit-tagger-v3`.
+pub struct ViTTagger {
     name: String,
     model: VitModel,
     labels: Vec<String>,
@@ -47,7 +53,7 @@ pub struct WdViTTagger {
     threshold: f32,
 }
 
-impl WdViTTagger {
+impl ViTTagger {
     pub fn load(
         name: &str,
         files: &loader::ModelFiles,
@@ -123,7 +129,7 @@ impl WdViTTagger {
 }
 
 #[async_trait::async_trait]
-impl CandleModel for WdViTTagger {
+impl CandleModel for ViTTagger {
     fn name(&self) -> &str {
         &self.name
     }
@@ -138,12 +144,41 @@ impl CandleModel for WdViTTagger {
         let probs = candle_nn::ops::sigmoid(&logits)?;
         let probs_vec: Vec<f32> = probs.to_vec1()?;
 
+        let mut max_score = 0.0f32;
+        let mut min_score = f32::INFINITY;
+        let mut sum_score = 0.0f32;
+        for &score in &probs_vec {
+            if score > max_score {
+                max_score = score;
+            }
+            if score < min_score {
+                min_score = score;
+            }
+            sum_score += score;
+        }
+        let mean_score = if !probs_vec.is_empty() {
+            sum_score / probs_vec.len() as f32
+        } else {
+            0.0
+        };
+
         let mut tags = HashMap::new();
         for (i, &score) in probs_vec.iter().enumerate() {
             if score >= self.threshold && i < self.labels.len() {
                 tags.insert(self.labels[i].clone(), score);
             }
         }
+
+        tracing::info!(
+            image = ?image_path,
+            labels = self.labels.len(),
+            threshold = self.threshold,
+            max_score,
+            min_score,
+            mean_score,
+            above_threshold = tags.len(),
+            "WdViTTagger inference stats"
+        );
 
         Ok(ModelOutput::Tags(tags))
     }
@@ -164,7 +199,7 @@ mod manual_tests {
     fn vit_base_tagger_smoke() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = WdViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
 
         let output = tagger.infer(Path::new("test_imgs/dagnpats.png"))?;
         let ModelOutput::Tags(tags) = output else {
@@ -182,6 +217,30 @@ mod manual_tests {
         Ok(())
     }
 
+    /// Verify the default threshold (0.35) still produces tags on the smoke image.
+    /// Run with `cargo test --features candle -- --ignored --nocapture vit_base_tagger_default_threshold`.
+    #[test]
+    #[ignore = "manual: checks default threshold produces tags"]
+    fn vit_base_tagger_default_threshold() -> Result<()> {
+        let source = loader::resolve_source("google/vit-base-patch16-224")?;
+        let files = loader::load_model_files(&source)?;
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.35)?;
+
+        let output = tagger.infer(Path::new("test_imgs/dagnpats.png"))?;
+        let ModelOutput::Tags(tags) = output else {
+            anyhow::bail!("expected tag output");
+        };
+
+        println!("default threshold tag count: {}", tags.len());
+        let mut sorted: Vec<_> = tags.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        for (tag, score) in sorted.iter().take(5) {
+            println!("  {}: {:.4}", tag, score);
+        }
+        assert!(!sorted.is_empty(), "expected at least one tag above default threshold");
+        Ok(())
+    }
+
     /// Manual performance baseline: run inference on 10 images and report total / per-image time.
     /// Run with `cargo test --features candle --release -- --ignored --nocapture vit_base_tagger_baseline`.
     #[test]
@@ -189,7 +248,7 @@ mod manual_tests {
     fn vit_base_tagger_baseline() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = WdViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
 
         let image_paths: Vec<&str> = vec![
             "test_imgs/dagnpats.png",

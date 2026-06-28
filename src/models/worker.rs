@@ -12,7 +12,7 @@ use super::{loader, CandleModel, ModelOutput};
 pub struct CandleWorker {
     pool: Arc<SqlitePool>,
     device: Device,
-    resident: Option<Box<dyn CandleModel>>,
+    resident: Option<Arc<dyn CandleModel>>,
     resident_config_id: Option<i64>,
 }
 
@@ -39,7 +39,7 @@ impl CandleWorker {
     }
 
     #[cfg(test)]
-    pub fn set_resident(&mut self, model: Box<dyn CandleModel>, config_id: i64) {
+    pub fn set_resident(&mut self, model: Arc<dyn CandleModel>, config_id: i64) {
         self.resident = Some(model);
         self.resident_config_id = Some(config_id);
     }
@@ -53,8 +53,18 @@ impl CandleWorker {
             if i > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            if let Err(e) = self.process_one(job).await {
-                let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+            tracing::info!(
+                job_id = job.id,
+                media_file_id = job.media_file_id,
+                searchable_config_id = job.searchable_config_id,
+                "CandleWorker: starting job"
+            );
+            match self.process_one(job).await {
+                Ok(()) => tracing::info!(job_id = job.id, "CandleWorker: job completed"),
+                Err(e) => {
+                    tracing::warn!(job_id = job.id, error = %e, "CandleWorker: job failed");
+                    let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+                }
             }
         }
         Ok(())
@@ -72,6 +82,7 @@ impl CandleWorker {
         // memory-mapping, and ViT build) runs on the blocking thread pool so it
         // does not stall the async runtime.
         if self.resident_config_id != Some(cfg.id) {
+            tracing::info!(model = cfg.name, "CandleWorker: loading model");
             let device = self.device.clone();
             let cfg_for_load = cfg.clone();
             self.resident = Some(
@@ -81,17 +92,22 @@ impl CandleWorker {
                     .with_context(|| format!("failed to load model for {}", cfg.name))?,
             );
             self.resident_config_id = Some(cfg.id);
+            tracing::info!(model = cfg.name, "CandleWorker: model loaded");
         }
 
-        let model = self.resident.as_ref().unwrap();
+        let model = self.resident.clone().unwrap();
         let media = crate::db::media::get_by_id(&self.pool, job.media_file_id)
             .await?
             .context("missing media file")?;
+        let image_path = media.absolute_path.clone();
 
-        let output = model.infer(Path::new(&media.absolute_path))?;
+        let output = tokio::task::spawn_blocking(move || model.infer(Path::new(&image_path)))
+            .await
+            .map_err(|e| anyhow::anyhow!("inference task panicked: {e}"))??;
 
         match output {
             ModelOutput::Tags(tags) => {
+                let count = tags.len();
                 crate::db::searchable::update_tags_json(
                     &self.pool,
                     job.media_file_id,
@@ -99,6 +115,12 @@ impl CandleWorker {
                     tags,
                 )
                 .await?;
+                tracing::info!(
+                    job_id = job.id,
+                    source = cfg.name,
+                    tag_count = count,
+                    "CandleWorker: wrote tags"
+                );
             }
             ModelOutput::Description(text) => {
                 crate::db::searchable::update_description_json(
@@ -120,7 +142,7 @@ impl CandleWorker {
 fn load_model_for_config(
     cfg: &crate::db::searchable::SearchableConfig,
     device: &Device,
-) -> Result<Box<dyn CandleModel>> {
+) -> Result<Arc<dyn CandleModel>> {
     let options_value = cfg.options.clone();
 
     if options_value
@@ -144,8 +166,8 @@ fn load_model_for_config(
             let options: crate::config::ModelTagsOptions =
                 serde_json::from_value(options_value).unwrap_or_default();
             let tagger =
-                super::tagger::WdViTTagger::load(&cfg.name, &files, device.clone(), options.threshold)?;
-            Ok(Box::new(tagger))
+                super::tagger::ViTTagger::load(&cfg.name, &files, device.clone(), options.threshold)?;
+            Ok(Arc::new(tagger))
         }
         other => anyhow::bail!("unsupported model kind: {other}"),
     }
@@ -174,11 +196,19 @@ mod tests {
         let jobs = crate::db::searchable::claim_pending_jobs(&pool, 10).await.unwrap();
         let mut worker = crate::models::worker::CandleWorker::new(Arc::new(pool.clone())).unwrap();
         // Override resident with stub for the test.
-        worker.set_resident(Box::new(crate::models::stub::StubTagger::new("stub")), cfg_id);
+        worker.set_resident(Arc::new(crate::models::stub::StubTagger::new("stub")), cfg_id);
         worker.process_jobs(&jobs).await.unwrap();
 
         let row: (String,) = sqlx::query_as("SELECT tags_json FROM media_files WHERE id = ?1")
             .bind(mid).fetch_one(&pool).await.unwrap();
         assert!(row.0.contains("stub_tag"));
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM searchable_tags WHERE media_file_id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 1);
     }
 }

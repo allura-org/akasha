@@ -41,20 +41,43 @@ impl SearchWorker {
 
     #[cfg(feature = "candle")]
     async fn tick(&mut self) -> anyhow::Result<usize> {
-        let mut jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
-        let count = jobs.len();
+        let jobs = crate::db::searchable::claim_pending_jobs(&self.pool, self.batch_size).await?;
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+
+        let ai_kinds = ["tagger", "classifier", "visionlanguage"];
+        let (mut to_process, ignored): (Vec<_>, Vec<_>) = jobs
+            .into_iter()
+            .partition(|j| ai_kinds.contains(&j.job_kind.as_str()));
+
+        for job in ignored {
+            tracing::warn!(
+                job_id = job.id,
+                job_kind = job.job_kind,
+                "SearchWorker: unknown job kind, failing"
+            );
+            let _ = crate::db::searchable::fail_job(
+                &self.pool,
+                job.id,
+                &format!("unknown job kind: {}", job.job_kind),
+            )
+            .await;
+        }
+
+        let count = to_process.len();
         if count == 0 {
             return Ok(0);
         }
 
         let resident_id = self.candle.as_ref().and_then(|c| c.resident_config_id());
-        cluster_jobs(&mut jobs, resident_id);
+        cluster_jobs(&mut to_process, resident_id);
 
         if self.candle.is_none() {
             match crate::models::worker::CandleWorker::new(Arc::clone(&self.pool)) {
                 Ok(c) => self.candle = Some(c),
                 Err(e) => {
-                    for job in &jobs {
+                    for job in &to_process {
                         let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
                     }
                     return Ok(count);
@@ -63,7 +86,7 @@ impl SearchWorker {
         }
 
         let candle = self.candle.as_mut().unwrap();
-        candle.process_jobs(&jobs).await?;
+        candle.process_jobs(&to_process).await?;
         Ok(count)
     }
 
@@ -104,26 +127,16 @@ impl SearchWorker {
             .unwrap_or_else(|| "unknown".to_string());
 
         tracing::info!(
-            "SearchWorker: running {} job {} for media {} (model: {})",
+            "SearchWorker: failing {} job {} for media {} (model: {}) — candle feature not enabled",
             job.job_kind,
             job.id,
             job.media_file_id,
             model_name
         );
 
-        // Dummy work: pretend inference takes a moment.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        tracing::info!(
-            "SearchWorker: completed {} job {} for media {} (model: {})",
-            job.job_kind,
-            job.id,
-            job.media_file_id,
-            model_name
-        );
-
-        crate::db::searchable::complete_job(&self.pool, job.id).await?;
-        Ok(())
+        anyhow::bail!(
+            "AI inference requires the 'candle' feature. Rebuild with --features candle."
+        )
     }
 }
 
