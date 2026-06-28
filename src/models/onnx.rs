@@ -217,8 +217,14 @@ impl Model for OrtModel {
         };
 
         let mut tags = HashMap::new();
+        let mut max_score = 0.0f32;
+        let mut min_score = f32::INFINITY;
+        let mut sum_score = 0.0f32;
         for (idx, &score) in scores.iter().enumerate() {
             let prob = 1.0 / (1.0 + (-score).exp());
+            max_score = max_score.max(prob);
+            min_score = min_score.min(prob);
+            sum_score += prob;
             if prob >= self.threshold {
                 let tag = self.tags.get(idx).map(|s| s.as_str()).unwrap_or("");
                 if !tag.is_empty() {
@@ -226,6 +232,18 @@ impl Model for OrtModel {
                 }
             }
         }
+        let mean_score = if !scores.is_empty() { sum_score / scores.len() as f32 } else { 0.0 };
+
+        tracing::info!(
+            image = ?image_path,
+            labels = self.tags.len(),
+            threshold = self.threshold,
+            max_score,
+            min_score = if min_score.is_finite() { min_score } else { 0.0 },
+            mean_score,
+            above_threshold = tags.len(),
+            "OrtModel inference stats"
+        );
 
         Ok(ModelOutput::Tags(tags))
     }
