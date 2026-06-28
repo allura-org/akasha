@@ -33,17 +33,20 @@ impl Backend for OrtBackend {
     }
 
     fn supports(&self, config: &ModelConfig) -> bool {
-        // Explicit backend selection takes precedence.
-        if config.backend.as_deref() == Some("onnx") {
-            return true;
-        }
-
-        // Otherwise, treat any local model folder that contains an ONNX file as
-        // an ONNX model. This keeps the door open for auto-detecting models
-        // downloaded by slug without a manual `backend = "onnx"` line.
         if config.kind != crate::config::ModelKind::Local {
             return false;
         }
+
+        // Explicit backend selection takes precedence.
+        match config.backend.as_deref() {
+            Some("onnx") => return true,
+            Some("candle") | Some(_) => return false,
+            None => {}
+        }
+
+        // If no backend is specified, claim the model if it already resolves to
+        // an ONNX model folder. We don't claim undownloaded HF slugs here so
+        // Candle (registered earlier) can handle .safetensors models by default.
         if let Some(path) = &config.path {
             if let Ok(dir) = resolve_model_dir(path) {
                 if find_model_file(&dir, None).is_ok() {
