@@ -75,6 +75,7 @@ cargo test
 - `cuda` — Enables CUDA support in Candle (requires `candle` feature and a CUDA toolkit). Build with `cargo build --features cuda`.
 - `remote` (default) — Enables remote HTTP inference via `reqwest::blocking` and `base64`. Used by the `RemoteBackend` for OpenAI-compatible or custom endpoints. Disable with `--no-default-features`.
 - `onnx` (default) — Enables local ONNX inference via `ort` and `ndarray`. Used by the `OrtBackend` for running ONNX models (e.g., WD VIT taggers, SigLIP). Disable with `--no-default-features`.
+  - **Release builds currently exclude ONNX** while packaging is figured out; `cargo run` and local builds still include it by default.
 - `hevc` — Enables HEVC-coded media. Currently covers HEIF/HEIC images; will extend to HEVC video in MP4 when video support lands. Requires system libraries:
   - `libheif-dev` >= 1.17.0 (and its dependency `libde265-dev` for HEVC decoding)
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
