@@ -1,5 +1,7 @@
 //! Local candle-based backend.
 
+pub mod vlm;
+
 use std::sync::Arc;
 use anyhow::{Context, Result};
 use candle_core::Device;

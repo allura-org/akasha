@@ -150,6 +150,25 @@ pub struct ModelConfig {
     pub onnx: Option<ModelOnnxOptions>,
 }
 
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: ModelKind::Local,
+            backend: None,
+            path: None,
+            base_url: None,
+            model_id: None,
+            api_key: None,
+            tags: None,
+            description: None,
+            classification: None,
+            remote: None,
+            onnx: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRemoteOptions {
     #[serde(default = "default_chat_endpoint")]
