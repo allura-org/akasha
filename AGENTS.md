@@ -125,6 +125,7 @@ src/
     browser.rs   — `BrowserPanel`: folder tree, thumbnail grid, search bar, and scroll/thumbnail queue state
     media_processing.rs — Media Processing window: AI tabs/subtabs, model selection, manual job enqueueing
     viewer.rs    — Full-screen viewer overlay: zoom fit/1:1, prev/next, info ticker, keyboard shortcuts (Escape, ArrowLeft, ArrowRight)
+    properties.rs — Metadata/properties window: per-source tags, descriptions, classifications, and advanced media fields
     widgets.rs   — Shared UI helpers (currently a single placeholder fn)
 ```
 
@@ -210,6 +211,7 @@ Cache path: `~/.cache/akasha/`
 ```toml
 [ui]
 theme = "dark"
+show_advanced_media_properties = false
 
 [thumbnails]
 thumbnail_size = 512
@@ -219,6 +221,11 @@ temporary_cache = false  # Writes to /tmp/.akasha_thumbnails, cleaned on exit
 
 [debug]
 no_cache_read = false    # Force thumbnail regeneration
+
+[remote]
+chat_endpoint = "/chat/completions"
+tag_endpoint = "/tags"
+classify_endpoint = "/classify"
 
 # [[import]]
 # path = ""
@@ -301,7 +308,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - Inference jobs must be triggered manually from the Media Processing window or context menus; they are not enqueued automatically on scan/import.
 - Remote backend currently uploads the full raw image without resize/compress; image preprocessing for remote endpoints is deferred.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
-- Text Searchables currently use `LIKE` queries; FTS5 can be added later for descriptions/sidecars.
+- Tags and descriptions are now backed by FTS5 (trigram for tags, `searchable_text_fts` for descriptions). Sidecar text search is still deferred.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
 - Cross-root file moves appear as a Remove + Create pair; no move deduplication.
 - Missing files (`is_present = 0`) are still shown in the grid and search results with a badge/placeholder; a dedicated hide-missing filter is not yet implemented.
@@ -336,6 +343,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/ui/browser.rs` | Folder tree, thumbnail grid, and search bar |
 | `src/ui/media_processing.rs` | Media Processing window for manual AI job enqueueing |
 | `src/ui/viewer.rs` | Full-screen image viewer overlay |
+| `src/ui/properties.rs` | Metadata/properties window for a single media item |
 | `src/watcher.rs` | Filesystem watcher and event classification |
 | `generate_test_noise.py` | Helper script to create random noise PNGs for watcher testing |
 

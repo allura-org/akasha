@@ -62,23 +62,19 @@ impl Searchable for TagsSearchable {
         if !long.is_empty() {
             let match_expr = fts5_match_expr(&long);
             let sql = if recursive {
-                format!(
-                    "SELECT fts.media_file_id, COUNT(*) AS matches
-                     FROM searchable_tags_fts fts
-                     JOIN media_files m ON m.id = fts.media_file_id
-                     JOIN folders f ON f.id = m.folder_id
-                     WHERE fts.tag MATCH ?1
-                       AND (f.id = ?2 OR f.path LIKE (SELECT path || '/%' FROM folders WHERE id = ?2))
-                     GROUP BY fts.media_file_id"
-                )
+                "SELECT fts.media_file_id, COUNT(*) AS matches
+                 FROM searchable_tags_fts fts
+                 JOIN media_files m ON m.id = fts.media_file_id
+                 JOIN folders f ON f.id = m.folder_id
+                 WHERE fts.tag MATCH ?1
+                   AND (f.id = ?2 OR f.path LIKE (SELECT path || '/%' FROM folders WHERE id = ?2))
+                 GROUP BY fts.media_file_id"
             } else {
-                format!(
-                    "SELECT fts.media_file_id, COUNT(*) AS matches
-                     FROM searchable_tags_fts fts
-                     JOIN media_files m ON m.id = fts.media_file_id
-                     WHERE m.folder_id = ?2 AND fts.tag MATCH ?1
-                     GROUP BY fts.media_file_id"
-                )
+                "SELECT fts.media_file_id, COUNT(*) AS matches
+                 FROM searchable_tags_fts fts
+                 JOIN media_files m ON m.id = fts.media_file_id
+                 WHERE m.folder_id = ?2 AND fts.tag MATCH ?1
+                 GROUP BY fts.media_file_id"
             };
 
             let rows: Vec<(i64, i64)> = sqlx::query_as(&sql)

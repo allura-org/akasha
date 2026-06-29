@@ -32,11 +32,19 @@ disable_cache = false
 
 [ui]
 theme = "dark"
+show_advanced_media_properties = false
 double_click_debounce_ms = 300
 scroll_speed = 1.0
 viewer_default_scale_mode = "smallest"
 sort_key = "filename"
 sort_order = "ascending"
+
+[remote]
+# Default HTTP endpoints for remote models. Per-model overrides are supported via
+# [models.remote].
+chat_endpoint = "/chat/completions"
+tag_endpoint = "/tags"
+classify_endpoint = "/classify"
 
 [[import]]
 path = ""
@@ -95,6 +103,7 @@ cache_fallback = "disable"
 #
 # [models.tags]
 # threshold = 0.35
+# top_k = 100  # Cap the number of returned tags to the N highest-scoring ones.
 
 # Example: an ONNX tagger. The model files are downloaded from HuggingFace on first use
 # and cached under `~/.local/share/akasha/models/onnx/SmilingWolf-wd-vit-tagger-v3/`.

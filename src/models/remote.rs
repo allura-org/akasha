@@ -95,11 +95,16 @@ impl RemoteModel {
             .json()
             .context("failed to parse remote tag response")?;
 
+        let threshold = self.tags.as_ref().map(|t| t.threshold).unwrap_or(0.35);
+
         let mut tags = HashMap::new();
         if let Some(obj) = response.as_object() {
             for (k, v) in obj {
                 if let Some(score) = v.as_f64() {
-                    tags.insert(k.clone(), score as f32);
+                    let score = score as f32;
+                    if score >= threshold {
+                        tags.insert(k.clone(), score);
+                    }
                 }
             }
         }

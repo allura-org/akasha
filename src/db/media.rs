@@ -257,14 +257,39 @@ pub async fn delete_by_path(
     folder_id: i64,
     relative_path: &str,
 ) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+
+    // Virtual FTS5 tables cannot have foreign keys, so clean them up explicitly
+    // before deleting the parent media_files row.
+    let media_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
+    )
+    .bind(folder_id)
+    .bind(relative_path)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(id) = media_id {
+        sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM searchable_text_fts WHERE media_file_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
     let rows = sqlx::query(
         "DELETE FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
     )
     .bind(folder_id)
     .bind(relative_path)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+
+    tx.commit().await?;
     Ok(rows)
 }
 
@@ -457,10 +482,26 @@ pub async fn mark_present_by_path(
 /// Permanently delete all rows that are currently marked missing.
 /// This is an explicit, user-initiated action from the DB Management menu.
 pub async fn delete_missing(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+
+    // Virtual FTS5 tables cannot declare foreign keys, so clean up orphans
+    // explicitly before deleting the parent media_files rows.
+    sqlx::query(
+        "DELETE FROM searchable_tags_fts WHERE media_file_id IN (SELECT id FROM media_files WHERE is_present = 0)"
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM searchable_text_fts WHERE media_file_id IN (SELECT id FROM media_files WHERE is_present = 0)"
+    )
+    .execute(&mut *tx)
+    .await?;
+
     let result = sqlx::query("DELETE FROM media_files WHERE is_present = 0")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
+    tx.commit().await?;
     Ok(result.rows_affected())
 }
 

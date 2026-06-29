@@ -110,7 +110,8 @@ fn show_general(ui: &mut egui::Ui, data: &PropertiesData, advanced: bool) {
         ui.label("Absolute path:");
         ui.add(
             egui::TextEdit::singleline(&mut m.absolute_path.clone())
-                .desired_width(f32::INFINITY),
+                .desired_width(f32::INFINITY)
+                .interactive(false),
         );
     });
     ui.label(format!("Folder: {}", data.folder_path));
@@ -287,6 +288,12 @@ fn show_classifications(ui: &mut egui::Ui, data: &PropertiesData) {
     }
 }
 
-fn show_embeddings(ui: &mut egui::Ui, _data: &PropertiesData) {
+fn show_embeddings(ui: &mut egui::Ui, data: &PropertiesData) {
     ui.label("Embeddings viewer not yet implemented.");
+    if !data.embeddings.is_empty() {
+        ui.label("Sources:");
+        for source in &data.embeddings {
+            ui.label(source);
+        }
+    }
 }
