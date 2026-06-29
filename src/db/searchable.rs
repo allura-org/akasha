@@ -891,6 +891,7 @@ mod tests {
             tags: None,
             description: Some(ModelDescriptionOptions {
                 prompt: Some("describe".into()),
+                ..Default::default()
             }),
             classification: None,
             remote: None,

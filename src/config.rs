@@ -193,8 +193,29 @@ pub struct ModelTagsOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelDescriptionOptions {
     pub prompt: Option<String>,
+    pub max_tokens: usize,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+}
+
+impl Default for ModelDescriptionOptions {
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            max_tokens: 128,
+            temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,5 +430,33 @@ classify_endpoint = "/v1/classify"
         assert_eq!(model.backend.as_deref(), Some("remote"));
         assert_eq!(model.remote.as_ref().unwrap().classify_endpoint.as_str(), "/v1/classify");
         assert_eq!(config.remote.chat_endpoint.as_str(), "/v1/chat");
+    }
+
+    #[test]
+    fn parse_model_description_options() {
+        let text = r#"
+[[models]]
+name = "gemma-4-E2B-it"
+type = "local"
+path = "google/gemma-4-E2B-it"
+
+[models.description]
+prompt = "Describe this image in one sentence."
+max_tokens = 64
+temperature = 0.5
+top_p = 0.9
+top_k = 20
+repeat_penalty = 1.1
+repeat_last_n = 32
+"#;
+        let config: Config = toml::from_str(text).unwrap();
+        let desc = config.models.models[0].description.as_ref().unwrap();
+        assert_eq!(desc.prompt.as_deref(), Some("Describe this image in one sentence."));
+        assert_eq!(desc.max_tokens, 64);
+        assert_eq!(desc.temperature, Some(0.5));
+        assert_eq!(desc.top_p, Some(0.9));
+        assert_eq!(desc.top_k, Some(20));
+        assert!((desc.repeat_penalty - 1.1).abs() < f32::EPSILON);
+        assert_eq!(desc.repeat_last_n, 32);
     }
 }
