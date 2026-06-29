@@ -1179,6 +1179,10 @@ impl eframe::App for AkashaApp {
                     crate::ui::settings::SettingsAction::ViewerDefaultScaleModeChanged => {
                         settings_changed = true;
                     }
+                    crate::ui::settings::SettingsAction::AdvancedMediaPropertiesChanged(value) => {
+                        let _ = value;
+                        settings_changed = true;
+                    }
                 }
             }
             if settings_changed {
