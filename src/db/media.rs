@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use futures_util::stream::TryStreamExt;
 use sqlx::SqlitePool;
 
@@ -14,6 +16,17 @@ pub struct MediaFile {
     pub file_size: Option<i64>,
     pub is_present: bool,
     pub missing_since: Option<chrono::NaiveDateTime>,
+    pub created_at: chrono::NaiveDateTime,
+    pub modified_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertiesData {
+    pub media: MediaFile,
+    pub tags: HashMap<String, HashMap<String, f32>>,
+    pub descriptions: HashMap<String, String>,
+    pub classifications: HashMap<String, Vec<String>>,
+    pub embeddings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +168,7 @@ pub async fn search_summaries(
 pub async fn get_by_id(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<MediaFile>> {
     let row = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE id = ?1"
     )
     .bind(id)
@@ -172,7 +185,7 @@ pub async fn get_by_path(
 ) -> anyhow::Result<Option<MediaFile>> {
     let row = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
     )
     .bind(folder_id)
@@ -207,7 +220,7 @@ pub async fn list_page_by_folder(
 ) -> anyhow::Result<Vec<MediaFile>> {
     let rows = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files
          WHERE folder_id = ?1 AND id > ?2
          ORDER BY id
@@ -235,7 +248,8 @@ pub async fn list_page_by_folder_recursive(
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
          )
          SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash,
-                m.width, m.height, m.format, m.file_size, m.is_present, m.missing_since
+                m.width, m.height, m.format, m.file_size, m.is_present, m.missing_since,
+                m.created_at, m.modified_at
          FROM media_files m
          JOIN subtree s ON m.folder_id = s.id
          WHERE m.id > ?2
@@ -255,7 +269,7 @@ pub async fn list_page_by_folder_recursive(
 pub async fn list_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<Vec<MediaFile>> {
     let rows = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE folder_id = ?1"
     )
     .bind(folder_id)
@@ -273,7 +287,7 @@ pub async fn list_by_folder_recursive(pool: &SqlitePool, folder_id: i64) -> anyh
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
          )
          SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
     )
     .bind(folder_id)
@@ -407,6 +421,8 @@ struct MediaFileRow {
     file_size: Option<i64>,
     is_present: i64,
     missing_since: Option<chrono::NaiveDateTime>,
+    created_at: chrono::NaiveDateTime,
+    modified_at: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -439,6 +455,8 @@ fn into_media(row: MediaFileRow) -> MediaFile {
         file_size: row.file_size,
         is_present: row.is_present != 0,
         missing_since: row.missing_since,
+        created_at: row.created_at,
+        modified_at: row.modified_at,
     }
 }
 
