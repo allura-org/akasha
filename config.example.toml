@@ -154,3 +154,16 @@ cache_fallback = "disable"
 # # Optional per-channel normalization overrides. If omitted, pixels are scaled by 1/255.
 # # image_mean = [0.5, 0.5, 0.5]
 # # image_std = [0.5, 0.5, 0.5]
+
+# Example: a local Gemma 4 vision-language model for image captioning via mistral.rs.
+# Requires the `mistralrs` feature. The model is downloaded from HuggingFace on first use.
+# [[models]]
+# name = "gemma4-description"
+# type = "local"
+# backend = "mistralrs"
+# model_id = "google/gemma-4-E2B-it"
+#
+# [models.description]
+# prompt = "Describe this image in detail."
+# max_tokens = 128
+# temperature = 0.7
