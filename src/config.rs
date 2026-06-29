@@ -223,8 +223,9 @@ pub struct ModelDescriptionOptions {
     pub repeat_last_n: usize,
     /// Optional per-channel mean for image normalization. If both `image_mean`
     /// and `image_std` are provided, preprocessing applies `(pixel/255 - mean) / std`
-    /// per channel. If omitted, pixels are only scaled by 1/255, which matches the
-    /// candle vision tower's default [-1, 1] path.
+    /// per channel, overriding the model-specific defaults. If omitted, the model's
+    /// default normalization is used (for Gemma 4 this is a no-op: mean `[0,0,0]`,
+    /// std `[1,1,1]`).
     pub image_mean: Option<Vec<f32>>,
     /// Optional per-channel standard deviation for image normalization. See `image_mean`.
     pub image_std: Option<Vec<f32>>,

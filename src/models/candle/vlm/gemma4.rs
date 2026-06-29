@@ -8,6 +8,10 @@ use candle_transformers::models::gemma4::{
 };
 use image::imageops::FilterType;
 use serde_json::Value;
+
+/// Number of image/vision tokens Gemma 4 uses for an image, taken from the
+/// official processor config (`image_seq_length` / `max_soft_tokens`).
+const GEMMA4_IMAGE_SEQ_LENGTH: usize = 280;
 use tokenizers::Tokenizer;
 
 use crate::config::{ModelConfig, ModelDescriptionOptions};
@@ -128,13 +132,25 @@ impl Gemma4Vlm {
     }
 }
 
+/// Default per-channel mean/std for Gemma 4 preprocessing, matching the
+/// official processor config (`do_normalize: false`, `image_mean: [0,0,0]`,
+/// `image_std: [1,1,1]`). Using these values makes normalization a no-op.
+const DEFAULT_IMAGE_MEAN: [f32; 3] = [0.0, 0.0, 0.0];
+const DEFAULT_IMAGE_STD: [f32; 3] = [1.0, 1.0, 1.0];
+const DEFAULT_RESCALE_FACTOR: f32 = 1.0 / 255.0;
+
 /// Preprocess the image and return the pixel tensor plus the number of vision
-/// tokens the Gemma 4 vision tower will produce for this resolution.
+/// tokens the Gemma 4 vision tower will produce.
 ///
-/// By default pixels are scaled by 1/255, matching the candle vision tower's
-/// internal [-1, 1] scaling path. If `image_mean` and `image_std` are both
-/// configured in `[models.description]`, the standard `(pixel/255 - mean) / std`
-/// normalization is applied per channel instead.
+/// Defaults are taken from the official Gemma 4 E2B-it processor config:
+/// - `do_convert_rgb: true` → input is converted to RGB.
+/// - `do_rescale: true`, `rescale_factor: 1/255` → pixels are scaled by 1/255.
+/// - `do_normalize: false`, `image_mean: [0,0,0]`, `image_std: [1,1,1]`
+///   → normalization is a no-op unless `[models.description]` explicitly sets
+///     `image_mean` and `image_std`, in which case `(pixel * rescale - mean) / std`
+///     is applied per channel.
+/// - `resample: 3` (PIL BICUBIC) → closest `image` crate filter is `CatmullRom`.
+/// - `image_seq_length` / `max_soft_tokens: 280` → fixed 280 vision tokens.
 fn preprocess_image_with_config(
     path: &Path,
     vision_config: &Gemma4VisionConfig,
@@ -142,11 +158,10 @@ fn preprocess_image_with_config(
     device: &Device,
 ) -> Result<(Tensor, usize)> {
     // Gemma 4 vision tower accepts any size divisible by patch_size.
-    // Resize longest side to a reasonable default; exact size should match the
-    // processor config and available memory. 896 keeps CPU inference tractable.
+    // patch_size (16) and pooling_kernel_size (3) come from config.vision_config
+    // and match the processor config.
     let target_longest = 896u32;
     let patch_size = vision_config.patch_size as u32;
-    let pooling_kernel = vision_config.pooling_kernel_size as u32;
 
     let img = image::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
@@ -164,38 +179,35 @@ fn preprocess_image_with_config(
         (nw.max(patch_size), nh.max(patch_size))
     };
 
-    let img = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
-    let normalize = generation.image_mean.as_ref().zip(generation.image_std.as_ref());
-    let data: Vec<f32> = if let Some((mean, std)) = normalize {
-        if mean.len() != 3 || std.len() != 3 {
-            anyhow::bail!("image_mean and image_std must each have exactly 3 channels");
+    let img = image::imageops::resize(&img, new_w, new_h, FilterType::CatmullRom);
+
+    let (mean, std) = match generation.image_mean.as_ref().zip(generation.image_std.as_ref()) {
+        Some((m, s)) => {
+            if m.len() != 3 || s.len() != 3 {
+                anyhow::bail!("image_mean and image_std must each have exactly 3 channels");
+            }
+            ([m[0], m[1], m[2]], [s[0], s[1], s[2]])
         }
-        img.pixels()
-            .flat_map(|p| {
-                [
-                    (p[0] as f32 / 255.0 - mean[0]) / std[0],
-                    (p[1] as f32 / 255.0 - mean[1]) / std[1],
-                    (p[2] as f32 / 255.0 - mean[2]) / std[2],
-                ]
-            })
-            .collect()
-    } else {
-        img.pixels()
-            .flat_map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
-            .collect()
+        None => (DEFAULT_IMAGE_MEAN, DEFAULT_IMAGE_STD),
     };
+
+    let data: Vec<f32> = img
+        .pixels()
+        .flat_map(|p| {
+            [
+                (p[0] as f32 * DEFAULT_RESCALE_FACTOR - mean[0]) / std[0],
+                (p[1] as f32 * DEFAULT_RESCALE_FACTOR - mean[1]) / std[1],
+                (p[2] as f32 * DEFAULT_RESCALE_FACTOR - mean[2]) / std[2],
+            ]
+        })
+        .collect();
 
     let tensor = Tensor::from_vec(data, (new_h as usize, new_w as usize, 3), device)?
         .permute((2, 0, 1))?
         .unsqueeze(0)
         .with_context(|| "failed to build image tensor")?;
 
-    let ph = (new_h / patch_size) as usize;
-    let pw = (new_w / patch_size) as usize;
-    let num_patches = ph * pw;
-    let vision_tokens = num_patches / (pooling_kernel as usize).pow(2);
-
-    Ok((tensor, vision_tokens.max(1)))
+    Ok((tensor, GEMMA4_IMAGE_SEQ_LENGTH))
 }
 
 fn build_prompt_tokens(
@@ -368,7 +380,7 @@ mod tests {
             preprocess_image_with_config(&path, &vision_config, &generation, &device).unwrap();
 
         assert_eq!(tensor.dims4().unwrap(), (1, 3, 144, 144));
-        assert_eq!(vision_tokens, 9);
+        assert_eq!(vision_tokens, GEMMA4_IMAGE_SEQ_LENGTH);
     }
 
     #[test]
