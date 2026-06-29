@@ -438,11 +438,11 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
 
     let tags: Option<crate::config::ModelTagsOptions> = opts
         .get("threshold")
-        .and_then(|t| serde_json::from_value(serde_json::json!({ "threshold": t })).ok());
+        .and_then(|_| serde_json::from_value(opts.clone()).ok());
 
     let description: Option<crate::config::ModelDescriptionOptions> = opts
         .get("prompt")
-        .and_then(|p| serde_json::from_value(serde_json::json!({ "prompt": p })).ok());
+        .and_then(|_| serde_json::from_value(opts.clone()).ok());
 
     let classification: Option<crate::config::ModelClassificationOptions> =
         if cfg.kind == "classification" {
@@ -989,5 +989,41 @@ mod tests {
         assert_eq!(remote.tag_endpoint, "/v1/tag");
         assert_eq!(remote.classify_endpoint, "/v1/classify");
         assert!(reconstructed.tags.is_some());
+    }
+
+    #[tokio::test]
+    async fn model_config_from_searchable_config_preserves_top_k() {
+        use crate::config::{ModelConfig, ModelKind, ModelTagsOptions};
+
+        let pool = setup_pool().await;
+
+        let model = ModelConfig {
+            name: "topk-test".into(),
+            kind: ModelKind::Local,
+            backend: None,
+            path: Some("/models/test".into()),
+            base_url: None,
+            model_id: None,
+            api_key: None,
+            tags: Some(ModelTagsOptions {
+                threshold: 0.25,
+                top_k: Some(42),
+            }),
+            description: None,
+            classification: None,
+            remote: None,
+            onnx: None,
+        };
+        sync_model_configs(&pool, &[model]).await.unwrap();
+
+        let cfg = get_config_by_name_kind(&pool, "topk-test", "tags")
+            .await
+            .unwrap()
+            .expect("tags config should exist");
+
+        let reconstructed = model_config_from_searchable_config(&cfg).unwrap();
+        let tags = reconstructed.tags.expect("tags options should exist");
+        assert!((tags.threshold - 0.25).abs() < f32::EPSILON);
+        assert_eq!(tags.top_k, Some(42));
     }
 }
