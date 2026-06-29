@@ -127,7 +127,7 @@ fn show_general(ui: &mut egui::Ui, data: &PropertiesData, advanced: bool) {
                 .desired_width(f32::INFINITY),
         );
     });
-    ui.label(format!("Folder ID: {}", m.folder_id));
+    ui.label(format!("Folder: {}", data.folder_path));
     ui.label(format!("Dimensions: {}x{}", m.width.unwrap_or(0), m.height.unwrap_or(0)));
     ui.label(format!("Format: {}", m.format.as_deref().unwrap_or("unknown")));
     ui.label(format!("Size: {}", format_bytes(m.file_size.unwrap_or(0))));

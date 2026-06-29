@@ -24,6 +24,7 @@ pub struct MediaFile {
 #[derive(Debug, Clone)]
 pub struct PropertiesData {
     pub media: MediaFile,
+    pub folder_path: String,
     pub tags: HashMap<String, HashMap<String, f32>>,
     pub descriptions: HashMap<String, String>,
     pub classifications: HashMap<String, Vec<String>>,
@@ -187,6 +188,14 @@ pub async fn get_properties_data(
         .await?
         .context("media file not found")?;
 
+    let folder_path: String = sqlx::query_scalar(
+        "SELECT path FROM folders WHERE id = ?1"
+    )
+    .bind(media.folder_id)
+    .fetch_one(pool)
+    .await
+    .context("folder not found for media file")?;
+
     let tags_json: Option<String> = sqlx::query_scalar(
         "SELECT tags_json FROM media_files WHERE id = ?1"
     )
@@ -217,6 +226,7 @@ pub async fn get_properties_data(
 
     Ok(PropertiesData {
         media,
+        folder_path,
         tags,
         descriptions,
         classifications,
@@ -709,6 +719,7 @@ mod tests {
         let props = get_properties_data(&pool, id).await.unwrap();
         assert_eq!(props.media.id, id);
         assert_eq!(props.media.relative_path, "foo.jpg");
+        assert_eq!(props.folder_path, "/tmp/root");
 
         let source_tags = props.tags.get("wd-vit").expect("wd-vit tags missing");
         assert_eq!(source_tags.len(), 2);
