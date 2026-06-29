@@ -160,6 +160,24 @@ impl VlmArchitecture for Gemma4Architecture {
             gemma_config.audio_config = None;
         }
 
+        // candle-transformers 0.11.0's Gemma4 text MLP does not honor the
+        // `use_double_wide_mlp` flag. The E2B-it checkpoint doubles the MLP
+        // width (gate/up: 2*intermediate_size, down: hidden_size x 2*intermediate_size).
+        // Scale intermediate_size accordingly so the VarBuilder shape checks pass.
+        if raw_config
+            .get("text_config")
+            .and_then(|c| c.get("use_double_wide_mlp"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let original = gemma_config.text_config.intermediate_size;
+            let doubled = original * 2;
+            tracing::debug!(
+                "gemma4: use_double_wide_mlp=true; scaling intermediate_size {original} -> {doubled}"
+            );
+            gemma_config.text_config.intermediate_size = doubled;
+        }
+
         let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         let mmap = unsafe { MmapedSafetensors::multi(&files.weights_paths)? };
         let backend: Box<dyn SimpleBackend> = Box::new(RemappedSafetensors::new(mmap));
