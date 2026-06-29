@@ -258,6 +258,12 @@ pub async fn delete_tags_for_source(
         .execute(&mut *tx)
         .await?;
 
+    sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2")
+        .bind(media_file_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT tags_json FROM media_files WHERE id = ?1"
     )
