@@ -140,7 +140,7 @@ cache_fallback = "disable"
 # [[models]]
 # name = "gemma-4-E2B-it"
 # type = "local"
-# backend = "candle-gemma4"
+# backend = "candle"
 # path = "google/gemma-4-E2B-it"
 #
 # [models.description]

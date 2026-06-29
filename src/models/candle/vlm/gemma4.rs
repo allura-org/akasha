@@ -28,11 +28,7 @@ impl VlmArchitecture for Gemma4Architecture {
     }
 
     fn supports(&self, config: &ModelConfig) -> bool {
-        // Explicit backend hint.
-        if config.backend.as_deref() == Some("candle-gemma4") {
-            return true;
-        }
-        // Heuristic: model id/path contains "gemma-4" or "gemma4".
+        // Selected by name/path heuristic: model id/path contains "gemma-4" or "gemma4".
         let haystack = format!(
             "{} {} {}",
             config.name,
