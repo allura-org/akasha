@@ -17,6 +17,8 @@ pub mod stub;
 pub mod remote;
 #[cfg(feature = "onnx")]
 pub mod onnx;
+#[cfg(feature = "mistralrs")]
+pub mod mistralrs;
 
 #[derive(Debug, Clone)]
 pub enum ModelOutput {
@@ -55,6 +57,8 @@ impl BackendRegistry {
         let mut reg = Self::empty();
         #[cfg(feature = "remote")]
         reg.register(remote::RemoteBackend::new(remote));
+        #[cfg(feature = "mistralrs")]
+        reg.register(mistralrs::MistralRsBackend);
         #[cfg(feature = "candle")]
         reg.register(candle::CandleBackend);
         #[cfg(feature = "onnx")]
