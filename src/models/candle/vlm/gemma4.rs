@@ -194,6 +194,7 @@ impl VlmModel for Gemma4Vlm {
 
         let (pixel_values, vision_tokens) = self.preprocess_image(image_path)?;
         let mut tokens = self.build_prompt_tokens(prompt, vision_tokens)?;
+        let prompt_len = tokens.len();
 
         let mut logits_processor = build_logits_processor(
             299792458,
@@ -235,6 +236,16 @@ impl VlmModel for Gemma4Vlm {
             }
         }
 
-        decode_tokens(self.tokenizer.tokenizer(), &tokens)
+        let mut text = decode_tokens(self.tokenizer.tokenizer(), &tokens[prompt_len..])?;
+        let eos_str = self
+            .tokenizer
+            .tokenizer()
+            .id_to_token(eos_token)
+            .unwrap_or_default();
+        while !eos_str.is_empty() && text.ends_with(&eos_str) {
+            text.truncate(text.len() - eos_str.len());
+        }
+        text = text.trim_end().to_string();
+        Ok(text)
     }
 }
