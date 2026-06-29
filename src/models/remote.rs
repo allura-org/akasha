@@ -104,14 +104,8 @@ impl RemoteModel {
             }
         }
 
-        if let Some(k) = self.tags.as_ref().and_then(|t| t.top_k)
-            && tags.len() > k
-        {
-            let mut sorted: Vec<_> = tags.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            sorted.truncate(k);
-            tags = sorted.into_iter().collect();
-        }
+        let top_k = self.tags.as_ref().and_then(|t| t.top_k);
+        tags = crate::models::tagger::apply_top_k(tags, top_k);
 
         Ok(ModelOutput::Tags(tags))
     }

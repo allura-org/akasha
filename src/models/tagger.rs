@@ -38,6 +38,19 @@ fn labels_from_config(config: &serde_json::Value) -> Result<Vec<String>> {
     Ok(pairs.into_iter().map(|(_, label)| label).collect())
 }
 
+/// Keep only the `k` highest-scoring tags when `top_k` is set.
+pub fn apply_top_k(tags: HashMap<String, f32>, top_k: Option<usize>) -> HashMap<String, f32> {
+    match top_k {
+        Some(k) if tags.len() > k => {
+            let mut sorted: Vec<_> = tags.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.truncate(k);
+            sorted.into_iter().collect()
+        }
+        _ => tags,
+    }
+}
+
 /// Standard Hugging Face ViT image-classifier tagger.
 ///
 /// This uses the `candle_transformers` ViT implementation and applies a
@@ -160,14 +173,7 @@ impl Model for ViTTagger {
             }
         }
 
-        if let Some(k) = self.top_k {
-            if tags.len() > k {
-                let mut sorted: Vec<_> = tags.into_iter().collect();
-                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                sorted.truncate(k);
-                tags = sorted.into_iter().collect();
-            }
-        }
+        tags = apply_top_k(tags, self.top_k);
 
         tracing::info!(
             image = ?image_path,

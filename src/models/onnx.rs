@@ -236,12 +236,7 @@ impl Model for OrtModel {
             }
         }
 
-        if let Some(k) = self.top_k && tags.len() > k {
-            let mut sorted: Vec<_> = tags.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            sorted.truncate(k);
-            tags = sorted.into_iter().collect();
-        }
+        tags = crate::models::tagger::apply_top_k(tags, self.top_k);
 
         let mean_score = if !scores.is_empty() { sum_score / scores.len() as f32 } else { 0.0 };
 
