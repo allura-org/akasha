@@ -32,6 +32,7 @@ pub struct BrowserActions {
     pub settings_toggled: bool,
     pub show_in_file_manager: Option<String>,
     pub copy_to_clipboard: Option<String>,
+    pub open_properties: Option<i64>,
     pub sort_key_changed: Option<SortKey>,
     pub sort_order_changed: Option<SortOrder>,
     pub search_changed: Option<SearchQuery>,
@@ -203,6 +204,7 @@ impl BrowserPanel {
             settings_toggled: false,
             show_in_file_manager: None,
             copy_to_clipboard: None,
+            open_properties: None,
             sort_key_changed: None,
             sort_order_changed: None,
             search_changed: None,
@@ -469,6 +471,10 @@ impl BrowserPanel {
                                                     }
                                                     if ui.button("Copy to clipboard").clicked() {
                                                         actions.copy_to_clipboard = Some(media.absolute_path.clone());
+                                                        ui.close_menu();
+                                                    }
+                                                    if ui.button("Properties").clicked() {
+                                                        actions.open_properties = Some(media.id);
                                                         ui.close_menu();
                                                     }
                                                 });

@@ -1138,6 +1138,11 @@ impl eframe::App for AkashaApp {
                 self.push_toast("Image copied to clipboard".to_string(), ToastLevel::Info);
             }
         }
+        if let Some(media_id) = actions.open_properties {
+            self.properties_state.open = true;
+            self.properties_state.media_id = Some(media_id);
+            self.fetch_properties_data(media_id);
+        }
         if let Some(key) = actions.sort_key_changed {
             self.config.ui.sort_key = key;
             if let Err(e) = self.config.save() {
@@ -1192,6 +1197,11 @@ impl eframe::App for AkashaApp {
                     if resp.process_with_ai {
                         self.browser.media_processing_open = true;
                         self.browser.media_processing_target = Some(crate::ui::media_processing::MediaProcessingTarget::Single(media.id));
+                    }
+                    if resp.show_properties {
+                        self.properties_state.open = true;
+                        self.properties_state.media_id = Some(media.id);
+                        self.fetch_properties_data(media.id);
                     }
                 } else {
                     self.close_viewer();

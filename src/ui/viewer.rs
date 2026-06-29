@@ -10,6 +10,7 @@ pub struct ViewerResponse {
     pub show_in_file_manager: bool,
     pub copy_to_clipboard: bool,
     pub process_with_ai: bool,
+    pub show_properties: bool,
     pub context_menu_used: bool,
 }
 
@@ -28,6 +29,7 @@ pub fn show(
         show_in_file_manager: false,
         copy_to_clipboard: false,
         process_with_ai: false,
+        show_properties: false,
         context_menu_used: false,
     };
 
@@ -44,6 +46,9 @@ pub fn show(
         }
         if i.key_pressed(egui::Key::ArrowUp) {
             resp.cycle_scale_mode = true;
+        }
+        if i.key_pressed(egui::Key::I) {
+            resp.show_properties = true;
         }
     });
 
@@ -155,7 +160,7 @@ pub fn show(
                 }
 
                 // Nav cluster — exactly centered on screen
-                let nav_w = 320.0;
+                let nav_w = 420.0;
                 let nav_rect = egui::Rect::from_min_size(
                     egui::pos2(bottom_rect.center().x - nav_w / 2.0, y),
                     egui::vec2(nav_w, button_h),
@@ -163,6 +168,7 @@ pub fn show(
                 let mut prev_clicked = false;
                 let mut scale_clicked = false;
                 let mut next_clicked = false;
+                let mut properties_clicked = false;
                 ui.allocate_new_ui(egui::UiBuilder::new().max_rect(nav_rect), |ui| {
                     ui.horizontal_centered(|ui| {
                         prev_clicked = ui.button("< Previous").clicked();
@@ -177,12 +183,17 @@ pub fn show(
                         if next_clicked {
                             resp.next = true;
                         }
+                        properties_clicked = ui.button("Properties").clicked();
+                        if properties_clicked {
+                            resp.show_properties = true;
+                        }
                     });
                 });
                 let button_clicked = close_resp.clicked()
                     || prev_clicked
                     || scale_clicked
-                    || next_clicked;
+                    || next_clicked
+                    || properties_clicked;
 
                 // Info — snapped to bottom-right
                 let info_left = bottom_rect.center().x + nav_w / 2.0 + 20.0;
