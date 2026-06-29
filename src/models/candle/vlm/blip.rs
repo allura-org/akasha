@@ -1,5 +1,4 @@
-use std::path::Path;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::Device;
 
 use crate::config::ModelConfig;
