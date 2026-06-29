@@ -29,6 +29,7 @@ pub struct MediaProcessingAction {
     pub source_name: String,
     pub output_kind: String,
     pub model_name: String,
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +200,18 @@ pub fn show(
                     );
                 }
 
+                ui.add_space(8.0);
+                let overwrite_key = format!("media_processing_overwrite_{}", sub_tab.output_kind());
+                let mut overwrite: bool = ctx.memory_mut(|mem| {
+                    mem.data
+                        .get_persisted(egui::Id::new(&overwrite_key))
+                        .unwrap_or(false)
+                });
+                ui.checkbox(&mut overwrite, "Overwrite existing predictions");
+                ctx.memory_mut(|mem| {
+                    mem.data.insert_persisted(egui::Id::new(overwrite_key), overwrite);
+                });
+
                 ui.add_space(16.0);
                 let can_go = target.is_some();
                 if ui.add_enabled(can_go, egui::Button::new("Go")).clicked() {
@@ -208,6 +221,7 @@ pub fn show(
                             source_name: models[selected].name.clone(),
                             output_kind: sub_tab.output_kind().to_string(),
                             model_name: models[selected].name.clone(),
+                            overwrite,
                         });
                         close = true;
                     }
