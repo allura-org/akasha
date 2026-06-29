@@ -96,13 +96,13 @@ impl ViTTagger {
         // Memory-map the weights once and reuse the same mapping for metadata inspection and
         // model construction.
         let tensors = unsafe {
-            // SAFETY: `MmapedSafetensors::new` memory-maps the weight file. The underlying file
+            // SAFETY: `MmapedSafetensors::new` memory-maps the weight files. The underlying files
             // must not be modified, truncated, or deleted for the lifetime of the returned
             // `MmapedSafetensors` (and any tensors/models derived from it), or the process may
             // encounter undefined behavior from the OS memory mapping.
-            candle_core::safetensors::MmapedSafetensors::new(&files.weights_path)
+            candle_core::safetensors::MmapedSafetensors::multi(&files.weights_paths)
         }
-        .with_context(|| format!("failed to mmap weights: {}", files.weights_path.display()))?;
+        .with_context(|| format!("failed to mmap weights: {:?}", files.weights_paths))?;
 
         // Inspect the classifier head output dimension directly from the weights so mismatches
         // with the labels file fail fast instead of loading garbage.
