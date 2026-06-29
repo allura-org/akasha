@@ -227,6 +227,82 @@ pub async fn update_description_json(
     Ok(())
 }
 
+/// Delete all tags for a given media file and source, updating both
+/// `searchable_tags` and `media_files.tags_json`.
+pub async fn delete_tags_for_source(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    source: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2")
+        .bind(media_file_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT tags_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let mut map: serde_json::Map<String, serde_json::Value> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    map.remove(source);
+
+    sqlx::query("UPDATE media_files SET tags_json = ?1 WHERE id = ?2")
+        .bind(serde_json::to_string(&map)?)
+        .bind(media_file_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Delete a description for a given media file and source, updating both
+/// `searchable_text_fts` and `media_files.descriptions_json`.
+pub async fn delete_description_for_source(
+    pool: &SqlitePool,
+    media_file_id: i64,
+    source: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM searchable_text_fts WHERE media_file_id = ?1 AND source = ?2")
+        .bind(media_file_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
+    let existing: Option<String> = sqlx::query_scalar(
+        "SELECT descriptions_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let mut map: serde_json::Map<String, serde_json::Value> = existing
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    map.remove(source);
+
+    sqlx::query("UPDATE media_files SET descriptions_json = ?1 WHERE id = ?2")
+        .bind(serde_json::to_string(&map)?)
+        .bind(media_file_id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Delete all computed Searchable values for a media file. Useful on rescan/refresh.
 pub async fn delete_values_for_media(pool: &SqlitePool, media_file_id: i64) -> Result<u64> {
     let rows = sqlx::query("DELETE FROM searchable_values WHERE media_file_id = ?1")
@@ -633,6 +709,80 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count.0, 1);
+    }
+
+    #[tokio::test]
+    async fn delete_tags_for_source_cleans_column_and_side_table() {
+        let pool = setup_pool().await;
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+        let mid = crate::db::media::upsert(
+            &pool, fid, "a.jpg", "/tmp/a.jpg", "hash", None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("cat".to_string(), 0.9f32);
+        update_tags_json(&pool, mid, "wd-vit", tags).await.unwrap();
+
+        delete_tags_for_source(&pool, mid, "wd-vit").await.unwrap();
+
+        let row: (String,) = sqlx::query_as("SELECT tags_json FROM media_files WHERE id = ?1")
+            .bind(mid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!row.0.contains("wd-vit"));
+
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM searchable_tags WHERE media_file_id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count.0, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_description_for_source_cleans_column_and_fts() {
+        let pool = setup_pool().await;
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+        let mid = crate::db::media::upsert(
+            &pool, fid, "b.jpg", "/tmp/b.jpg", "hash", None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        update_description_json(&pool, mid, "blip", "a cat on a mat")
+            .await
+            .unwrap();
+
+        delete_description_for_source(&pool, mid, "blip").await.unwrap();
+
+        let row: (String,) =
+            sqlx::query_as("SELECT descriptions_json FROM media_files WHERE id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!row.0.contains("blip"));
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM searchable_text_fts WHERE media_file_id = ?1"
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 0);
     }
 
     #[tokio::test]

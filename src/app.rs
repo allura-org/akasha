@@ -790,6 +790,19 @@ impl AkashaApp {
                 }
             };
 
+            if action.overwrite {
+                for &media_id in &media_ids {
+                    let result = match action.output_kind.as_str() {
+                        "tags" => db::searchable::delete_tags_for_source(&pool, media_id, &action.source_name).await,
+                        "description" => db::searchable::delete_description_for_source(&pool, media_id, &action.source_name).await,
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        tracing::warn!(media_id, error = %e, "Failed to clear existing predictions");
+                    }
+                }
+            }
+
             let params = serde_json::json!({ "model_name": action.model_name }).to_string();
             let mut enqueued = 0usize;
             for media_id in media_ids {
