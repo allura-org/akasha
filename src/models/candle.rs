@@ -57,12 +57,7 @@ impl Backend for CandleBackend {
 
         match config.tags.as_ref() {
             Some(options) => {
-                let tagger = super::tagger::ViTTagger::load(
-                    &config.name,
-                    &files,
-                    device,
-                    options.threshold,
-                )?;
+                let tagger = super::tagger::ViTTagger::load(&config.name, &files, device, options)?;
                 Ok(Arc::new(tagger))
             }
             None => anyhow::bail!("candle backend only supports tags output kind right now"),

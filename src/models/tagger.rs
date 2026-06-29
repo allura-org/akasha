@@ -50,6 +50,7 @@ pub struct ViTTagger {
     device: Device,
     input_size: usize,
     threshold: f32,
+    top_k: Option<usize>,
 }
 
 impl ViTTagger {
@@ -57,7 +58,7 @@ impl ViTTagger {
         _name: &str,
         files: &loader::ModelFiles,
         device: Device,
-        threshold: f32,
+        options: &crate::config::ModelTagsOptions,
     ) -> Result<Self> {
         let config_text = std::fs::read_to_string(&files.config_path)
             .with_context(|| format!("failed to read config: {}", files.config_path.display()))?;
@@ -121,7 +122,8 @@ impl ViTTagger {
             labels,
             device,
             input_size: config.image_size,
-            threshold,
+            threshold: options.threshold,
+            top_k: options.top_k,
         })
     }
 }
@@ -158,6 +160,15 @@ impl Model for ViTTagger {
             }
         }
 
+        if let Some(k) = self.top_k {
+            if tags.len() > k {
+                let mut sorted: Vec<_> = tags.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                sorted.truncate(k);
+                tags = sorted.into_iter().collect();
+            }
+        }
+
         tracing::info!(
             image = ?image_path,
             labels = self.labels.len(),
@@ -188,7 +199,11 @@ mod manual_tests {
     fn vit_base_tagger_smoke() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+        let options = crate::config::ModelTagsOptions {
+            threshold: 0.1,
+            top_k: None,
+        };
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, &options)?;
 
         let output = tagger.infer(Path::new("test_imgs/dagnpats.png"))?;
         let ModelOutput::Tags(tags) = output else {
@@ -213,7 +228,11 @@ mod manual_tests {
     fn vit_base_tagger_default_threshold() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.35)?;
+        let options = crate::config::ModelTagsOptions {
+            threshold: 0.35,
+            top_k: None,
+        };
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, &options)?;
 
         let output = tagger.infer(Path::new("test_imgs/dagnpats.png"))?;
         let ModelOutput::Tags(tags) = output else {
@@ -237,7 +256,11 @@ mod manual_tests {
     fn vit_base_tagger_baseline() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+        let options = crate::config::ModelTagsOptions {
+            threshold: 0.1,
+            top_k: None,
+        };
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, &options)?;
 
         let image_paths: Vec<&str> = vec![
             "test_imgs/dagnpats.png",
