@@ -103,6 +103,8 @@ pub struct UiConfig {
     pub viewer_default_scale_mode: ViewerScaleMode,
     pub sort_key: SortKey,
     pub sort_order: SortOrder,
+    #[serde(default)]
+    pub show_advanced_media_properties: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +266,7 @@ impl Default for UiConfig {
             viewer_default_scale_mode: ViewerScaleMode::Smallest,
             sort_key: SortKey::Filename,
             sort_order: SortOrder::Ascending,
+            show_advanced_media_properties: false,
         }
     }
 }
