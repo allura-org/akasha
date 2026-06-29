@@ -149,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "candle")]
     fn parse_safetensors_index_returns_unique_sorted_files() {
         use std::io::Write;
         let temp = tempfile::tempdir().unwrap();
