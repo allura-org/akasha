@@ -133,3 +133,24 @@ cache_fallback = "disable"
 #
 # [models.description]
 # prompt = "Describe this image in one sentence."
+
+# Example: a local Gemma 4 vision-language model for image captioning.
+# Requires the `candle` feature. Model files are downloaded from HuggingFace on
+# first use and cached under `~/.local/share/akasha/models/`.
+# [[models]]
+# name = "gemma-4-E2B-it"
+# type = "local"
+# backend = "candle-gemma4"
+# path = "google/gemma-4-E2B-it"
+#
+# [models.description]
+# prompt = "Describe this image in one sentence."
+# max_tokens = 128
+# temperature = 0.7
+# top_p = 0.9
+# top_k = 20
+# repeat_penalty = 1.0
+# repeat_last_n = 64
+# # Optional per-channel normalization overrides. If omitted, pixels are scaled by 1/255.
+# # image_mean = [0.5, 0.5, 0.5]
+# # image_std = [0.5, 0.5, 0.5]

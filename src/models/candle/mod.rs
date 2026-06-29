@@ -28,7 +28,10 @@ impl VlmModelWrapper {
 
 impl Model for VlmModelWrapper {
     fn infer(&self, image_path: &Path) -> Result<ModelOutput> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VLM model mutex was poisoned"))?;
         let text = inner.generate(image_path, self.prompt.as_deref())?;
         Ok(ModelOutput::Description(text))
     }

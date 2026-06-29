@@ -4,22 +4,11 @@ use anyhow::Result;
 /// Based on the helper in candle-examples, reimplemented here to avoid that dependency.
 pub struct TokenOutputStream {
     tokenizer: tokenizers::Tokenizer,
-    tokens: Vec<u32>,
 }
 
 impl TokenOutputStream {
     pub fn new(tokenizer: tokenizers::Tokenizer) -> Self {
-        Self { tokenizer, tokens: Vec::new() }
-    }
-
-    pub fn push(&mut self, token: u32) {
-        self.tokens.push(token);
-    }
-
-    pub fn decode_all(&self) -> Result<String> {
-        self.tokenizer
-            .decode(&self.tokens, true)
-            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))
+        Self { tokenizer }
     }
 
     pub fn get_token(&self, text: &str) -> Option<u32> {
@@ -28,10 +17,6 @@ impl TokenOutputStream {
 
     pub fn tokenizer(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
-    }
-
-    pub fn clear(&mut self) {
-        self.tokens.clear();
     }
 }
 

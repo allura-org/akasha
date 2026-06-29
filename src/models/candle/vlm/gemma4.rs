@@ -2,8 +2,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
-use candle_transformers::models::gemma4::{self, config::Gemma4Config};
+use candle_transformers::models::gemma4::{
+    self,
+    config::{Gemma4Config, Gemma4VisionConfig},
+};
 use image::imageops::FilterType;
+use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use crate::config::{ModelConfig, ModelDescriptionOptions};
@@ -41,10 +45,11 @@ impl VlmArchitecture for Gemma4Architecture {
         files: &ModelFiles,
         device: &Device,
     ) -> Result<Box<dyn VlmModel>> {
+        let name = &config.name;
         let tokenizer_path = files
             .tokenizer_path
             .as_ref()
-            .context("Gemma4 requires a tokenizer.json file")?;
+            .with_context(|| format!("tokenizer.json not found for {name}"))?;
         let tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {tokenizer_path:?}: {e}"))?;
 
@@ -52,6 +57,9 @@ impl VlmArchitecture for Gemma4Architecture {
             .with_context(|| format!("failed to read config: {}", files.config_path.display()))?;
         let gemma_config: Gemma4Config = serde_json::from_str(&config_text)
             .with_context(|| "failed to parse Gemma4Config")?;
+        let raw_config: Value = serde_json::from_str(&config_text)
+            .with_context(|| "failed to parse raw config.json")?;
+        let eos_token_ids = parse_eos_token_ids(&raw_config);
 
         let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
         let vb = unsafe {
@@ -67,6 +75,7 @@ impl VlmArchitecture for Gemma4Architecture {
             config: gemma_config,
             generation: desc,
             device: device.clone(),
+            eos_token_ids,
         }))
     }
 }
@@ -77,115 +86,197 @@ pub struct Gemma4Vlm {
     config: Gemma4Config,
     generation: ModelDescriptionOptions,
     device: Device,
+    /// EOS token IDs parsed from raw config.json, if present.
+    eos_token_ids: Vec<u32>,
 }
 
 impl Gemma4Vlm {
     /// Preprocess the image and return the pixel tensor plus the number of vision
     /// tokens the Gemma 4 vision tower will produce for this resolution.
     fn preprocess_image(&self, path: &Path) -> Result<(Tensor, usize)> {
-        // Gemma 4 vision tower accepts any size divisible by patch_size.
-        // Resize longest side to a reasonable default; exact size should match the
-        // processor config and available memory. 896 keeps CPU inference tractable.
-        let target_longest = 896u32;
-        let patch_size = self.config.vision_config.patch_size as u32;
-        let pooling_kernel = self.config.vision_config.pooling_kernel_size as u32;
-
-        let img = image::open(path)
-            .with_context(|| format!("failed to open image: {}", path.display()))?;
-        let img = img.to_rgb8();
-        let (w, h) = img.dimensions();
-
-        let (new_w, new_h) = if w.max(h) > target_longest {
-            let scale = target_longest as f32 / w.max(h) as f32;
-            let nw = ((w as f32 * scale) as u32 / patch_size) * patch_size;
-            let nh = ((h as f32 * scale) as u32 / patch_size) * patch_size;
-            (nw.max(patch_size), nh.max(patch_size))
-        } else {
-            let nw = (w / patch_size) * patch_size;
-            let nh = (h / patch_size) * patch_size;
-            (nw.max(patch_size), nh.max(patch_size))
-        };
-
-        let img = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
-        let data: Vec<f32> = img
-            .pixels()
-            .flat_map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
-            .collect();
-
-        let tensor = Tensor::from_vec(data, (new_h as usize, new_w as usize, 3), &self.device)?
-            .permute((2, 0, 1))?
-            .unsqueeze(0)
-            .with_context(|| "failed to build image tensor")?;
-
-        let ph = (new_h / patch_size) as usize;
-        let pw = (new_w / patch_size) as usize;
-        let num_patches = ph * pw;
-        let vision_tokens = num_patches / (pooling_kernel as usize).pow(2);
-
-        Ok((tensor, vision_tokens.max(1)))
+        preprocess_image_with_config(
+            path,
+            &self.config.vision_config,
+            &self.generation,
+            &self.device,
+        )
     }
 
     fn build_prompt_tokens(&self, prompt: Option<&str>, vision_tokens: usize) -> Result<Vec<u32>> {
-        let prompt = prompt.unwrap_or("Describe this image.");
-        let t = self.tokenizer.tokenizer();
-
-        // Gemma 4 uses special tokens. Try the tokenizer vocab first, fall back to IDs from config.
-        let channel_id = self.tokenizer.get_token("<|channel|>");
-        let turn_id = self.tokenizer.get_token("<|turn|>");
-        let boi_id = self.tokenizer.get_token("<|image>");
-        let image_id = self
-            .tokenizer
-            .get_token("<|image|>")
-            .unwrap_or(self.config.image_token_id as u32);
-
-        let mut ids = Vec::new();
-        if let Some(id) = channel_id {
-            ids.push(id);
-        }
-        if let Some(id) = turn_id {
-            ids.push(id);
-        }
-        ids.extend(
-            t.encode("user\n", false)
-                .map_err(|e| anyhow::anyhow!("encode user: {e}"))?
-                .get_ids()
-                .iter()
-                .copied(),
-        );
-        if let Some(id) = boi_id {
-            ids.push(id);
-        }
-        for _ in 0..vision_tokens {
-            ids.push(image_id);
-        }
-        ids.extend(
-            t.encode(format!("\n{}\n", prompt), false)
-                .map_err(|e| anyhow::anyhow!("encode prompt: {e}"))?
-                .get_ids()
-                .iter()
-                .copied(),
-        );
-        if let Some(id) = turn_id {
-            ids.push(id);
-        }
-        ids.extend(
-            t.encode("model\n", false)
-                .map_err(|e| anyhow::anyhow!("encode model: {e}"))?
-                .get_ids()
-                .iter()
-                .copied(),
-        );
-
-        Ok(ids)
+        build_prompt_tokens(
+            self.tokenizer.tokenizer(),
+            self.config.image_token_id,
+            prompt,
+            vision_tokens,
+        )
     }
 
-    fn eos_token(&self) -> u32 {
-        // The Gemma 4 config lists EOS as token 1; prefer tokenizer vocab lookup, then default.
-        self.tokenizer
-            .get_token("</s>")
-            .or_else(|| self.tokenizer.get_token("<eos>"))
-            .unwrap_or(1)
+    fn eos_token(&self) -> Vec<u32> {
+        // Stop on any explicit EOS IDs from config.json, plus tokenizer vocab lookups.
+        // Default to ID 1 if nothing else is available.
+        let mut ids = self.eos_token_ids.clone();
+        if let Some(id) = self.tokenizer.get_token("</s>") {
+            ids.push(id);
+        }
+        if let Some(id) = self.tokenizer.get_token("<eos>") {
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            ids.push(1);
+        }
+        ids
     }
+}
+
+/// Preprocess the image and return the pixel tensor plus the number of vision
+/// tokens the Gemma 4 vision tower will produce for this resolution.
+///
+/// By default pixels are scaled by 1/255, matching the candle vision tower's
+/// internal [-1, 1] scaling path. If `image_mean` and `image_std` are both
+/// configured in `[models.description]`, the standard `(pixel/255 - mean) / std`
+/// normalization is applied per channel instead.
+fn preprocess_image_with_config(
+    path: &Path,
+    vision_config: &Gemma4VisionConfig,
+    generation: &ModelDescriptionOptions,
+    device: &Device,
+) -> Result<(Tensor, usize)> {
+    // Gemma 4 vision tower accepts any size divisible by patch_size.
+    // Resize longest side to a reasonable default; exact size should match the
+    // processor config and available memory. 896 keeps CPU inference tractable.
+    let target_longest = 896u32;
+    let patch_size = vision_config.patch_size as u32;
+    let pooling_kernel = vision_config.pooling_kernel_size as u32;
+
+    let img = image::open(path)
+        .with_context(|| format!("failed to open image: {}", path.display()))?;
+    let img = img.to_rgb8();
+    let (w, h) = img.dimensions();
+
+    let (new_w, new_h) = if w.max(h) > target_longest {
+        let scale = target_longest as f32 / w.max(h) as f32;
+        let nw = ((w as f32 * scale) as u32 / patch_size) * patch_size;
+        let nh = ((h as f32 * scale) as u32 / patch_size) * patch_size;
+        (nw.max(patch_size), nh.max(patch_size))
+    } else {
+        let nw = (w / patch_size) * patch_size;
+        let nh = (h / patch_size) * patch_size;
+        (nw.max(patch_size), nh.max(patch_size))
+    };
+
+    let img = image::imageops::resize(&img, new_w, new_h, FilterType::Lanczos3);
+    let normalize = generation.image_mean.as_ref().zip(generation.image_std.as_ref());
+    let data: Vec<f32> = if let Some((mean, std)) = normalize {
+        if mean.len() != 3 || std.len() != 3 {
+            anyhow::bail!("image_mean and image_std must each have exactly 3 channels");
+        }
+        img.pixels()
+            .flat_map(|p| {
+                [
+                    (p[0] as f32 / 255.0 - mean[0]) / std[0],
+                    (p[1] as f32 / 255.0 - mean[1]) / std[1],
+                    (p[2] as f32 / 255.0 - mean[2]) / std[2],
+                ]
+            })
+            .collect()
+    } else {
+        img.pixels()
+            .flat_map(|p| [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0])
+            .collect()
+    };
+
+    let tensor = Tensor::from_vec(data, (new_h as usize, new_w as usize, 3), device)?
+        .permute((2, 0, 1))?
+        .unsqueeze(0)
+        .with_context(|| "failed to build image tensor")?;
+
+    let ph = (new_h / patch_size) as usize;
+    let pw = (new_w / patch_size) as usize;
+    let num_patches = ph * pw;
+    let vision_tokens = num_patches / (pooling_kernel as usize).pow(2);
+
+    Ok((tensor, vision_tokens.max(1)))
+}
+
+fn build_prompt_tokens(
+    tokenizer: &Tokenizer,
+    image_token_id: usize,
+    prompt: Option<&str>,
+    vision_tokens: usize,
+) -> Result<Vec<u32>> {
+    let prompt = prompt.unwrap_or("Describe this image.");
+
+    // `tokenizers` 0.22 does not support `apply_chat_template`, so we manually
+    // construct the special-token framing. Revisit this if a chat-template library
+    // (e.g. minijinja) is added later.
+    // Gemma 4 uses special tokens. Try the tokenizer vocab first, fall back to IDs from config.
+    let vocab = tokenizer.get_vocab(true);
+    let channel_id = vocab.get("<|channel|>").copied();
+    let turn_id = vocab.get("<|turn|>").copied();
+    let boi_id = vocab.get("<|image>").copied();
+    let image_id = vocab
+        .get("<|image|>")
+        .copied()
+        .unwrap_or(image_token_id as u32);
+
+    let mut ids = Vec::new();
+    if let Some(id) = channel_id {
+        ids.push(id);
+    }
+    if let Some(id) = turn_id {
+        ids.push(id);
+    }
+    ids.extend(
+        tokenizer
+            .encode("user\n", false)
+            .map_err(|e| anyhow::anyhow!("encode user: {e}"))?
+            .get_ids()
+            .iter()
+            .copied(),
+    );
+    if let Some(id) = boi_id {
+        ids.push(id);
+    }
+    for _ in 0..vision_tokens {
+        ids.push(image_id);
+    }
+    ids.extend(
+        tokenizer
+            .encode(format!("\n{}\n", prompt), false)
+            .map_err(|e| anyhow::anyhow!("encode prompt: {e}"))?
+            .get_ids()
+            .iter()
+            .copied(),
+    );
+    if let Some(id) = turn_id {
+        ids.push(id);
+    }
+    ids.extend(
+        tokenizer
+            .encode("model\n", false)
+            .map_err(|e| anyhow::anyhow!("encode model: {e}"))?
+            .get_ids()
+            .iter()
+            .copied(),
+    );
+
+    Ok(ids)
+}
+
+fn parse_eos_token_ids(raw: &Value) -> Vec<u32> {
+    let mut ids = Vec::new();
+    if let Some(eos) = raw.get("eos_token_id") {
+        if let Some(arr) = eos.as_array() {
+            for v in arr {
+                if let Some(n) = v.as_u64() {
+                    ids.push(n as u32);
+                }
+            }
+        } else if let Some(n) = eos.as_u64() {
+            ids.push(n as u32);
+        }
+    }
+    ids
 }
 
 impl VlmModel for Gemma4Vlm {
@@ -203,10 +294,11 @@ impl VlmModel for Gemma4Vlm {
             self.generation.top_k,
         );
 
-        let eos_token = self.eos_token();
+        let eos_tokens = self.eos_token();
         let max_tokens = self.generation.max_tokens;
         let repeat_penalty = self.generation.repeat_penalty;
         let repeat_last_n = self.generation.repeat_last_n;
+        let pixel_values_slice: Vec<Tensor> = vec![pixel_values];
 
         for index in 0..max_tokens {
             let context_size = if index > 0 { 1 } else { tokens.len() };
@@ -215,7 +307,7 @@ impl VlmModel for Gemma4Vlm {
 
             let logits = self.model.forward_multimodal(
                 &input_ids,
-                Some(&[pixel_values.clone()]),
+                Some(&pixel_values_slice),
                 None,
                 None,
                 start_pos,
@@ -231,21 +323,111 @@ impl VlmModel for Gemma4Vlm {
             )?;
             tokens.push(next_token);
 
-            if next_token == eos_token {
+            if eos_tokens.contains(&next_token) {
                 break;
             }
         }
 
         let mut text = decode_tokens(self.tokenizer.tokenizer(), &tokens[prompt_len..])?;
-        let eos_str = self
-            .tokenizer
-            .tokenizer()
-            .id_to_token(eos_token)
+        let eos_str = eos_tokens
+            .first()
+            .and_then(|id| self.tokenizer.tokenizer().id_to_token(*id))
             .unwrap_or_default();
         while !eos_str.is_empty() && text.ends_with(&eos_str) {
             text.truncate(text.len() - eos_str.len());
         }
         text = text.trim_end().to_string();
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_vision_config(patch_size: usize, pooling_kernel_size: usize) -> Gemma4VisionConfig {
+        serde_json::from_value(serde_json::json!({
+            "patch_size": patch_size,
+            "pooling_kernel_size": pooling_kernel_size,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn preprocess_shape_and_vision_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("solid.png");
+        let img = image::RgbImage::from_pixel(144, 144, image::Rgb([128, 64, 32]));
+        img.save(&path).unwrap();
+
+        let vision_config = minimal_vision_config(16, 3);
+        let generation = ModelDescriptionOptions::default();
+        let device = Device::Cpu;
+
+        let (tensor, vision_tokens) =
+            preprocess_image_with_config(&path, &vision_config, &generation, &device).unwrap();
+
+        assert_eq!(tensor.dims4().unwrap(), (1, 3, 144, 144));
+        assert_eq!(vision_tokens, 9);
+    }
+
+    #[test]
+    fn preprocess_applies_mean_std_normalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("white.png");
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
+        img.save(&path).unwrap();
+
+        let vision_config = minimal_vision_config(16, 3);
+        let generation = ModelDescriptionOptions {
+            image_mean: Some(vec![0.5, 0.5, 0.5]),
+            image_std: Some(vec![0.5, 0.5, 0.5]),
+            ..Default::default()
+        };
+        let device = Device::Cpu;
+
+        let (tensor, _) =
+            preprocess_image_with_config(&path, &vision_config, &generation, &device).unwrap();
+        let flat = tensor.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for v in flat {
+            assert!((v - 1.0).abs() < 1e-5, "expected normalized white pixel to be 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn build_prompt_tokens_includes_image_token() {
+        let tokenizer_json = r#"
+        {
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 0, "content": "<|image|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<|image|>": 0, "user": 1, "model": 2, "\n": 3, "Desc": 4, "ribe": 5},
+                "unk_token": "<|image|>"
+            }
+        }
+        "#;
+        let tokenizer = Tokenizer::from_bytes(tokenizer_json).unwrap();
+        let tokens = build_prompt_tokens(&tokenizer, 258880, None, 2).unwrap();
+
+        assert!(!tokens.is_empty());
+        assert!(tokens.contains(&0), "expected prompt tokens to contain image token id 0");
+    }
+
+    #[test]
+    fn parse_eos_token_ids_from_array_and_scalar() {
+        let raw = serde_json::json!({"eos_token_id": [1, 106]});
+        assert_eq!(parse_eos_token_ids(&raw), vec![1, 106]);
+
+        let raw = serde_json::json!({"eos_token_id": 42});
+        assert_eq!(parse_eos_token_ids(&raw), vec![42]);
     }
 }
