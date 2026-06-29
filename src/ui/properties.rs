@@ -105,14 +105,32 @@ pub fn show(
     actions
 }
 
+fn format_bytes(bytes: i64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2} KiB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 fn show_general(ui: &mut egui::Ui, data: &PropertiesData, advanced: bool) {
     let m = &data.media;
     ui.label(format!("Filename: {}", std::path::Path::new(&m.relative_path).file_name().map(|s| s.to_string_lossy()).unwrap_or_default()));
-    ui.label(format!("Absolute path: {}", m.absolute_path));
+    ui.horizontal(|ui| {
+        ui.label("Absolute path:");
+        ui.add(
+            egui::TextEdit::singleline(&mut m.absolute_path.clone())
+                .desired_width(f32::INFINITY),
+        );
+    });
     ui.label(format!("Folder ID: {}", m.folder_id));
     ui.label(format!("Dimensions: {}x{}", m.width.unwrap_or(0), m.height.unwrap_or(0)));
     ui.label(format!("Format: {}", m.format.as_deref().unwrap_or("unknown")));
-    ui.label(format!("Size: {} bytes", m.file_size.unwrap_or(0)));
+    ui.label(format!("Size: {}", format_bytes(m.file_size.unwrap_or(0))));
     ui.label(format!("Created: {}", m.created_at));
     if let Some(modified) = m.modified_at {
         ui.label(format!("Modified: {}", modified));
