@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{safetensors::MmapedSafetensors, DType, Device, Shape, Tensor};
+use candle_nn::var_builder::{SimpleBackend, VarBuilderArgs};
 use candle_transformers::models::gemma4::{
     self,
     config::{Gemma4Config, Gemma4VisionConfig},
@@ -19,6 +20,83 @@ use crate::models::loader::ModelFiles;
 
 use super::token_stream::{decode_tokens, TokenOutputStream};
 use super::{build_logits_processor, sample_next, VlmArchitecture, VlmModel};
+
+/// Custom `SimpleBackend` that transparently maps the unwrapped tensor names
+/// used by `candle-transformers` to the `*.linear.weight` names produced by
+/// Gemma 4's `Gemma4ClippableLinear` wrapper.
+///
+/// The clamp buffers (`input_max`, `output_max`, ...) are ignored; we load the
+/// inner `linear.weight` and run inference without input/output clipping. This
+/// matches the common "unwrap ClippableLinear" workaround used by PEFT and
+/// vLLM for Gemma 4 checkpoints.
+struct RemappedSafetensors(MmapedSafetensors);
+
+impl RemappedSafetensors {
+    fn new(mmap: MmapedSafetensors) -> Self {
+        Self(mmap)
+    }
+
+    /// If `name` exists in the checkpoint use it directly. Otherwise, if it is
+    /// a `.weight` tensor, try the equivalent `*.linear.weight` path used by
+    /// Gemma 4's clippable linears.
+    fn resolve(&self, name: &str) -> String {
+        if self.0.get(name).is_ok() {
+            return name.to_string();
+        }
+        if name.ends_with(".weight") {
+            let prefix = &name[..name.len() - ".weight".len()];
+            let linear_name = format!("{prefix}.linear.weight");
+            if self.0.get(&linear_name).is_ok() {
+                return linear_name;
+            }
+        }
+        name.to_string()
+    }
+}
+
+impl SimpleBackend for RemappedSafetensors {
+    fn get(
+        &self,
+        s: Shape,
+        name: &str,
+        _init: candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let name = self.resolve(name);
+        let tensor = self.0.load(&name, dev)?.to_dtype(dtype)?;
+        if tensor.shape() != &s {
+            return Err(candle_core::Error::UnexpectedShape {
+                msg: format!("shape mismatch for {name}"),
+                expected: s,
+                got: tensor.shape().clone(),
+            }
+            .bt());
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let name = self.resolve(name);
+        self.0.load(&name, dev)?.to_dtype(dtype)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        if self.0.get(name).is_ok() {
+            return true;
+        }
+        if name.ends_with(".weight") {
+            let prefix = &name[..name.len() - ".weight".len()];
+            return self.0.get(&format!("{prefix}.linear.weight")).is_ok();
+        }
+        false
+    }
+}
 
 pub struct Gemma4Architecture;
 
@@ -55,16 +133,24 @@ impl VlmArchitecture for Gemma4Architecture {
 
         let config_text = std::fs::read_to_string(&files.config_path)
             .with_context(|| format!("failed to read config: {}", files.config_path.display()))?;
-        let gemma_config: Gemma4Config = serde_json::from_str(&config_text)
+        let mut gemma_config: Gemma4Config = serde_json::from_str(&config_text)
             .with_context(|| "failed to parse Gemma4Config")?;
         let raw_config: Value = serde_json::from_str(&config_text)
             .with_context(|| "failed to parse raw config.json")?;
         let eos_token_ids = parse_eos_token_ids(&raw_config);
 
+        // Akasha only uses the vision tower for image description, so skip the
+        // audio tower entirely. This also avoids loading its ClippableLinear
+        // wrapped weights, which candle-transformers 0.11.0 does not support.
+        if gemma_config.audio_config.is_some() {
+            tracing::debug!("gemma4: dropping audio_config; audio tower not needed");
+            gemma_config.audio_config = None;
+        }
+
         let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&files.weights_paths, dtype, device)?
-        };
+        let mmap = unsafe { MmapedSafetensors::multi(&files.weights_paths)? };
+        let backend: Box<dyn SimpleBackend> = Box::new(RemappedSafetensors::new(mmap));
+        let vb = VarBuilderArgs::new_with_args(backend, dtype, device);
         let model = gemma4::Model::new(&gemma_config, vb)?;
 
         let desc = config.description.clone().unwrap_or_default();
@@ -351,6 +437,8 @@ impl VlmModel for Gemma4Vlm {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     fn minimal_vision_config(patch_size: usize, pooling_kernel_size: usize) -> Gemma4VisionConfig {
@@ -437,5 +525,39 @@ mod tests {
 
         let raw = serde_json::json!({"eos_token_id": 42});
         assert_eq!(parse_eos_token_ids(&raw), vec![42]);
+    }
+
+    #[test]
+    fn remapped_backend_loads_clippable_linear_weight() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("clippable.safetensors");
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "vision.encoder.layers.0.self_attn.q_proj.linear.weight".to_string(),
+            Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "vision.encoder.layers.0.self_attn.q_proj.input_max".to_string(),
+            Tensor::new(1.0f32, &Device::Cpu).unwrap(),
+        );
+        tensors.insert(
+            "vision.encoder.layers.0.input_layernorm.weight".to_string(),
+            Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&tensors, &path).unwrap();
+
+        let mmap = unsafe { MmapedSafetensors::multi(&[path]).unwrap() };
+        let backend: Box<dyn SimpleBackend> = Box::new(RemappedSafetensors::new(mmap));
+        let vb = VarBuilderArgs::new_with_args(backend, DType::F32, &Device::Cpu);
+
+        let weight = vb
+            .get((4, 4), "vision.encoder.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(weight.dims(), &[4, 4]);
+
+        let norm = vb
+            .get(4, "vision.encoder.layers.0.input_layernorm.weight")
+            .unwrap();
+        assert_eq!(norm.dims(), &[4]);
     }
 }
