@@ -787,6 +787,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 0);
+
+        let fts_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM searchable_tags_fts WHERE media_file_id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(fts_count.0, 0);
     }
 
     #[tokio::test]
