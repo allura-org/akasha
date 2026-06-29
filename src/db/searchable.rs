@@ -161,6 +161,13 @@ pub async fn update_tags_json(
         .execute(&mut *tx)
         .await?;
 
+    // Keep the FTS5 trigram side table in sync with searchable_tags.
+    sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2")
+        .bind(media_file_id)
+        .bind(source)
+        .execute(&mut *tx)
+        .await?;
+
     for (tag, score) in tags {
         sqlx::query(
             "INSERT INTO searchable_tags (media_file_id, source, tag, score)
@@ -168,8 +175,17 @@ pub async fn update_tags_json(
         )
         .bind(media_file_id)
         .bind(source)
-        .bind(tag)
+        .bind(tag.as_str())
         .bind(score)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO searchable_tags_fts (tag, media_file_id, source) VALUES (?1, ?2, ?3)"
+        )
+        .bind(tag.as_str())
+        .bind(media_file_id)
+        .bind(source)
         .execute(&mut *tx)
         .await?;
     }
@@ -673,6 +689,26 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 1);
+
+        let fts_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2"
+        )
+        .bind(mid)
+        .bind("wd-vit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fts_count.0, 1);
+
+        let fts_tag: (String,) = sqlx::query_as(
+            "SELECT tag FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2"
+        )
+        .bind(mid)
+        .bind("wd-vit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fts_tag.0, "cat");
     }
 
     #[tokio::test]
