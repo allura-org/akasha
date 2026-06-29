@@ -7,7 +7,7 @@ edition = "2024"
 default = ["simd-thumbnails", "remote", "candle", "onnx"]
 hevc = ["dep:libheif-rs"]
 simd-thumbnails = ["dep:fast_image_resize", "dep:webp"]
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub"]
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
 remote = ["dep:reqwest", "dep:base64"]
 onnx = ["dep:ort", "dep:ndarray", "dep:csv", "dep:hf-hub"]
 cuda = ["candle", "candle-core/cuda"]
@@ -80,10 +80,11 @@ fast_image_resize = { version = "6.0.0", default-features = false, features = ["
 webp = { version = "0.3.1", optional = true }
 
 # Local inference (opt-in)
-candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
+candle-core = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
+candle-transformers = { version = "0.11.0", optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"], optional = true }
 
 # Remote inference (opt-in)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
