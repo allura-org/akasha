@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use anyhow::Context;
 use futures_util::stream::TryStreamExt;
 use sqlx::SqlitePool;
 
@@ -176,6 +177,51 @@ pub async fn get_by_id(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Medi
     .await?;
 
     Ok(row.map(into_media))
+}
+
+pub async fn get_properties_data(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> anyhow::Result<PropertiesData> {
+    let media = get_by_id(pool, media_file_id)
+        .await?
+        .context("media file not found")?;
+
+    let tags_json: Option<String> = sqlx::query_scalar(
+        "SELECT tags_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_one(pool)
+    .await?;
+
+    let tags: HashMap<String, HashMap<String, f32>> = tags_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let descriptions_json: Option<String> = sqlx::query_scalar(
+        "SELECT descriptions_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_one(pool)
+    .await?;
+
+    let descriptions: HashMap<String, String> = descriptions_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    // Classifications and embeddings stored similarly once wired.
+    let classifications: HashMap<String, Vec<String>> = HashMap::new();
+    let embeddings: Vec<String> = Vec::new();
+
+    Ok(PropertiesData {
+        media,
+        tags,
+        descriptions,
+        classifications,
+        embeddings,
+    })
 }
 
 pub async fn get_by_path(
@@ -483,6 +529,7 @@ fn into_summary(row: MediaSummaryRow) -> MediaSummary {
 mod tests {
     use super::*;
     use crate::db::folder;
+    use crate::db::searchable;
 
     async fn setup_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -624,5 +671,55 @@ mod tests {
         let all = list_by_folder(&pool, fid).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].relative_path, "present.jpg");
+    }
+
+    #[tokio::test]
+    async fn get_properties_data_returns_tags_and_descriptions() {
+        let pool = setup_pool().await;
+        let fid = folder::insert(&pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+
+        let id = upsert(
+            &pool,
+            fid,
+            "foo.jpg",
+            "/tmp/root/foo.jpg",
+            "hash",
+            Some(100),
+            Some(200),
+            Some("jpeg"),
+            Some(1024),
+            Some(chrono::Local::now().naive_local()),
+        )
+        .await
+        .unwrap();
+
+        let mut tags = HashMap::new();
+        tags.insert("cat".to_string(), 0.95f32);
+        tags.insert("dog".to_string(), 0.23f32);
+        searchable::update_tags_json(&pool, id, "wd-vit", tags.clone())
+            .await
+            .unwrap();
+
+        searchable::update_description_json(&pool, id, "blip", "a cat on a mat")
+            .await
+            .unwrap();
+
+        let props = get_properties_data(&pool, id).await.unwrap();
+        assert_eq!(props.media.id, id);
+        assert_eq!(props.media.relative_path, "foo.jpg");
+
+        let source_tags = props.tags.get("wd-vit").expect("wd-vit tags missing");
+        assert_eq!(source_tags.len(), 2);
+        assert!((source_tags.get("cat").copied().unwrap() - 0.95f32).abs() < f32::EPSILON);
+        assert!((source_tags.get("dog").copied().unwrap() - 0.23f32).abs() < f32::EPSILON);
+
+        assert_eq!(
+            props.descriptions.get("blip"),
+            Some(&"a cat on a mat".to_string())
+        );
+        assert!(props.classifications.is_empty());
+        assert!(props.embeddings.is_empty());
     }
 }
