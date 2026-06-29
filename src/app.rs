@@ -64,6 +64,13 @@ pub struct AkashaApp {
     pub viewer_just_opened: bool,
     pub pending_viewer_images: HashSet<String>,
 
+    pub properties_state: crate::ui::properties::PropertiesState,
+    pub properties_data: Option<crate::db::media::PropertiesData>,
+    pub properties_fetch_in_progress: bool,
+    properties_last_id: Option<i64>,
+    pub properties_tx: tokio::sync::mpsc::UnboundedSender<(i64, crate::db::media::PropertiesData)>,
+    properties_rx: tokio::sync::mpsc::UnboundedReceiver<(i64, crate::db::media::PropertiesData)>,
+
     pub toasts: Vec<Toast>,
 }
 
@@ -102,6 +109,7 @@ impl AkashaApp {
         let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
         let (jobs_count_tx, jobs_count_rx) = std::sync::mpsc::channel::<usize>();
+        let (properties_tx, properties_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Background ticker: report pending/running job count every few seconds.
         {
@@ -256,6 +264,12 @@ impl AkashaApp {
             viewer_scale_mode: crate::config::ViewerScaleMode::Fit,
             viewer_just_opened: false,
             pending_viewer_images: HashSet::new(),
+            properties_state: crate::ui::properties::PropertiesState::default(),
+            properties_data: None,
+            properties_fetch_in_progress: false,
+            properties_last_id: None,
+            properties_tx,
+            properties_rx,
             toasts: Vec::new(),
         };
 
@@ -314,6 +328,21 @@ impl AkashaApp {
         self.rt.spawn(async move {
             let result = db::folder::list_all(&pool).await;
             let _ = tx.send(result.map_err(|e| e.to_string()));
+        });
+    }
+
+    fn fetch_properties_data(&self, media_id: i64) {
+        let pool = Arc::clone(&self.pool);
+        let tx = self.properties_tx.clone();
+        self.rt.spawn(async move {
+            match db::media::get_properties_data(&pool, media_id).await {
+                Ok(data) => {
+                    let _ = tx.send((media_id, data));
+                }
+                Err(e) => {
+                    tracing::warn!(media_id, error = %e, "Failed to fetch properties data");
+                }
+            }
         });
     }
 
@@ -733,6 +762,32 @@ impl AkashaApp {
         }
     }
 
+    fn update_properties(&mut self) {
+        while let Ok((media_id, data)) = self.properties_rx.try_recv() {
+            if self.properties_state.media_id == Some(media_id) {
+                self.properties_data = Some(data);
+                self.properties_fetch_in_progress = false;
+            }
+        }
+
+        if !self.properties_state.open {
+            return;
+        }
+
+        let current_id = self.properties_state.media_id;
+        if current_id == self.properties_last_id {
+            return;
+        }
+        self.properties_last_id = current_id;
+        self.properties_data = None;
+        self.properties_fetch_in_progress = false;
+
+        if let Some(id) = current_id {
+            self.properties_fetch_in_progress = true;
+            self.fetch_properties_data(id);
+        }
+    }
+
     fn push_toast(&mut self, message: String, level: ToastLevel) {
         self.toasts.push(Toast {
             message,
@@ -1015,6 +1070,7 @@ impl eframe::App for AkashaApp {
         self.poll_media_events();
         self.poll_thumbnail_events(ctx);
         self.poll_viewer_images(ctx);
+        self.update_properties();
         while let Ok(count) = self.jobs_count_rx.try_recv() {
             self.browser.pending_jobs = count;
         }
@@ -1190,6 +1246,16 @@ impl eframe::App for AkashaApp {
                     self.push_toast(format!("Failed to save config: {}", e), ToastLevel::Error);
                 }
             }
+        }
+
+        if self.properties_state.open {
+            let _ = crate::ui::properties::show(
+                ctx,
+                &mut self.properties_state.open,
+                self.properties_state.media_id,
+                self.properties_data.as_ref(),
+                self.config.ui.show_advanced_media_properties,
+            );
         }
 
         if self.browser.media_processing_open {
