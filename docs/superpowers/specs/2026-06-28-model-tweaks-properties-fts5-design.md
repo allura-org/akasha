@@ -1,6 +1,6 @@
 # Design: Model Tweaks, Properties Window, and FTS5 Tag Search
 
-Date: 2026-06-27
+Date: 2026-06-28
 
 ## Overview
 
