@@ -36,9 +36,12 @@ impl RemappedSafetensors {
         Self(mmap)
     }
 
-    /// If `name` exists in the checkpoint use it directly. Otherwise, if it is
-    /// a `.weight` tensor, try the equivalent `*.linear.weight` path used by
-    /// Gemma 4's clippable linears.
+    /// If `name` exists in the checkpoint use it directly. Otherwise try the
+    /// known Gemma 4 key mappings:
+    /// - `*.weight` -> `*.linear.weight` for ClippableLinear wrapped layers.
+    /// - `*.language_model.model.*` -> `*.language_model.*` because the official
+    ///   checkpoint stores text weights directly under `language_model`, while
+    ///   candle-transformers expects an extra `model` sub-prefix.
     fn resolve(&self, name: &str) -> String {
         if self.0.get(name).is_ok() {
             return name.to_string();
@@ -49,6 +52,10 @@ impl RemappedSafetensors {
             if self.0.get(&linear_name).is_ok() {
                 return linear_name;
             }
+        }
+        let flattened_lm = name.replace(".language_model.model.", ".language_model.");
+        if flattened_lm != name && self.0.get(&flattened_lm).is_ok() {
+            return flattened_lm;
         }
         name.to_string()
     }
@@ -92,7 +99,13 @@ impl SimpleBackend for RemappedSafetensors {
         }
         if name.ends_with(".weight") {
             let prefix = &name[..name.len() - ".weight".len()];
-            return self.0.get(&format!("{prefix}.linear.weight")).is_ok();
+            if self.0.get(&format!("{prefix}.linear.weight")).is_ok() {
+                return true;
+            }
+        }
+        let flattened_lm = name.replace(".language_model.model.", ".language_model.");
+        if flattened_lm != name {
+            return self.0.get(&flattened_lm).is_ok();
         }
         false
     }
@@ -544,6 +557,10 @@ mod tests {
             "vision.encoder.layers.0.input_layernorm.weight".to_string(),
             Tensor::zeros(4, DType::F32, &Device::Cpu).unwrap(),
         );
+        tensors.insert(
+            "model.language_model.embed_tokens.weight".to_string(),
+            Tensor::zeros((8, 4), DType::F32, &Device::Cpu).unwrap(),
+        );
         candle_core::safetensors::save(&tensors, &path).unwrap();
 
         let mmap = unsafe { MmapedSafetensors::multi(&[path]).unwrap() };
@@ -559,5 +576,12 @@ mod tests {
             .get(4, "vision.encoder.layers.0.input_layernorm.weight")
             .unwrap();
         assert_eq!(norm.dims(), &[4]);
+
+        // TextModel adds an extra "model" prefix that doesn't exist in the
+        // official checkpoint.
+        let embed = vb
+            .get((8, 4), "model.language_model.model.embed_tokens.weight")
+            .unwrap();
+        assert_eq!(embed.dims(), &[8, 4]);
     }
 }
