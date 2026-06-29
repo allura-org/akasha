@@ -52,6 +52,7 @@ impl Backend for RemoteBackend {
             model_id: model_id.to_string(),
             api_key: config.api_key.clone(),
             endpoints,
+            tags: config.tags.clone(),
         }))
     }
 }
@@ -62,6 +63,7 @@ struct RemoteModel {
     model_id: String,
     api_key: Option<String>,
     endpoints: crate::config::ModelRemoteOptions,
+    tags: Option<crate::config::ModelTagsOptions>,
 }
 
 impl Model for RemoteModel {
@@ -101,6 +103,16 @@ impl RemoteModel {
                 }
             }
         }
+
+        if let Some(k) = self.tags.as_ref().and_then(|t| t.top_k)
+            && tags.len() > k
+        {
+            let mut sorted: Vec<_> = tags.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.truncate(k);
+            tags = sorted.into_iter().collect();
+        }
+
         Ok(ModelOutput::Tags(tags))
     }
 }
@@ -123,7 +135,7 @@ mod tests {
             base_url: Some("https://example.com".into()),
             model_id: Some("m1".into()),
             api_key: None,
-            tags: Some(ModelTagsOptions { threshold: 0.35 }),
+            tags: Some(ModelTagsOptions { threshold: 0.35, top_k: None }),
             description: None,
             classification: None,
             remote: Some(ModelRemoteOptions::default()),
@@ -161,7 +173,7 @@ mod tests {
             base_url: Some(format!("http://127.0.0.1:{}", port)),
             model_id: Some("stub-model".into()),
             api_key: None,
-            tags: Some(ModelTagsOptions { threshold: 0.35 }),
+            tags: Some(ModelTagsOptions { threshold: 0.35, top_k: None }),
             description: None,
             classification: None,
             remote: Some(ModelRemoteOptions::default()),
@@ -179,6 +191,60 @@ mod tests {
             ModelOutput::Tags(tags) => {
                 assert!((tags.get("tag_a").copied().unwrap_or(0.0) - 0.9).abs() < 1e-6);
                 assert!((tags.get("tag_b").copied().unwrap_or(0.0) - 0.5).abs() < 1e-6);
+            }
+            other => panic!("expected ModelOutput::Tags, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn remote_backend_http_stub_applies_top_k() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"tag_a": 0.9, "tag_b": 0.5, "tag_c": 0.7}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        let temp_path = std::env::temp_dir().join("akasha_remote_stub_topk_test.bin");
+        std::fs::write(&temp_path, b"fake-image-bytes").expect("write temp file");
+
+        let config = ModelConfig {
+            name: "remote-stub-topk".into(),
+            kind: ModelKind::Remote,
+            backend: None,
+            path: None,
+            base_url: Some(format!("http://127.0.0.1:{}", port)),
+            model_id: Some("stub-model".into()),
+            api_key: None,
+            tags: Some(ModelTagsOptions { threshold: 0.35, top_k: Some(2) }),
+            description: None,
+            classification: None,
+            remote: Some(ModelRemoteOptions::default()),
+            onnx: None,
+        };
+
+        let output = RemoteBackend::new(RemoteConfig::default())
+            .load(&config)
+            .expect("load")
+            .infer(&temp_path)
+            .expect("infer");
+        std::fs::remove_file(&temp_path).ok();
+
+        match output {
+            ModelOutput::Tags(tags) => {
+                assert_eq!(tags.len(), 2);
+                assert!(tags.contains_key("tag_a"));
+                assert!(tags.contains_key("tag_c"));
+                assert!(!tags.contains_key("tag_b"));
             }
             other => panic!("expected ModelOutput::Tags, got {:?}", other),
         }

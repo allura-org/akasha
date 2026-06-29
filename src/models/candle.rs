@@ -86,7 +86,7 @@ mod tests {
             base_url: None,
             model_id: None,
             api_key: None,
-            tags: Some(ModelTagsOptions { threshold: 0.1 }),
+            tags: Some(ModelTagsOptions { threshold: 0.1, top_k: None }),
             description: None,
             classification: None,
             remote: None,

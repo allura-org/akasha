@@ -188,6 +188,8 @@ pub struct ModelOnnxOptions {
 pub struct ModelTagsOptions {
     #[serde(default = "default_threshold")]
     pub threshold: f32,
+    #[serde(default = "default_top_k")]
+    pub top_k: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,10 +204,15 @@ fn default_threshold() -> f32 {
     0.35
 }
 
+fn default_top_k() -> Option<usize> {
+    Some(100)
+}
+
 impl Default for ModelTagsOptions {
     fn default() -> Self {
         Self {
             threshold: default_threshold(),
+            top_k: default_top_k(),
         }
     }
 }
@@ -375,6 +382,7 @@ threshold = 0.35
         assert_eq!(config.models.models[0].kind, ModelKind::Local);
         assert_eq!(config.models.models[0].path.as_deref(), Some("SmilingWolf/wd-vit-tagger-v3"));
         assert_eq!(config.models.models[0].tags.as_ref().unwrap().threshold, 0.35);
+        assert_eq!(config.models.models[0].tags.as_ref().unwrap().top_k, Some(100));
     }
 
     #[test]
