@@ -197,18 +197,31 @@ fn show_tags(ui: &mut egui::Ui, data: &PropertiesData) {
         mem.data.insert_persisted(egui::Id::new("properties_tags_source"), selected);
     });
 
+    if sources.is_empty() {
+        ui.label("No tags available.");
+        return;
+    }
+
     if let Some(source) = sources.get(selected) {
         if let Some(tags) = data.tags.get(source) {
+            if tags.is_empty() {
+                ui.label("No tags for this source.");
+                return;
+            }
             let mut sorted: Vec<_> = tags.iter().collect();
             sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (tag, score) in sorted {
-                ui.horizontal(|ui| {
-                    ui.label(tag);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("{:.3}", score));
-                    });
+            egui::ScrollArea::vertical()
+                .max_height(ui.available_height())
+                .show(ui, |ui| {
+                    for (tag, score) in sorted {
+                        ui.horizontal(|ui| {
+                            ui.label(tag);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(format!("{:.3}", score));
+                            });
+                        });
+                    }
                 });
-            }
         }
     }
 }
@@ -227,6 +240,11 @@ fn show_descriptions(ui: &mut egui::Ui, data: &PropertiesData) {
     ui.memory_mut(|mem| {
         mem.data.insert_persisted(egui::Id::new("properties_desc_source"), selected);
     });
+
+    if sources.is_empty() {
+        ui.label("No descriptions available.");
+        return;
+    }
 
     if let Some(source) = sources.get(selected) {
         if let Some(text) = data.descriptions.get(source) {
@@ -255,10 +273,19 @@ fn show_classifications(ui: &mut egui::Ui, data: &PropertiesData) {
         mem.data.insert_persisted(egui::Id::new("properties_cls_source"), selected);
     });
 
+    if sources.is_empty() {
+        ui.label("No classifications available.");
+        return;
+    }
+
     if let Some(source) = sources.get(selected) {
         if let Some(classes) = data.classifications.get(source) {
-            for class in classes {
-                ui.label(class);
+            if classes.is_empty() {
+                ui.label("No classifications for this source.");
+            } else {
+                for class in classes {
+                    ui.label(class);
+                }
             }
         }
     }
