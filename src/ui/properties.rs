@@ -23,20 +23,10 @@ impl PropertiesTab {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PropertiesState {
     pub open: bool,
     pub media_id: Option<i64>,
-}
-
-impl Default for PropertiesState {
-    fn default() -> Self {
-        Self { open: false, media_id: None }
-    }
-}
-
-pub enum PropertiesAction {
-    Open(i64),
 }
 
 pub fn show(
@@ -45,9 +35,7 @@ pub fn show(
     media_id: Option<i64>,
     data: Option<&PropertiesData>,
     advanced: bool,
-) -> Vec<PropertiesAction> {
-    let mut actions = Vec::new();
-
+) {
     egui::Window::new("Properties")
         .open(open)
         .resizable(true)
@@ -55,7 +43,7 @@ pub fn show(
         .default_width(500.0)
         .default_height(600.0)
         .show(ctx, |ui| {
-            let Some(media_id) = media_id else {
+            let Some(_media_id) = media_id else {
                 ui.label("No media selected.");
                 return;
             };
@@ -101,8 +89,6 @@ pub fn show(
                 }
             });
         });
-
-    actions
 }
 
 fn format_bytes(bytes: i64) -> String {
@@ -202,28 +188,32 @@ fn show_tags(ui: &mut egui::Ui, data: &PropertiesData) {
         return;
     }
 
-    if let Some(source) = sources.get(selected) {
-        if let Some(tags) = data.tags.get(source) {
-            if tags.is_empty() {
-                ui.label("No tags for this source.");
-                return;
-            }
-            let mut sorted: Vec<_> = tags.iter().collect();
-            sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
-            egui::ScrollArea::vertical()
-                .max_height(ui.available_height())
-                .show(ui, |ui| {
-                    for (tag, score) in sorted {
-                        ui.horizontal(|ui| {
-                            ui.label(tag);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(format!("{:.3}", score));
-                            });
-                        });
-                    }
-                });
-        }
+    let Some(tags) = sources
+        .get(selected)
+        .and_then(|source| data.tags.get(source))
+    else {
+        return;
+    };
+
+    if tags.is_empty() {
+        ui.label("No tags for this source.");
+        return;
     }
+
+    let mut sorted: Vec<_> = tags.iter().collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+    egui::ScrollArea::vertical()
+        .max_height(ui.available_height())
+        .show(ui, |ui| {
+            for (tag, score) in sorted {
+                ui.horizontal(|ui| {
+                    ui.label(tag);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!("{:.3}", score));
+                    });
+                });
+            }
+        });
 }
 
 fn show_descriptions(ui: &mut egui::Ui, data: &PropertiesData) {
@@ -246,16 +236,19 @@ fn show_descriptions(ui: &mut egui::Ui, data: &PropertiesData) {
         return;
     }
 
-    if let Some(source) = sources.get(selected) {
-        if let Some(text) = data.descriptions.get(source) {
-            let mut text = text.clone();
-            ui.add(
-                egui::TextEdit::multiline(&mut text)
-                    .desired_width(f32::INFINITY)
-                    .interactive(false),
-            );
-        }
-    }
+    let Some(text) = sources
+        .get(selected)
+        .and_then(|source| data.descriptions.get(source))
+    else {
+        return;
+    };
+
+    let mut text = text.clone();
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_width(f32::INFINITY)
+            .interactive(false),
+    );
 }
 
 fn show_classifications(ui: &mut egui::Ui, data: &PropertiesData) {
@@ -278,15 +271,18 @@ fn show_classifications(ui: &mut egui::Ui, data: &PropertiesData) {
         return;
     }
 
-    if let Some(source) = sources.get(selected) {
-        if let Some(classes) = data.classifications.get(source) {
-            if classes.is_empty() {
-                ui.label("No classifications for this source.");
-            } else {
-                for class in classes {
-                    ui.label(class);
-                }
-            }
+    let Some(classes) = sources
+        .get(selected)
+        .and_then(|source| data.classifications.get(source))
+    else {
+        return;
+    };
+
+    if classes.is_empty() {
+        ui.label("No classifications for this source.");
+    } else {
+        for class in classes {
+            ui.label(class);
         }
     }
 }

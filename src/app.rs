@@ -1141,7 +1141,6 @@ impl eframe::App for AkashaApp {
         if let Some(media_id) = actions.open_properties {
             self.properties_state.open = true;
             self.properties_state.media_id = Some(media_id);
-            self.fetch_properties_data(media_id);
         }
         if let Some(key) = actions.sort_key_changed {
             self.config.ui.sort_key = key;
@@ -1201,7 +1200,6 @@ impl eframe::App for AkashaApp {
                     if resp.show_properties {
                         self.properties_state.open = true;
                         self.properties_state.media_id = Some(media.id);
-                        self.fetch_properties_data(media.id);
                     }
                 } else {
                     self.close_viewer();
@@ -1259,7 +1257,7 @@ impl eframe::App for AkashaApp {
         }
 
         if self.properties_state.open {
-            let _ = crate::ui::properties::show(
+            crate::ui::properties::show(
                 ctx,
                 &mut self.properties_state.open,
                 self.properties_state.media_id,
