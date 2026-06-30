@@ -227,14 +227,14 @@ chat_endpoint = "/chat/completions"
 tag_endpoint = "/tags"
 classify_endpoint = "/classify"
 
-# [[imports]]
+# [[import]]
 # path = ""
 # recursive = true
 # flatten = false        # Show import as one folder in the folders pane
 # exclude = []
 # include = []
 #
-# [imports.thumbnails]
+# [import.thumbnails]
 # cache_mode = "global"  # "global" | "custom" | "disabled"
 # cache_folder = ""      # Defaults to <import_root>/.akasha_thumbnails
 # cache_fallback = "disable"  # "disable" | "global"

@@ -9,7 +9,7 @@ pub struct Config {
     pub debug: DebugConfig,
     pub models: ModelsConfig,
     pub remote: RemoteConfig,
-    #[serde(alias = "folders", alias = "import")]
+    #[serde(alias = "folders")]
     pub imports: Vec<ImportConfig>,
 }
 
