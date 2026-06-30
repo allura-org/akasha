@@ -53,7 +53,10 @@ impl Backend for MistralRsBackend {
         }) {
             Ok(m) => m,
             Err(e) => {
-                tracing::error!(error = %e, "mistralrs model build failed");
+                tracing::error!(error = ?e, "mistralrs model build failed");
+                for (i, cause) in e.chain().enumerate() {
+                    tracing::error!(cause_index = i, "{}", cause);
+                }
                 return Err(e);
             }
         };
