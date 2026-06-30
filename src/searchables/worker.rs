@@ -133,6 +133,13 @@ impl SearchWorker {
             tracing::info!(model = model_config.name, "SearchWorker: model loaded");
         }
 
+        let overwrite = job
+            .params_json
+            .as_deref()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .and_then(|v| v.get("overwrite").and_then(|o| o.as_bool()))
+            .unwrap_or(false);
+
         let model = self.resident.as_ref().unwrap().model.clone();
         let media = crate::db::media::get_by_id(&self.pool, job.media_file_id)
             .await?
@@ -145,6 +152,17 @@ impl SearchWorker {
 
         match output {
             crate::models::ModelOutput::Tags(tags) => {
+                if tags.is_empty() {
+                    anyhow::bail!("model {} returned no tags", model_config.name);
+                }
+                if overwrite {
+                    crate::db::searchable::delete_tags_for_source(
+                        &self.pool,
+                        job.media_file_id,
+                        &cfg.name,
+                    )
+                    .await?;
+                }
                 crate::db::searchable::update_tags_json(
                     &self.pool,
                     job.media_file_id,
@@ -154,6 +172,20 @@ impl SearchWorker {
                 .await?;
             }
             crate::models::ModelOutput::Description(text) => {
+                if text.trim().is_empty() {
+                    anyhow::bail!(
+                        "model {} returned an empty description",
+                        model_config.name
+                    );
+                }
+                if overwrite {
+                    crate::db::searchable::delete_description_for_source(
+                        &self.pool,
+                        job.media_file_id,
+                        &cfg.name,
+                    )
+                    .await?;
+                }
                 crate::db::searchable::update_description_json(
                     &self.pool,
                     job.media_file_id,

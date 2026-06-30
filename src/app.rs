@@ -66,8 +66,8 @@ pub struct AkashaApp {
 
     pub properties_state: crate::ui::properties::PropertiesState,
     pub properties_data: Option<crate::db::media::PropertiesData>,
-    pub properties_fetch_in_progress: bool,
     properties_last_id: Option<i64>,
+    properties_last_refresh: Option<std::time::Instant>,
     pub properties_tx: tokio::sync::mpsc::UnboundedSender<(i64, crate::db::media::PropertiesData)>,
     properties_rx: tokio::sync::mpsc::UnboundedReceiver<(i64, crate::db::media::PropertiesData)>,
 
@@ -266,8 +266,8 @@ impl AkashaApp {
             pending_viewer_images: HashSet::new(),
             properties_state: crate::ui::properties::PropertiesState::default(),
             properties_data: None,
-            properties_fetch_in_progress: false,
             properties_last_id: None,
+            properties_last_refresh: None,
             properties_tx,
             properties_rx,
             toasts: Vec::new(),
@@ -766,7 +766,7 @@ impl AkashaApp {
         while let Ok((media_id, data)) = self.properties_rx.try_recv() {
             if self.properties_state.media_id == Some(media_id) {
                 self.properties_data = Some(data);
-                self.properties_fetch_in_progress = false;
+                self.properties_last_refresh = Some(std::time::Instant::now());
             }
         }
 
@@ -775,15 +775,23 @@ impl AkashaApp {
         }
 
         let current_id = self.properties_state.media_id;
-        if current_id == self.properties_last_id {
+        let id_changed = current_id != self.properties_last_id;
+        let stale = self
+            .properties_last_refresh
+            .map(|t| t.elapsed() > std::time::Duration::from_secs(2))
+            .unwrap_or(true);
+
+        if !id_changed && !stale {
             return;
         }
+
         self.properties_last_id = current_id;
-        self.properties_data = None;
-        self.properties_fetch_in_progress = false;
+        if id_changed {
+            self.properties_data = None;
+            self.properties_last_refresh = None;
+        }
 
         if let Some(id) = current_id {
-            self.properties_fetch_in_progress = true;
             self.fetch_properties_data(id);
         }
     }
@@ -845,20 +853,11 @@ impl AkashaApp {
                 }
             };
 
-            if action.overwrite {
-                for &media_id in &media_ids {
-                    let result = match action.output_kind.as_str() {
-                        "tags" => db::searchable::delete_tags_for_source(&pool, media_id, &action.source_name).await,
-                        "description" => db::searchable::delete_description_for_source(&pool, media_id, &action.source_name).await,
-                        _ => Ok(()),
-                    };
-                    if let Err(e) = result {
-                        tracing::warn!(media_id, error = %e, "Failed to clear existing predictions");
-                    }
-                }
-            }
-
-            let params = serde_json::json!({ "model_name": action.model_name }).to_string();
+            let params = serde_json::json!({
+                "model_name": action.model_name,
+                "overwrite": action.overwrite,
+            })
+            .to_string();
             let mut enqueued = 0usize;
             for media_id in media_ids {
                 match db::searchable::enqueue_job(&pool, media_id, job_kind, &params, Some(config.id)).await {
