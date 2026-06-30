@@ -562,12 +562,19 @@ pub async fn fail_job(pool: &SqlitePool, job_id: i64, error: &str) -> Result<()>
     Ok(())
 }
 
-/// Reset any jobs left in the `running` state back to `pending`. This is
-/// intended to be called once at startup so that jobs abandoned by a previous
-/// process crash or unclean shutdown are retried instead of staying stuck.
+/// Mark any jobs left in the `running` state as `failed`. This is intended to
+/// be called once at startup so that jobs abandoned by a previous process crash
+/// or unclean shutdown are cleaned up instead of staying stuck or being
+/// auto-retried (which could crash the app again if the failure was
+/// memory-related).
 pub async fn reset_running_jobs(pool: &SqlitePool) -> Result<u64> {
     let result = sqlx::query(
-        "UPDATE job_queue SET status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE status = 'running'"
+        "UPDATE job_queue
+         SET status = 'failed',
+             attempts = attempts + 1,
+             error = 'Abandoned by previous session shutdown',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE status = 'running'"
     )
     .execute(pool)
     .await?;

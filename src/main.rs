@@ -33,8 +33,11 @@ fn main() -> anyhow::Result<()> {
 
     match rt.block_on(db::searchable::reset_running_jobs(&pool)) {
         Ok(0) => {}
-        Ok(n) => info!("Reset {} job(s) left in 'running' state from previous session", n),
-        Err(e) => tracing::warn!("Failed to reset running jobs: {e}"),
+        Ok(n) => info!(
+            "Marked {} job(s) left in 'running' state as failed from previous session",
+            n
+        ),
+        Err(e) => tracing::warn!("Failed to clean up running jobs: {e}"),
     }
 
     let options = eframe::NativeOptions {
