@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use mistralrs::{
     IsqType, MultimodalMessages, MultimodalModelBuilder, RequestBuilder, TextMessageRole,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 
 use crate::config::{ModelConfig, ModelDescriptionOptions};
 use crate::models::{Backend, Model, ModelOutput};
@@ -33,8 +33,12 @@ impl Backend for MistralRsBackend {
             .or_else(|| config.path.clone())
             .context("mistralrs backend requires a model_id or path")?;
         let opts = config.description.clone().unwrap_or_default();
-        let runtime = Runtime::new().context("failed to create tokio runtime for mistralrs")?;
-        let model = runtime.block_on(async {
+        // `Backend::load` is called from `tokio::task::spawn_blocking`, so a
+        // runtime handle is available. We keep only the handle (not a full
+        // `Runtime`) so dropping the model on an async worker thread does not
+        // try to tear down a nested runtime.
+        let handle = Handle::current();
+        let model = handle.block_on(async {
             MultimodalModelBuilder::new(&model_id)
                 .with_isq(IsqType::Q4K)
                 .build()
@@ -44,7 +48,7 @@ impl Backend for MistralRsBackend {
         Ok(Arc::new(MistralRsModel {
             model,
             opts,
-            runtime,
+            handle,
         }))
     }
 }
@@ -52,7 +56,7 @@ impl Backend for MistralRsBackend {
 struct MistralRsModel {
     model: mistralrs::Model,
     opts: ModelDescriptionOptions,
-    runtime: Runtime,
+    handle: Handle,
 }
 
 impl Model for MistralRsModel {
@@ -65,7 +69,7 @@ impl Model for MistralRsModel {
             .clone()
             .unwrap_or_else(|| "Describe this image in detail.".into());
 
-        self.runtime.block_on(async {
+        self.handle.block_on(async {
             let messages = MultimodalMessages::new()
                 .add_image_message(TextMessageRole::User, &prompt, vec![image]);
             let mut request =
