@@ -39,7 +39,7 @@ impl Backend for MistralRsBackend {
         // try to tear down a nested runtime.
         let handle = Handle::current();
         let isq = opts.isq.as_deref().unwrap_or("Q8_0");
-        let mut builder = MultimodalModelBuilder::new(&model_id);
+        let mut builder = MultimodalModelBuilder::new(&model_id).with_logging(true);
         if !isq.eq_ignore_ascii_case("none") {
             let isq_type = parse_isq(isq)
                 .with_context(|| format!("invalid mistralrs isq value: {isq}"))?;
