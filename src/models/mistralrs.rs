@@ -45,8 +45,18 @@ impl Backend for MistralRsBackend {
                 .with_context(|| format!("invalid mistralrs isq value: {isq}"))?;
             builder = builder.with_isq(isq_type);
         }
-        let model = handle
-            .block_on(async { builder.build().await.context("failed to build mistralrs multimodal model") })?;
+        let model = match handle.block_on(async {
+            builder
+                .build()
+                .await
+                .context("failed to build mistralrs multimodal model")
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "mistralrs model build failed");
+                return Err(e);
+            }
+        };
         Ok(Arc::new(MistralRsModel {
             model,
             opts,
