@@ -167,3 +167,4 @@ cache_fallback = "disable"
 # prompt = "Describe this image in detail."
 # max_tokens = 128
 # temperature = 0.7
+# isq = "Q8_0"  # mistral.rs ISQ type (e.g. Q8_0, Q6K, Q4K) or "none" to disable.

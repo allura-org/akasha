@@ -229,6 +229,10 @@ pub struct ModelDescriptionOptions {
     pub image_mean: Option<Vec<f32>>,
     /// Optional per-channel standard deviation for image normalization. See `image_mean`.
     pub image_std: Option<Vec<f32>>,
+    /// In-situ quantization type for local `mistralrs` models. Accepts any `mistral.rs`
+    /// `IsqType` value (e.g. `"Q8_0"`, `"Q4K"`, `"Q6K"`) or `"none"` to disable ISQ.
+    /// Defaults to `"Q8_0"` when omitted.
+    pub isq: Option<String>,
 }
 
 impl Default for ModelDescriptionOptions {
@@ -243,6 +247,7 @@ impl Default for ModelDescriptionOptions {
             repeat_last_n: 64,
             image_mean: None,
             image_std: None,
+            isq: None,
         }
     }
 }

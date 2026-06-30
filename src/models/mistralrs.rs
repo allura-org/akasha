@@ -38,13 +38,15 @@ impl Backend for MistralRsBackend {
         // `Runtime`) so dropping the model on an async worker thread does not
         // try to tear down a nested runtime.
         let handle = Handle::current();
-        let model = handle.block_on(async {
-            MultimodalModelBuilder::new(&model_id)
-                .with_isq(IsqType::Q4K)
-                .build()
-                .await
-                .context("failed to build mistralrs multimodal model")
-        })?;
+        let isq = opts.isq.as_deref().unwrap_or("Q8_0");
+        let mut builder = MultimodalModelBuilder::new(&model_id);
+        if !isq.eq_ignore_ascii_case("none") {
+            let isq_type = parse_isq(isq)
+                .with_context(|| format!("invalid mistralrs isq value: {isq}"))?;
+            builder = builder.with_isq(isq_type);
+        }
+        let model = handle
+            .block_on(async { builder.build().await.context("failed to build mistralrs multimodal model") })?;
         Ok(Arc::new(MistralRsModel {
             model,
             opts,
@@ -95,5 +97,33 @@ impl Model for MistralRsModel {
                 .unwrap_or_default();
             Ok(ModelOutput::Description(text))
         })
+    }
+}
+
+fn parse_isq(s: &str) -> Result<IsqType> {
+    match s.to_ascii_uppercase().as_str() {
+        "Q4_0" => Ok(IsqType::Q4_0),
+        "Q4_1" => Ok(IsqType::Q4_1),
+        "Q5_0" => Ok(IsqType::Q5_0),
+        "Q5_1" => Ok(IsqType::Q5_1),
+        "Q8_0" => Ok(IsqType::Q8_0),
+        "Q8_1" => Ok(IsqType::Q8_1),
+        "Q2K" => Ok(IsqType::Q2K),
+        "Q3K" => Ok(IsqType::Q3K),
+        "Q4K" => Ok(IsqType::Q4K),
+        "Q5K" => Ok(IsqType::Q5K),
+        "Q6K" => Ok(IsqType::Q6K),
+        "Q8K" => Ok(IsqType::Q8K),
+        "HQQ8" => Ok(IsqType::HQQ8),
+        "HQQ4" => Ok(IsqType::HQQ4),
+        "F8E4M3" => Ok(IsqType::F8E4M3),
+        "AFQ8" => Ok(IsqType::AFQ8),
+        "AFQ6" => Ok(IsqType::AFQ6),
+        "AFQ4" => Ok(IsqType::AFQ4),
+        "AFQ3" => Ok(IsqType::AFQ3),
+        "AFQ2" => Ok(IsqType::AFQ2),
+        "F8Q8" => Ok(IsqType::F8Q8),
+        "MXFP4" => Ok(IsqType::MXFP4),
+        _ => anyhow::bail!("unknown ISQ type: {s}"),
     }
 }
