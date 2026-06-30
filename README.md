@@ -106,7 +106,7 @@ cargo build --features candle,cuda
 ## setup
 
 `~.config/akasha/config.toml` should be generated on first launch.
-modify the `[[import]]` table array (including the `[import.thumbnails]` tables) to your preferences.
+modify the `[[imports]]` table array (including the `[imports.thumbnails]` tables) to your preferences.
 you can copy these table arrays multiple times for multiple imports.
 
 refer to `config.example.toml` in this repo for info on all the available options.
