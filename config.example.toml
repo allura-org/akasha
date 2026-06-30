@@ -46,7 +46,7 @@ chat_endpoint = "/chat/completions"
 tag_endpoint = "/tags"
 classify_endpoint = "/classify"
 
-[[import]]
+[[imports]]
 path = ""
 # The path to the import root. If this is unset or reading the path fails, the import is ignored, and if it was previously imported, it's hidden from the gallery. A toast will be shown at startup informing the user of the issue.
 
@@ -66,7 +66,7 @@ include = []
 # Folders or items to include, *ignoring* everything else. Behaves the same as `exclude`, but `exclude` takes precedence (so you can selectively exclude from included folders, but NOT vice-versa.)
 # Useful for e.g. asset libraries, where you have compatible media in some folders but not others, or for when you have a couple folders that you want to import in the same high-level folder.
 
-[import.thumbnails]
+[imports.thumbnails]
 cache_mode = "global"
 # How to cache thumbnails for this import.
 # If "global", uses the global thumbnail cache.
