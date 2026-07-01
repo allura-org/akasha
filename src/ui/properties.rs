@@ -170,7 +170,8 @@ fn source_switcher(
 }
 
 fn show_tags(ui: &mut egui::Ui, data: &PropertiesData) {
-    let sources: Vec<String> = data.tags.keys().cloned().collect();
+    let mut sources: Vec<String> = data.tags.keys().cloned().collect();
+    sources.sort();
     let mut selected = ui.memory_mut(|mem| {
         mem.data
             .get_persisted(egui::Id::new("properties_tags_source"))
@@ -218,7 +219,8 @@ fn show_tags(ui: &mut egui::Ui, data: &PropertiesData) {
 }
 
 fn show_descriptions(ui: &mut egui::Ui, data: &PropertiesData) {
-    let sources: Vec<String> = data.descriptions.keys().cloned().collect();
+    let mut sources: Vec<String> = data.descriptions.keys().cloned().collect();
+    sources.sort();
     let mut selected = ui.memory_mut(|mem| {
         mem.data
             .get_persisted(egui::Id::new("properties_desc_source"))
@@ -253,7 +255,8 @@ fn show_descriptions(ui: &mut egui::Ui, data: &PropertiesData) {
 }
 
 fn show_classifications(ui: &mut egui::Ui, data: &PropertiesData) {
-    let sources: Vec<String> = data.classifications.keys().cloned().collect();
+    let mut sources: Vec<String> = data.classifications.keys().cloned().collect();
+    sources.sort();
     let mut selected = ui.memory_mut(|mem| {
         mem.data
             .get_persisted(egui::Id::new("properties_cls_source"))
