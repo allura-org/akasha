@@ -94,6 +94,7 @@ pub fn load_model_files(source: &ModelSource) -> Result<ModelFiles> {
                 labels_path,
             })
         }
+        #[cfg(not(feature = "hf-hub"))]
         ModelSource::HfSlug(_) => {
             anyhow::bail!("HuggingFace model slugs require the hf-hub feature")
         }

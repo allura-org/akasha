@@ -43,9 +43,11 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | XDG directories | `directories` 6 |
 | Date/time | `chrono` (with serde support) |
 | File system watching | `notify` 8, `notify-debouncer-full` 0.5 |
-| Local inference (optional) | `candle-core` 0.8, `candle-nn` 0.8, `candle-transformers` 0.8, `hf-hub` 0.4 |
+| Local inference (optional) | `candle-core` 0.11, `candle-nn` 0.11, `candle-transformers` 0.11 |
+| HuggingFace downloads (optional) | `hf-hub` 0.4 (`native-tls`), gated behind `hf-hub` feature |
 | Local ONNX inference (default) | `ort` 2.0.0-rc.12 (ONNX Runtime 1.24), `ndarray` 0.17 |
-| Remote inference (optional) | `reqwest` 0.12 (`blocking` + `native-tls`), `base64` 0.22 |
+| Remote inference (optional) | `reqwest` 0.12 (`blocking` + `rustls-tls`), `base64` 0.22 |
+| Local VLM inference (optional) | `mistralrs` 0.8.1, gated behind `mistralrs` feature |
 
 ---
 
@@ -54,13 +56,13 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 Standard Cargo workflow:
 
 ```bash
-# Debug build (default features; needs OpenSSL/libssl-dev)
+# Debug build (default features; pure Rust, no C dependencies)
 cargo build
 
 # Run
 cargo run
 
-# Release build (default features; needs OpenSSL/libssl-dev)
+# Release build (default features; pure Rust, no C dependencies)
 cargo build --release
 
 # With SIMD thumbnail acceleration (requires libwebp-dev / libwebp-devel)
@@ -71,10 +73,11 @@ cargo test
 
 ### Feature flags
 
-- `candle` (default) — Enables local inference via Candle (`candle-core`, `candle-nn`, `candle-transformers`, `hf-hub`). Used by the `CandleBackend` for tag/classification/description models. Disable with `--no-default-features` for a lighter build.
+- `candle` (default) — Enables local inference via Candle (`candle-core`, `candle-nn`, `candle-transformers`). Used by the `CandleBackend` for tag/classification/description models. Without the `hf-hub` feature, Candle models must be available as local paths. Disable with `--no-default-features` for a lighter build.
+- `hf-hub` (optional) — Enables downloading HuggingFace models by slug for Candle and ONNX backends. Requires OpenSSL (`libssl-dev` / `openssl-devel`).
 - `cuda` — Enables CUDA support in Candle (requires `candle` feature and a CUDA toolkit). Build with `cargo build --features cuda`.
 - `remote` (default) — Enables remote HTTP inference via `reqwest::blocking` and `base64`. Used by the `RemoteBackend` for OpenAI-compatible or custom endpoints. Disable with `--no-default-features`.
-- `onnx` (default) — Enables local ONNX inference via `ort` and `ndarray`. Used by the `OrtBackend` for running ONNX models (e.g., WD VIT taggers, SigLIP). Disable with `--no-default-features`.
+- `onnx` (default) — Enables local ONNX inference via `ort` and `ndarray`. Used by the `OrtBackend` for running ONNX models (e.g., WD VIT taggers, SigLIP). Without the `hf-hub` feature, ONNX models must be available as local paths. Disable with `--no-default-features`.
   - **Release builds currently exclude ONNX** while packaging is figured out; `cargo run` and local builds still include it by default.
 - `hevc` — Enables HEVC-coded media. Currently covers HEIF/HEIC images; will extend to HEVC video in MP4 when video support lands. Requires system libraries:
   - `libheif-dev` >= 1.17.0 (and its dependency `libde265-dev` for HEVC decoding)
@@ -82,6 +85,7 @@ cargo test
   - Build with the feature: `cargo build --features hevc`
   - This feature is **excluded from default builds** for license reasons and is only included in the dedicated HEVC binary.
 - `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; requires `libwebp-dev` (Debian/Ubuntu) or `libwebp-devel` (Fedora).
+- `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Requires OpenSSL because `mistral.rs` uses `hf-hub` with `native-tls`.
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
@@ -110,7 +114,7 @@ src/
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ModelsConfig`, `ImportConfig`
   scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
-  models/        — Backend-agnostic model plugin interface (`Model`, `Backend`, `BackendRegistry`) plus `CandleBackend`, `RemoteBackend`, and `OrtBackend` implementations
+  models/        — Backend-agnostic model plugin interface (`Model`, `Backend`, `BackendRegistry`) plus `CandleBackend`, `RemoteBackend`, `OrtBackend`, and `MistralRsBackend` implementations; `loader.rs` resolves local vs. HuggingFace model sources
   searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename`/`tags`/`description` Searchables, background `SearchWorker`
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
   watcher.rs     — Filesystem watcher using `notify-debouncer-full`; emits batched Create/Modify/Remove events to `app.rs`
@@ -304,7 +308,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 ## Known Gaps / TODOs
 
 - `ui/widgets.rs` — only contains a placeholder label helper.
-- Media Processing UI and generic `job_queue` are in place. `CandleBackend` (local ViT tagger) and `RemoteBackend` (HTTP tag endpoint) are implemented; description/classification endpoints for remote are deferred.
+- Media Processing UI and generic `job_queue` are in place. `CandleBackend` (local ViT tagger), `RemoteBackend` (HTTP tag endpoint), and `MistralRsBackend` (local VLM description) are implemented; description/classification endpoints for remote are deferred.
 - Inference jobs must be triggered manually from the Media Processing window or context menus; they are not enqueued automatically on scan/import.
 - Remote backend currently uploads the full raw image without resize/compress; image preprocessing for remote endpoints is deferred.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
@@ -332,6 +336,8 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/models/candle.rs` | `CandleBackend` for local Candle-based inference |
 | `src/models/remote.rs` | `RemoteBackend` for HTTP inference endpoints |
 | `src/models/onnx.rs` | `OrtBackend` for local ONNX inference; heuristic preprocessing/tag discovery |
+| `src/models/mistralrs.rs` | `MistralRsBackend` for local VLM description jobs |
+| `src/models/loader.rs` | Resolves model sources (local path vs. HuggingFace slug, `hf-hub` gated) |
 | `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
 | `src/searchables/engine.rs` | Search orchestration and score aggregation |
 | `src/searchables/filename.rs` | Built-in filename Searchable |
