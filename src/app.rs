@@ -54,6 +54,7 @@ pub struct AkashaApp {
     pub watcher_handle: Option<WatcherHandle>,
 
     pub jobs_count_rx: std::sync::mpsc::Receiver<usize>,
+    pub jobs_count_tx: std::sync::mpsc::Sender<usize>,
     pub search_worker_running: Arc<AtomicBool>,
 
     pub media_refresh_in_flight: bool,
@@ -124,13 +125,14 @@ impl AkashaApp {
         // Background ticker: report pending/running job count every few seconds.
         {
             let pool_clone = Arc::clone(&pool_arc);
+            let tx = jobs_count_tx.clone();
             rt_arc.spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
                 loop {
                     interval.tick().await;
                     match db::searchable::count_pending_jobs(&pool_clone).await {
                         Ok(n) => {
-                            if jobs_count_tx.send(n as usize).is_err() {
+                            if tx.send(n as usize).is_err() {
                                 break;
                             }
                         }
@@ -266,6 +268,7 @@ impl AkashaApp {
             watcher_rx: std::sync::mpsc::channel().1,
             watcher_handle: None,
             jobs_count_rx,
+            jobs_count_tx,
             search_worker_running: Arc::clone(&search_worker_running),
             media_refresh_in_flight: false,
             last_refresh: std::time::Instant::now(),
@@ -1282,6 +1285,7 @@ impl eframe::App for AkashaApp {
 
         if self.browser.media_processing_open {
             let mut toggle_queue = false;
+            let mut clear_queue = false;
             if let Some(action) = crate::ui::media_processing::show(
                 ctx,
                 &mut self.browser.media_processing_open,
@@ -1290,6 +1294,7 @@ impl eframe::App for AkashaApp {
                 self.browser.pending_jobs,
                 self.search_worker_running.load(Ordering::Relaxed),
                 &mut toggle_queue,
+                &mut clear_queue,
             ) {
                 self.push_toast("Enqueuing media processing jobs…".to_string(), ToastLevel::Info);
                 self.enqueue_media_processing_jobs(action);
@@ -1305,6 +1310,24 @@ impl eframe::App for AkashaApp {
                     },
                     ToastLevel::Info,
                 );
+            }
+            if clear_queue {
+                let pool = Arc::clone(&self.pool);
+                let tx = self.jobs_count_tx.clone();
+                self.rt.spawn(async move {
+                    match crate::db::searchable::delete_pending_jobs(&pool).await {
+                        Ok(n) => {
+                            tracing::info!("Cleared {} pending job(s)", n);
+                            let count =
+                                crate::db::searchable::count_pending_jobs(&pool).await.unwrap_or(0);
+                            let _ = tx.send(count as usize);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to clear pending jobs: {e}");
+                        }
+                    }
+                });
+                self.push_toast("Clearing pending jobs…".to_string(), ToastLevel::Info);
             }
         }
 

@@ -530,6 +530,14 @@ pub async fn claim_pending_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<Job
     Ok(rows)
 }
 
+/// Delete all pending jobs from the queue. Returns the number removed.
+pub async fn delete_pending_jobs(pool: &SqlitePool) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM job_queue WHERE status = 'pending'")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Count jobs that are either pending or running.
 pub async fn count_pending_jobs(pool: &SqlitePool) -> Result<i64> {
     let row: (i64,) = sqlx::query_as(

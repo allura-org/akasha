@@ -78,6 +78,7 @@ pub fn show(
     pending_jobs: usize,
     running: bool,
     toggle: &mut bool,
+    clear: &mut bool,
 ) -> Option<MediaProcessingAction> {
     let mut action = None;
     let mut close = false;
@@ -130,6 +131,12 @@ pub fn show(
                 ui.label(format!("Queue: {} ({} pending/running)", status, pending_jobs));
                 if ui.button(if running { "Pause" } else { "Resume" }).clicked() {
                     *toggle = true;
+                }
+                if ui
+                    .add_enabled(pending_jobs > 0, egui::Button::new("Clear pending"))
+                    .clicked()
+                {
+                    *clear = true;
                 }
             });
             ui.add_space(8.0);
