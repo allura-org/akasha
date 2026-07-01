@@ -1,6 +1,6 @@
 ## Summary
 
-Add an optional `mistralrs` backend for local vision-language model (VLM) description jobs. This lets Akasha run multimodal captioning models (e.g., `google/gemma-4-E2B-it`, `Qwen/Qwen3-VL-2B-Instruct`) through `mistral.rs` instead of Candle, because Candle does not yet support the Gemma 4 architecture.
+Add an optional `mistralrs` backend for local vision-language model (VLM) description jobs. We are pivoting from Candle to `mistral.rs` for VLMs because `mistral.rs` is the superior option for this workload. With ONNX handling taggers and `mistral.rs` handling VLMs, we should evaluate in future whether Candle can be deprecated entirely, or whether it will still be needed for cases like JTP-3 that require a custom model implementation.
 
 ## What changed
 
@@ -17,7 +17,6 @@ Add an optional `mistralrs` backend for local vision-language model (VLM) descri
 - Made the Properties window refresh every 2 seconds while open so inference results appear without closing/reopening.
 - Unified all HTTP/TLS usage on `native-tls` (`hf-hub`, `reqwest`, `ort`) to avoid `rustls` TLS `close_notify` and truncated-response failures when downloading large model files from Hugging Face.
 - Added `scripts/regenerate_imports.py` to rebuild `[[imports]]` config blocks from the database after the config key fix.
-- Added `run-gpu.sh` as a local test helper for the 32-bit `/usr/lib/libcuda.so` linker workaround (gitignored, not shipped).
 - Updated `AGENTS.md` and `config.example.toml` to document the new backend and `isq` option.
 
 ## Testing
@@ -29,5 +28,3 @@ Add an optional `mistralrs` backend for local vision-language model (VLM) descri
 ## Known limitations
 
 - `mistral.rs` handles its own HuggingFace downloads; on some networks large model files may fail with truncated-body errors and need a retry/re-queue.
-- `mistralrs` models must specify `backend = "mistralrs"` explicitly.
-- Models still need to fit in VRAM; quantization via `isq` helps but very large VLMs will need a bigger card or CPU fallback.
