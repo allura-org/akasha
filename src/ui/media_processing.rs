@@ -76,6 +76,8 @@ pub fn show(
     config: &Config,
     target: Option<&MediaProcessingTarget>,
     pending_jobs: usize,
+    running: bool,
+    toggle: &mut bool,
 ) -> Option<MediaProcessingAction> {
     let mut action = None;
     let mut close = false;
@@ -123,7 +125,13 @@ pub fn show(
             } else {
                 ui.label("Target: nothing selected");
             }
-            ui.label(format!("Pending/running jobs: {}", pending_jobs));
+            ui.horizontal(|ui| {
+                let status = if running { "running" } else { "paused" };
+                ui.label(format!("Queue: {} ({} pending/running)", status, pending_jobs));
+                if ui.button(if running { "Pause" } else { "Resume" }).clicked() {
+                    *toggle = true;
+                }
+            });
             ui.add_space(8.0);
 
             if models.is_empty() {

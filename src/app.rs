@@ -1,6 +1,7 @@
 use eframe::egui;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -53,6 +54,7 @@ pub struct AkashaApp {
     pub watcher_handle: Option<WatcherHandle>,
 
     pub jobs_count_rx: std::sync::mpsc::Receiver<usize>,
+    pub search_worker_running: Arc<AtomicBool>,
 
     pub media_refresh_in_flight: bool,
     pub last_refresh: std::time::Instant,
@@ -94,6 +96,14 @@ impl AkashaApp {
 
         let pool_arc = Arc::new(pool);
         let rt_arc = Arc::new(rt);
+
+        // If there are leftover jobs from a previous session, start the worker
+        // paused so the queue doesn't resume automatically on reopen.
+        let initial_worker_running = rt_arc
+            .block_on(crate::db::searchable::count_pending_jobs(&pool_arc))
+            .map(|n| n == 0)
+            .unwrap_or(true);
+        let search_worker_running = Arc::new(AtomicBool::new(initial_worker_running));
 
         // Sync the configured model registry into searchable_configs so the UI
         // and SearchWorker see the current set of output kinds. This is awaited
@@ -256,6 +266,7 @@ impl AkashaApp {
             watcher_rx: std::sync::mpsc::channel().1,
             watcher_handle: None,
             jobs_count_rx,
+            search_worker_running: Arc::clone(&search_worker_running),
             media_refresh_in_flight: false,
             last_refresh: std::time::Instant::now(),
             viewer_open: false,
@@ -288,8 +299,11 @@ impl AkashaApp {
 
         // Start the background Searchables worker.
         let worker_pool = Arc::clone(&app.pool);
+        let worker_running = Arc::clone(&search_worker_running);
         app.rt.spawn(async move {
-            crate::searchables::SearchWorker::new(worker_pool, remote_config).run().await;
+            crate::searchables::SearchWorker::new(worker_pool, remote_config, worker_running)
+                .run()
+                .await;
         });
 
         // Start the filesystem watcher immediately. Events that arrive while a
@@ -1267,15 +1281,30 @@ impl eframe::App for AkashaApp {
         }
 
         if self.browser.media_processing_open {
+            let mut toggle_queue = false;
             if let Some(action) = crate::ui::media_processing::show(
                 ctx,
                 &mut self.browser.media_processing_open,
                 &self.config,
                 self.browser.media_processing_target.as_ref(),
                 self.browser.pending_jobs,
+                self.search_worker_running.load(Ordering::Relaxed),
+                &mut toggle_queue,
             ) {
                 self.push_toast("Enqueuing media processing jobs…".to_string(), ToastLevel::Info);
                 self.enqueue_media_processing_jobs(action);
+            }
+            if toggle_queue {
+                let now_running = !self.search_worker_running.load(Ordering::Relaxed);
+                self.search_worker_running.store(now_running, Ordering::Relaxed);
+                self.push_toast(
+                    if now_running {
+                        "Queue resumed".to_string()
+                    } else {
+                        "Queue paused".to_string()
+                    },
+                    ToastLevel::Info,
+                );
             }
         }
 

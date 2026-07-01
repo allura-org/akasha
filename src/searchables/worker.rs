@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ pub struct SearchWorker {
     batch_size: i64,
     registry: BackendRegistry,
     resident: Option<ResidentModel>,
+    running: Arc<AtomicBool>,
 }
 
 struct ResidentModel {
@@ -24,12 +26,17 @@ struct ResidentModel {
 }
 
 impl SearchWorker {
-    pub fn new(pool: Arc<SqlitePool>, remote: RemoteConfig) -> Self {
+    pub fn new(
+        pool: Arc<SqlitePool>,
+        remote: RemoteConfig,
+        running: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             pool,
             batch_size: 4,
             registry: BackendRegistry::with_remote(remote),
             resident: None,
+            running,
         }
     }
 
@@ -40,6 +47,7 @@ impl SearchWorker {
             batch_size: 4,
             registry,
             resident: None,
+            running: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -47,6 +55,10 @@ impl SearchWorker {
         let mut ticker = interval(Duration::from_secs(5));
         loop {
             ticker.tick().await;
+            if !self.running.load(Ordering::Relaxed) {
+                tracing::debug!("SearchWorker paused");
+                continue;
+            }
             match self.tick().await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!("SearchWorker processed {} jobs", n),
