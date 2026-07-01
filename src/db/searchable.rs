@@ -461,6 +461,7 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         api_key: opts.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()),
         remote,
         onnx,
+        jtp3: None,
         tags,
         description,
         classification,
@@ -876,6 +877,7 @@ mod tests {
             classification: Some(ModelClassificationOptions {}),
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -915,6 +917,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         sync_model_configs(&pool, &[model2]).await.unwrap();
 
@@ -962,6 +965,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -997,6 +1001,7 @@ mod tests {
                 classify_endpoint: "/v1/classify".into(),
             }),
             onnx: None,
+            jtp3: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -1041,6 +1046,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 

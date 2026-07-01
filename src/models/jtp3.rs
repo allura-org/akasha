@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
+use image::{ImageDecoder, RgbImage};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView3, Axis, s};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -77,6 +78,27 @@ impl Backend for Jtp3Backend {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicationMode {
+    Inherit,
+    Constrain,
+    Remove,
+    ConstrainRemove,
+    Off,
+}
+
+impl ImplicationMode {
+    fn parse(s: &str) -> Self {
+        match s {
+            "inherit" => Self::Inherit,
+            "constrain" => Self::Constrain,
+            "remove" => Self::Remove,
+            "constrain-remove" => Self::ConstrainRemove,
+            _ => Self::Off,
+        }
+    }
+}
+
 pub struct Jtp3Model {
     session: std::sync::Mutex<Session>,
     tags: Vec<String>,
@@ -84,6 +106,13 @@ pub struct Jtp3Model {
     threshold: f32,
     top_k: Option<usize>,
     max_seq_len: usize,
+    /// Per-tag calibration thresholds loaded from `calibration.csv`.
+    thresholds: HashMap<String, f32>,
+    /// Tag implication graph loaded from tag metadata.
+    implications: HashMap<String, Vec<String>>,
+    /// Tag categories loaded from tag metadata.
+    categories: HashMap<String, i32>,
+    implication_mode: ImplicationMode,
 }
 
 impl Jtp3Model {
@@ -112,10 +141,51 @@ impl Jtp3Model {
         let threshold = config.tags.as_ref().map(|t| t.threshold).unwrap_or(0.35);
         let top_k = config.tags.as_ref().and_then(|t| t.top_k);
 
+        let jtp3_opts = config.jtp3.clone().unwrap_or_default();
+
+        // Optional per-tag calibration thresholds.
+        let calibration_path = jtp3_opts
+            .calibration_file
+            .map(|n| dir.join(n))
+            .or_else(|| Some(dir.join("calibration.csv")))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| dir.join("calibration.csv"));
+        let thresholds = if calibration_path.is_file() {
+            load_calibration_csv(&calibration_path)
+                .with_context(|| format!("failed to load calibration from {}", calibration_path.display()))?
+        } else {
+            HashMap::new()
+        };
+
+        // Optional tag metadata (categories + implications).
+        let metadata_path = jtp3_opts
+            .metadata_file
+            .map(|n| dir.join(n))
+            .or_else(|| find_metadata_file(&dir));
+        let (categories, implications) = if let Some(path) = metadata_path {
+            load_metadata_csv(&path)
+                .with_context(|| format!("failed to load tag metadata from {}", path.display()))?
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+
+        let implication_mode = if jtp3_opts.implications.is_empty() {
+            if implications.is_empty() {
+                ImplicationMode::Off
+            } else {
+                ImplicationMode::Inherit
+            }
+        } else {
+            ImplicationMode::parse(&jtp3_opts.implications)
+        };
+
         tracing::info!(
             tags = tags.len(),
             threshold,
             top_k = ?top_k,
+            calibrated = thresholds.len(),
+            metadata = implications.len(),
+            implication_mode = ?implication_mode,
             "JTP-3 model ready"
         );
 
@@ -126,13 +196,31 @@ impl Jtp3Model {
             threshold,
             top_k,
             max_seq_len: DEFAULT_MAX_SEQ_LEN,
+            thresholds,
+            implications,
+            categories,
+            implication_mode,
         })
     }
 
     fn preprocess(&self, image_path: &Path) -> Result<(Array2<u8>, Array1<bool>, Array2<f32>)> {
+        let icc_profile = image::ImageReader::open(image_path)
+            .ok()
+            .and_then(|r| r.into_decoder().ok())
+            .and_then(|mut d| d.icc_profile().ok())
+            .flatten();
+
         let img = image::open(image_path)
             .with_context(|| format!("failed to open image: {}", image_path.display()))?;
-        let rgb = img.to_rgb8();
+        let mut rgb = img.to_rgb8();
+        rgb = apply_exif_orientation(image_path, rgb)
+            .with_context(|| format!("failed to apply EXIF orientation: {}", image_path.display()))?;
+
+        if let Some(icc) = icc_profile {
+            rgb = apply_icc_profile(&icc, rgb)
+                .with_context(|| format!("failed to apply ICC profile: {}", image_path.display()))?;
+        }
+
         let (orig_w, orig_h) = (rgb.width() as usize, rgb.height() as usize);
 
         let (resize_h, resize_w) = compute_resize_for_seq(orig_h, orig_w, PATCH_SIZE, self.max_seq_len);
@@ -206,7 +294,7 @@ impl Model for Jtp3Model {
             .copied()
             .collect();
 
-        let mut tags = HashMap::new();
+        let mut labels: HashMap<String, f32> = HashMap::new();
         let mut max_score = 0.0f32;
         let mut min_score = f32::INFINITY;
         let mut sum_score = 0.0f32;
@@ -217,15 +305,20 @@ impl Model for Jtp3Model {
             min_score = min_score.min(prob);
             sum_score += prob;
 
-            if prob >= self.threshold {
-                let tag = self.tags.get(idx).map(|s| s.as_str()).unwrap_or("");
-                if !tag.is_empty() {
-                    tags.insert(tag.to_string(), prob);
-                }
+            let tag = self.tags.get(idx).map(|s| s.as_str()).unwrap_or("");
+            if tag.is_empty() {
+                continue;
+            }
+
+            let threshold = self.thresholds.get(tag).copied().unwrap_or(self.threshold);
+            if prob >= threshold {
+                labels.insert(tag.to_string(), prob);
             }
         }
 
-        tags = crate::models::tagger::apply_top_k(tags, self.top_k);
+        apply_implications(&mut labels, &self.implications, self.implication_mode);
+
+        let mut tags = crate::models::tagger::apply_top_k(labels, self.top_k);
 
         let mean_score = if !scores.is_empty() {
             sum_score / scores.len() as f32
@@ -246,6 +339,77 @@ impl Model for Jtp3Model {
 
         Ok(ModelOutput::Tags(tags))
     }
+}
+
+/// Read the EXIF Orientation tag from `image_path` and apply the corresponding
+/// transform to `rgb`.  If no orientation tag is present, `rgb` is returned
+/// unchanged.  This matches PIL's `ImageOps.exif_transpose` behavior.
+fn apply_exif_orientation(image_path: &Path, rgb: RgbImage) -> Result<RgbImage> {
+    let file = std::fs::File::open(image_path)
+        .with_context(|| format!("failed to open image for EXIF: {}", image_path.display()))?;
+    let mut bufreader = std::io::BufReader::new(file);
+    let exif_reader = exif::Reader::new();
+    let exif = match exif_reader.read_from_container(&mut bufreader) {
+        Ok(e) => e,
+        Err(_) => return Ok(rgb),
+    };
+
+    let orientation_value = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .unwrap_or(1);
+
+    let oriented = match orientation_value {
+        1 => rgb,
+        2 => image::imageops::flip_horizontal(&rgb),
+        3 => image::imageops::rotate180(&rgb),
+        4 => image::imageops::flip_vertical(&rgb),
+        5 => transpose_image(&rgb),
+        6 => image::imageops::rotate90(&rgb),
+        7 => image::imageops::rotate180(&transpose_image(&rgb)),
+        8 => image::imageops::rotate270(&rgb),
+        _ => rgb,
+    };
+
+    Ok(oriented)
+}
+
+/// Convert `rgb` from its embedded ICC profile to sRGB using qcms.
+fn apply_icc_profile(icc: &[u8], rgb: RgbImage) -> Result<RgbImage> {
+    let src_profile = qcms::Profile::new_from_slice(icc, false)
+        .context("failed to parse embedded ICC profile")?;
+
+    // Already sRGB; nothing to do.
+    if src_profile.is_sRGB() {
+        return Ok(rgb);
+    }
+
+    let dst_profile = qcms::Profile::new_sRGB();
+    let transform = qcms::Transform::new(
+        &src_profile,
+        &dst_profile,
+        qcms::DataType::RGB8,
+        qcms::Intent::RelativeColorimetric,
+    )
+    .context("failed to create ICC transform")?;
+
+    let (w, h) = (rgb.width(), rgb.height());
+    let mut data = rgb.into_raw();
+    transform.apply(&mut data);
+
+    RgbImage::from_raw(w, h, data)
+        .context("failed to rebuild RGB image after ICC conversion")
+}
+
+/// Transpose rows and columns (mirror across the top-left to bottom-right
+/// diagonal).  Equivalent to PIL's `Image.Transpose.TRANSPOSE`.
+fn transpose_image(img: &RgbImage) -> RgbImage {
+    let (w, h) = (img.width(), img.height());
+    let mut out = RgbImage::new(h, w);
+    for (x, y, pixel) in img.enumerate_pixels() {
+        out.put_pixel(y, x, *pixel);
+    }
+    out
 }
 
 /// Binary-search for the largest resize that keeps the patch count within
@@ -420,6 +584,188 @@ fn load_tags(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+fn load_calibration_csv(path: &Path) -> Result<HashMap<String, f32>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read calibration CSV: {}", path.display()))?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(text.as_bytes());
+
+    let headers = reader.headers()?.clone();
+    let tag_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("tag"))
+        .context("calibration CSV missing 'tag' column")?;
+    let threshold_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("threshold"))
+        .context("calibration CSV missing 'threshold' column")?;
+
+    let mut thresholds = HashMap::new();
+    for result in reader.records() {
+        let record = result?;
+        let tag = record.get(tag_idx).unwrap_or("").trim().to_string();
+        let value = record.get(threshold_idx).unwrap_or("").trim();
+        if tag.is_empty() || value.is_empty() {
+            continue;
+        }
+        let threshold: f32 = value.parse().with_context(|| format!("invalid threshold for tag {tag}"))?;
+        if !(0.0..=1.0).contains(&threshold) {
+            anyhow::bail!("threshold for tag {tag} must be between 0.0 and 1.0");
+        }
+        thresholds.insert(tag, threshold);
+    }
+
+    Ok(thresholds)
+}
+
+fn find_metadata_file(dir: &Path) -> Option<PathBuf> {
+    for name in &["tags.csv", "jtp-3-hydra-tags.csv"] {
+        let path = dir.join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn load_metadata_csv(path: &Path) -> Result<(HashMap<String, i32>, HashMap<String, Vec<String>>)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read tag metadata CSV: {}", path.display()))?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(text.as_bytes());
+
+    let headers = reader.headers()?.clone();
+    let tag_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("tag"))
+        .context("metadata CSV missing 'tag' column")?;
+    let category_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("category"))
+        .context("metadata CSV missing 'category' column")?;
+    let implications_idx = headers
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case("implications"))
+        .context("metadata CSV missing 'implications' column")?;
+
+    let mut categories = HashMap::new();
+    let mut implications = HashMap::new();
+    for result in reader.records() {
+        let record = result?;
+        let tag = record.get(tag_idx).unwrap_or("").trim().to_string();
+        if tag.is_empty() {
+            continue;
+        }
+
+        if let Ok(category) = record.get(category_idx).unwrap_or("").trim().parse::<i32>() {
+            categories.insert(tag.clone(), category);
+        }
+
+        let implied: Vec<String> = record
+            .get(implications_idx)
+            .unwrap_or("")
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !implied.is_empty() {
+            implications.insert(tag, implied);
+        }
+    }
+
+    Ok((categories, implications))
+}
+
+fn apply_implications(
+    labels: &mut HashMap<String, f32>,
+    implications: &HashMap<String, Vec<String>>,
+    mode: ImplicationMode,
+) {
+    if mode == ImplicationMode::Off || implications.is_empty() {
+        return;
+    }
+
+    let tags: Vec<String> = labels.keys().cloned().collect();
+
+    match mode {
+        ImplicationMode::Inherit => {
+            for tag in &tags {
+                inherit_implications(labels, tag, implications);
+            }
+        }
+        ImplicationMode::Constrain | ImplicationMode::ConstrainRemove => {
+            for tag in &tags {
+                constrain_implications(labels, tag, implications, None);
+            }
+        }
+        ImplicationMode::Remove => {}
+        ImplicationMode::Off => {}
+    }
+
+    if mode == ImplicationMode::Remove || mode == ImplicationMode::ConstrainRemove {
+        for tag in &tags {
+            if labels.contains_key(tag) {
+                remove_implications(labels, tag, implications);
+            }
+        }
+    }
+}
+
+fn inherit_implications(
+    labels: &mut HashMap<String, f32>,
+    antecedent: &str,
+    implications: &HashMap<String, Vec<String>>,
+) {
+    let p = match labels.get(antecedent) {
+        Some(&p) => p,
+        None => return,
+    };
+
+    for consequent in implications.get(antecedent).into_iter().flatten() {
+        if let Some(&q) = labels.get(consequent) {
+            if q < p {
+                labels.insert(consequent.clone(), p);
+            }
+        }
+        inherit_implications(labels, consequent, implications);
+    }
+}
+
+fn constrain_implications(
+    labels: &mut HashMap<String, f32>,
+    antecedent: &str,
+    implications: &HashMap<String, Vec<String>>,
+    target: Option<&str>,
+) {
+    let target = target.unwrap_or(antecedent);
+    let target_p = match labels.get(target) {
+        Some(&p) => p,
+        None => return,
+    };
+
+    for consequent in implications.get(antecedent).into_iter().flatten() {
+        if let Some(&q) = labels.get(consequent) {
+            if target_p > q {
+                labels.insert(target.to_string(), q);
+            }
+        }
+        constrain_implications(labels, consequent, implications, Some(target));
+    }
+}
+
+fn remove_implications(
+    labels: &mut HashMap<String, f32>,
+    antecedent: &str,
+    implications: &HashMap<String, Vec<String>>,
+) {
+    for consequent in implications.get(antecedent).into_iter().flatten() {
+        labels.remove(consequent);
+        remove_implications(labels, consequent, implications);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +826,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
 
         let model = Jtp3Backend.load(&cfg).expect("load model");

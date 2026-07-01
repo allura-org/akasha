@@ -153,6 +153,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         assert!(reg.select(&config).is_some());
     }
@@ -173,6 +174,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         assert!(reg.select(&config).is_none());
     }
