@@ -162,6 +162,11 @@ impl SearchWorker {
 
         let model = self.resident.as_ref().unwrap().model.clone();
         let max_batch = model.max_batch_size().max(1);
+        tracing::info!(
+            group_size = jobs.len(),
+            max_batch,
+            "SearchWorker: processing job group"
+        );
 
         // Split the config group into inference chunks sized to what the model
         // says it can handle without blowing up memory.

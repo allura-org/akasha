@@ -129,7 +129,10 @@ impl Jtp3Model {
         tracing::info!(dir = %dir.display(), model = %model_path.display(), "Loading JTP-3 ONNX model");
 
         let session = Session::builder()
-            .and_then(|mut b| b.commit_from_file(&model_path))
+            .map_err(|e| anyhow::anyhow!("failed to create ONNX Runtime session builder: {e}"))?
+            .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
+            .map_err(|e| anyhow::anyhow!("failed to configure CPU execution provider: {e}"))?
+            .commit_from_file(&model_path)
             .with_context(|| format!("failed to load JTP-3 ONNX model from {}", model_path.display()))?;
 
         let pos_embed_dtype = session
