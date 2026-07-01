@@ -147,12 +147,12 @@ impl Jtp3Model {
         let arr = Array3::from_shape_vec((resize_h, resize_w, 3), raw)
             .context("failed to build resized image array")?;
         let patches_view = arr
-            .into_shape((grid_h, PATCH_SIZE, grid_w, PATCH_SIZE, 3))
+            .into_shape_with_order((grid_h, PATCH_SIZE, grid_w, PATCH_SIZE, 3))
             .context("failed to reshape into patches")?
             .permuted_axes([0, 2, 1, 3, 4]);
         let patches = patches_view
             .as_standard_layout()
-            .into_shape((n_valid, PATCH_SIZE * PATCH_SIZE * 3))
+            .into_shape_with_order((n_valid, PATCH_SIZE * PATCH_SIZE * 3))
             .context("failed to flatten patches")?;
 
         let mut patches_padded = Array2::<u8>::zeros((self.max_seq_len, PATCH_SIZE * PATCH_SIZE * 3));

@@ -63,10 +63,13 @@ impl BackendRegistry {
         reg.register(mistralrs::MistralRsBackend);
         #[cfg(feature = "candle")]
         reg.register(candle::CandleBackend);
-        #[cfg(feature = "onnx")]
-        reg.register(onnx::OrtBackend);
+        // Register JTP-3 before the generic ONNX backend so its specific
+        // auto-detection (pos_embed.safetensors + tags.txt) wins for JTP-3
+        // folders, while normal ONNX models fall through to OrtBackend.
         #[cfg(feature = "onnx")]
         reg.register(jtp3::Jtp3Backend);
+        #[cfg(feature = "onnx")]
+        reg.register(onnx::OrtBackend);
         #[cfg(not(feature = "remote"))]
         let _ = remote;
         reg
