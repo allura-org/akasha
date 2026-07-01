@@ -7,7 +7,7 @@
 //!
 //! A model directory must contain:
 //!
-//!   - `model.onnx` + `model.onnx.data`   the exported FP32 ONNX model
+//!   - `model.onnx` + `model.onnx.data`   the exported ONNX model (FP32 or FP16)
 //!   - `pos_embed.safetensors`            learned 16x16 position embedding
 //!   - `tags.txt`                         one tag per line
 
@@ -113,6 +113,7 @@ pub struct Jtp3Model {
     /// Tag categories loaded from tag metadata.
     categories: HashMap<String, i32>,
     implication_mode: ImplicationMode,
+    pos_embed_dtype: ort::value::TensorElementType,
 }
 
 impl Jtp3Model {
@@ -129,6 +130,16 @@ impl Jtp3Model {
         let session = Session::builder()
             .and_then(|mut b| b.commit_from_file(&model_path))
             .with_context(|| format!("failed to load JTP-3 ONNX model from {}", model_path.display()))?;
+
+        let pos_embed_dtype = session
+            .inputs()
+            .iter()
+            .find(|i| i.name() == "pos_embed_padded")
+            .and_then(|i| match i.dtype() {
+                ort::value::ValueType::Tensor { ty, .. } => Some(*ty),
+                _ => None,
+            })
+            .unwrap_or(ort::value::TensorElementType::Float32);
 
         let pos_embed_path = dir.join("pos_embed.safetensors");
         let pos_embed = load_pos_embed(&pos_embed_path)
@@ -200,6 +211,7 @@ impl Jtp3Model {
             implications,
             categories,
             implication_mode,
+            pos_embed_dtype,
         })
     }
 
@@ -269,8 +281,23 @@ impl Model for Jtp3Model {
             .context("failed to create patches tensor")?;
         let valid_tensor = Tensor::from_array(valid_batch)
             .context("failed to create patch_valid tensor")?;
-        let pos_embed_tensor = Tensor::from_array(pos_embed_batch)
-            .context("failed to create pos_embed tensor")?;
+        let pos_embed_tensor: ort::value::DynValue = match self.pos_embed_dtype {
+            ort::value::TensorElementType::Float16 => {
+                let shape: Vec<i64> = pos_embed_batch.shape().iter().map(|&d| d as i64).collect();
+                let data: Vec<half::f16> = pos_embed_batch
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v))
+                    .collect();
+                Tensor::<half::f16>::from_array((shape, data))
+                    .context("failed to create fp16 pos_embed tensor")?
+                    .upcast()
+                    .into()
+            }
+            _ => Tensor::from_array(pos_embed_batch)
+                .context("failed to create pos_embed tensor")?
+                .upcast()
+                .into(),
+        };
 
         let mut session = self
             .session
@@ -519,7 +546,7 @@ fn sample_pos_embed(view: &ArrayView3<f32>, y: isize, x: isize, c: usize) -> f32
 }
 
 fn find_model_file(dir: &Path) -> Result<PathBuf> {
-    let candidates = ["model.onnx", "jtp-3-hydra-fp32.onnx"];
+    let candidates = ["model.onnx", "jtp-3-hydra-fp16.onnx", "jtp-3-hydra-fp32.onnx"];
     for name in &candidates {
         let path = dir.join(name);
         if path.is_file() {
