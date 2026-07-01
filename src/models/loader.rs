@@ -47,44 +47,32 @@ fn parse_safetensors_index(index_path: &Path) -> Result<Vec<String>> {
 }
 
 #[cfg(feature = "candle")]
-pub fn load_safetensors_paths(
-    repo: Option<&hf_hub::api::sync::ApiRepo>,
-    local_dir: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
-    let index_path = match (repo, local_dir) {
-        (Some(repo), None) => repo.get("model.safetensors.index.json").ok(),
-        (None, Some(dir)) => {
-            let p = dir.join("model.safetensors.index.json");
-            p.exists().then_some(p)
+fn load_local_safetensors_paths(local_dir: &Path) -> Result<Vec<PathBuf>> {
+    let index_path = local_dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let names = parse_safetensors_index(&index_path)?;
+        Ok(names.into_iter().map(|n| local_dir.join(n)).collect())
+    } else {
+        let p = local_dir.join("model.safetensors");
+        if p.exists() {
+            Ok(vec![p])
+        } else {
+            anyhow::bail!("model.safetensors not found in {}", local_dir.display())
         }
-        _ => None,
-    };
+    }
+}
 
+#[cfg(all(feature = "candle", feature = "hf-hub"))]
+fn load_hf_safetensors_paths(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf>> {
+    let index_path = repo.get("model.safetensors.index.json").ok();
     if let Some(index_path) = index_path {
         let names = parse_safetensors_index(&index_path)?;
-        match repo {
-            Some(repo) => names
-                .into_iter()
-                .map(|n| repo.get(&n).with_context(|| format!("failed to fetch {n}")))
-                .collect(),
-            None => {
-                let dir = local_dir.unwrap();
-                Ok(names.into_iter().map(|n| dir.join(n)).collect())
-            }
-        }
+        names
+            .into_iter()
+            .map(|n| repo.get(&n).with_context(|| format!("failed to fetch {n}")))
+            .collect()
     } else {
-        let single = match (repo, local_dir) {
-            (Some(repo), None) => repo.get("model.safetensors")?,
-            (None, Some(dir)) => {
-                let p = dir.join("model.safetensors");
-                if p.exists() {
-                    p
-                } else {
-                    anyhow::bail!("model.safetensors not found in {}", dir.display());
-                }
-            }
-            _ => anyhow::bail!("expected repo or local_dir"),
-        };
+        let single = repo.get("model.safetensors")?;
         Ok(vec![single])
     }
 }
@@ -92,12 +80,13 @@ pub fn load_safetensors_paths(
 #[cfg(feature = "candle")]
 pub fn load_model_files(source: &ModelSource) -> Result<ModelFiles> {
     match source {
+        #[cfg(feature = "hf-hub")]
         ModelSource::HfSlug(slug) => {
             let api = hf_hub::api::sync::Api::new()?;
             let repo = api.model(slug.clone());
             let labels_path = repo.get("selected_tags.csv").ok();
             let tokenizer_path = repo.get("tokenizer.json").ok();
-            let weights_paths = load_safetensors_paths(Some(&repo), None)?;
+            let weights_paths = load_hf_safetensors_paths(&repo)?;
             Ok(ModelFiles {
                 config_path: repo.get("config.json")?,
                 weights_paths,
@@ -105,12 +94,15 @@ pub fn load_model_files(source: &ModelSource) -> Result<ModelFiles> {
                 labels_path,
             })
         }
+        ModelSource::HfSlug(_) => {
+            anyhow::bail!("HuggingFace model slugs require the hf-hub feature")
+        }
         ModelSource::LocalPath(dir) => {
             let labels_path = dir.join("selected_tags.csv");
             let labels_path = labels_path.exists().then_some(labels_path);
             let tokenizer_path = dir.join("tokenizer.json");
             let tokenizer_path = tokenizer_path.exists().then_some(tokenizer_path);
-            let weights_paths = load_safetensors_paths(None, Some(dir))?;
+            let weights_paths = load_local_safetensors_paths(dir)?;
             Ok(ModelFiles {
                 config_path: dir.join("config.json"),
                 weights_paths,

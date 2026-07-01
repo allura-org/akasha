@@ -286,66 +286,76 @@ fn ensure_model_dir(path: &str) -> Result<PathBuf> {
         return Ok(target_dir);
     }
 
-    tracing::info!(slug = path, dir = %target_dir.display(), "Downloading ONNX model from HuggingFace");
+    #[cfg(feature = "hf-hub")]
+    {
+        tracing::info!(slug = path, dir = %target_dir.display(), "Downloading ONNX model from HuggingFace");
 
-    std::fs::create_dir_all(&target_dir)
-        .with_context(|| format!("failed to create model directory {}", target_dir.display()))?;
+        std::fs::create_dir_all(&target_dir)
+            .with_context(|| format!("failed to create model directory {}", target_dir.display()))?;
 
-    let api = hf_hub::api::sync::Api::new()?;
-    let repo = api.model(path.to_string());
+        let api = hf_hub::api::sync::Api::new()?;
+        let repo = api.model(path.to_string());
 
-    let info = repo.info().with_context(|| format!("failed to fetch repo info for {path}"))?;
+        let info = repo.info().with_context(|| format!("failed to fetch repo info for {path}"))?;
 
-    let wanted = [
-        ("model.onnx", "model.onnx"),
-        ("onnx/model.onnx", "model.onnx"),
-        ("vision_model.onnx", "vision_model.onnx"),
-        ("onnx/vision_model.onnx", "vision_model.onnx"),
-        ("text_model.onnx", "text_model.onnx"),
-        ("onnx/text_model.onnx", "text_model.onnx"),
-        ("config.json", "config.json"),
-        ("preprocess.json", "preprocess.json"),
-        ("preprocessor_config.json", "preprocessor_config.json"),
-        ("selected_tags.csv", "selected_tags.csv"),
-        ("categories.json", "categories.json"),
-        ("tags.json", "tags.json"),
-        ("labels.txt", "labels.txt"),
-    ];
+        let wanted = [
+            ("model.onnx", "model.onnx"),
+            ("onnx/model.onnx", "model.onnx"),
+            ("vision_model.onnx", "vision_model.onnx"),
+            ("onnx/vision_model.onnx", "vision_model.onnx"),
+            ("text_model.onnx", "text_model.onnx"),
+            ("onnx/text_model.onnx", "text_model.onnx"),
+            ("config.json", "config.json"),
+            ("preprocess.json", "preprocess.json"),
+            ("preprocessor_config.json", "preprocessor_config.json"),
+            ("selected_tags.csv", "selected_tags.csv"),
+            ("categories.json", "categories.json"),
+            ("tags.json", "tags.json"),
+            ("labels.txt", "labels.txt"),
+        ];
 
-    let available: std::collections::HashSet<String> = info
-        .siblings
-        .into_iter()
-        .map(|s| s.rfilename)
-        .collect();
+        let available: std::collections::HashSet<String> = info
+            .siblings
+            .into_iter()
+            .map(|s| s.rfilename)
+            .collect();
 
-    let mut downloaded_model = false;
-    for (remote, local) in &wanted {
-        if !available.contains(*remote) {
-            continue;
-        }
-        match repo.get(remote) {
-            Ok(src) => {
-                let dst = target_dir.join(local);
-                if let Err(e) = std::fs::copy(&src, &dst) {
-                    tracing::warn!(src = %src.display(), dst = %dst.display(), error = %e, "Failed to copy downloaded file");
-                } else {
-                    tracing::info!(file = remote, "Downloaded");
-                    if local.ends_with(".onnx") {
-                        downloaded_model = true;
+        let mut downloaded_model = false;
+        for (remote, local) in &wanted {
+            if !available.contains(*remote) {
+                continue;
+            }
+            match repo.get(remote) {
+                Ok(src) => {
+                    let dst = target_dir.join(local);
+                    if let Err(e) = std::fs::copy(&src, &dst) {
+                        tracing::warn!(src = %src.display(), dst = %dst.display(), error = %e, "Failed to copy downloaded file");
+                    } else {
+                        tracing::info!(file = remote, "Downloaded");
+                        if local.ends_with(".onnx") {
+                            downloaded_model = true;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(file = remote, error = %e, "Failed to download file");
+                Err(e) => {
+                    tracing::warn!(file = remote, error = %e, "Failed to download file");
+                }
             }
         }
+
+        if !downloaded_model {
+            anyhow::bail!("no ONNX model file could be downloaded from {path}");
+        }
+
+        Ok(target_dir)
     }
 
-    if !downloaded_model {
-        anyhow::bail!("no ONNX model file could be downloaded from {path}");
+    #[cfg(not(feature = "hf-hub"))]
+    {
+        anyhow::bail!(
+            "HuggingFace model slug '{path}' requires the hf-hub feature to download"
+        )
     }
-
-    Ok(target_dir)
 }
 
 /// Inspect the session's input type to decide whether the model expects NHWC (channels-last)
