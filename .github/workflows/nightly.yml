@@ -24,8 +24,9 @@ jobs:
           # ONNX Runtime (glibc requirements + static/dynamic linking) is a
           # time sink; local `cargo run` still gets it via default features.
           # `hf-hub` and `mistralrs` are included for HuggingFace downloads and
-          # local VLM inference; they link against OpenSSL, just like the
-          # libwebp dependency from `simd-thumbnails`.
+          # local VLM inference. OpenSSL is statically vendored into the binary
+          # (via the `openssl/vendored` feature), just like libwebp is from
+          # `simd-thumbnails`.
           - os: ubuntu-22.04
             feature-flag: ""
             suffix: ""
@@ -52,8 +53,7 @@ jobs:
             libxcb-xfixes0-dev \
             libegl1-mesa-dev \
             libheif-dev \
-            libde265-dev \
-            libssl-dev
+            libde265-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

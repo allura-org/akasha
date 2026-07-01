@@ -7,9 +7,9 @@ edition = "2024"
 default = ["simd-thumbnails", "remote", "candle", "onnx"]
 hevc = ["dep:libheif-rs"]
 simd-thumbnails = ["dep:fast_image_resize", "dep:webp"]
-hf-hub = ["dep:hf-hub"]
+hf-hub = ["dep:hf-hub", "dep:openssl"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers"]
-mistralrs = ["dep:mistralrs"]
+mistralrs = ["dep:mistralrs", "dep:openssl"]
 remote = ["dep:reqwest", "dep:base64"]
 onnx = ["dep:ort", "dep:ndarray", "dep:csv"]
 cuda = ["candle", "candle-core/cuda", "mistralrs?/cuda"]
@@ -99,6 +99,9 @@ csv = { version = "1.3", optional = true }
 
 # mistral.rs local inference (optional)
 mistralrs = { version = "0.8.1", optional = true }
+
+# Static OpenSSL for hf-hub / mistral.rs on Linux
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

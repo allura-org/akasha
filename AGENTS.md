@@ -44,7 +44,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Date/time | `chrono` (with serde support) |
 | File system watching | `notify` 8, `notify-debouncer-full` 0.5 |
 | Local inference (optional) | `candle-core` 0.11, `candle-nn` 0.11, `candle-transformers` 0.11 |
-| HuggingFace downloads (optional) | `hf-hub` 0.4 (`native-tls`), gated behind `hf-hub` feature |
+| HuggingFace downloads (optional) | `hf-hub` 0.4 (`native-tls`), gated behind `hf-hub` feature; OpenSSL statically vendored via `openssl/vendored` |
 | Local ONNX inference (default) | `ort` 2.0.0-rc.12 (ONNX Runtime 1.24), `ndarray` 0.17 |
 | Remote inference (optional) | `reqwest` 0.12 (`blocking` + `rustls-tls`), `base64` 0.22 |
 | Local VLM inference (optional) | `mistralrs` 0.8.1, gated behind `mistralrs` feature |
@@ -74,7 +74,7 @@ cargo test
 ### Feature flags
 
 - `candle` (default) — Enables local inference via Candle (`candle-core`, `candle-nn`, `candle-transformers`). Used by the `CandleBackend` for tag/classification/description models. Without the `hf-hub` feature, Candle models must be available as local paths. Disable with `--no-default-features` for a lighter build.
-- `hf-hub` (optional) — Enables downloading HuggingFace models by slug for Candle and ONNX backends. Requires OpenSSL (`libssl-dev` / `openssl-devel`).
+- `hf-hub` (optional) — Enables downloading HuggingFace models by slug for Candle and ONNX backends. Uses a statically vendored OpenSSL (via `openssl/vendored`) on Linux, so no system `libssl-dev` is required.
 - `cuda` — Enables CUDA support in Candle (requires `candle` feature and a CUDA toolkit). Build with `cargo build --features cuda`.
 - `remote` (default) — Enables remote HTTP inference via `reqwest::blocking` and `base64`. Used by the `RemoteBackend` for OpenAI-compatible or custom endpoints. Disable with `--no-default-features`.
 - `onnx` (default) — Enables local ONNX inference via `ort` and `ndarray`. Used by the `OrtBackend` for running ONNX models (e.g., WD VIT taggers, SigLIP). Without the `hf-hub` feature, ONNX models must be available as local paths. Disable with `--no-default-features`.
@@ -85,7 +85,7 @@ cargo test
   - Build with the feature: `cargo build --features hevc`
   - This feature is **excluded from default builds** for license reasons and is only included in the dedicated HEVC binary.
 - `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; requires `libwebp-dev` (Debian/Ubuntu) or `libwebp-devel` (Fedora).
-- `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Requires OpenSSL because `mistral.rs` uses `hf-hub` with `native-tls`.
+- `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Uses a statically vendored OpenSSL on Linux.
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
