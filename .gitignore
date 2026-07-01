@@ -5,6 +5,7 @@ Cargo.lock
 *.db-shm
 .akasha_thumbs/
 test_imgs/
+test_models/
 .DS_Store
 .kimi
 run-gpu.sh

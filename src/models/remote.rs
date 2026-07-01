@@ -139,6 +139,7 @@ mod tests {
             classification: None,
             remote: Some(ModelRemoteOptions::default()),
             onnx: None,
+            jtp3: None,
         };
         assert!(backend.supports(&cfg));
     }
@@ -177,6 +178,7 @@ mod tests {
             classification: None,
             remote: Some(ModelRemoteOptions::default()),
             onnx: None,
+            jtp3: None,
         };
 
         let output = RemoteBackend::new(RemoteConfig::default())
@@ -229,6 +231,7 @@ mod tests {
             classification: None,
             remote: Some(ModelRemoteOptions::default()),
             onnx: None,
+            jtp3: None,
         };
 
         let output = RemoteBackend::new(RemoteConfig::default())

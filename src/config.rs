@@ -148,6 +148,7 @@ pub struct ModelConfig {
     pub classification: Option<ModelClassificationOptions>,
     pub remote: Option<ModelRemoteOptions>,
     pub onnx: Option<ModelOnnxOptions>,
+    pub jtp3: Option<ModelJtp3Options>,
 }
 
 impl Default for ModelConfig {
@@ -165,6 +166,7 @@ impl Default for ModelConfig {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         }
     }
 }
@@ -201,6 +203,21 @@ pub struct ModelOnnxOptions {
     pub tags_file: Option<String>,
     /// Explicit preprocessing config file. If omitted, OrtBackend searches the model folder.
     pub config_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelJtp3Options {
+    /// Implication mode for tag relationships. One of: inherit, constrain,
+    /// remove, constrain-remove, off. Defaults to "inherit" if tag metadata is
+    /// available, otherwise "off".
+    #[serde(default)]
+    pub implications: String,
+    /// Explicit calibration CSV path. If omitted, the backend looks for
+    /// `calibration.csv` in the model directory.
+    pub calibration_file: Option<String>,
+    /// Explicit tag metadata CSV path. If omitted, the backend looks for
+    /// `tags.csv` or `jtp-3-hydra-tags.csv` in the model directory.
+    pub metadata_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
