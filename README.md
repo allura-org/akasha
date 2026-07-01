@@ -43,11 +43,87 @@ thankfully we live in the era of vibe-coding. so i slopped harder than ive ever 
 ## install
 
 clone it and `cargo build` homeboy. (or grab the latest nightly over [hyea](https://github.com/allura-org/akasha/releases/tag/nightly))
+(note that ONNX is currently not included in nightly builds because of a packaging headache)
 
-### extra features
+### features
+when building from source, akasha's default features require no extra dependencies besides a working C toolchain:
 
-when building from source, akasha is pure-rust by default for ease of setup, but some features require non-rust libraries.
-if u want an optional feature, use `--features <feature>` once for each.
+```bash
+# Debian / Ubuntu
+sudo apt install build-essential
+
+# Fedora
+sudo dnf install gcc make
+```
+
+for `cargo build --all-features`, you'll need `perl` (for OpenSSL), `libheif` and `libde265` (for HEVC), and CUDA Toolkit (for use ur imagination).
+
+```bash
+# Debian / Ubuntu
+sudo apt install libheif-dev libde265-dev perl
+
+# Fedora
+sudo dnf install libheif-devel libde265-devel perl
+```
+(if i could give u a one-liner for CUDA on both families i'd have 2 more hours on my lifespan r/n)
+
+#### remote AI inference
+
+`remote`
+
+remote (OpenAI-compatible) inference for classifiers (WIP) and descriptions, with `reqwest`.
+
+#### SIMD thumbnail generation (non-rust)
+
+`simd-thumbnails`
+
+accelerates thumbnail generation with `libwebp`. compiled at build time (no external dependencies.)
+requires a working C toolchain.
+
+#### inference backends: `onnx`
+
+`onnx`
+
+enables local inference with `ort` for ONNX-format taggers. when `hf-hub` is enabled, parses .json files from the repo to configure the preprocessor, which is a Very Big Win.
+
+#### inference backends: `candle`
+
+`candle`
+
+enables local inference using Hugging Face `candle`. currently this isn't well-supported for the implemented inference modes (taggers, VLMs where it straight-up isn't finished), but it's listed for the sake of completeness. support for customized models like JTP-3 is planned, and these will be implemented through `candle` primitives.
+
+### optional features
+
+these features require non-rust components. if u want optional features, use `--features "feature1 feature2..."`
+
+#### huggingface model downloads
+
+`hf-hub`
+
+enables putting an HF slug into config.toml to automatically download models.
+this uses statically-vendored `openssl` via `native-tls`, due to bugs with `rustls-tls`.
+in addition to a working C toolchain you also need `perl`.
+
+**dependencies:**
+- `base-devel`/`gcc`+`make`
+- `perl`
+
+#### inference backends: mistralrs
+
+`mistralrs`
+
+enables VLMs to generate descriptions using mistral.rs.
+mistral.rs itself *requires* `hf-hub`, and thus external dependencies, which is why it's not a default feature.
+
+**dependencies**
+- see `hf-hub`
+
+#### CUDA acceleration
+
+`cuda`
+
+lets you generate tags/descriptions at speeds that *may* process your library *before* you shuffle off your mortal coil. (currently ONNX CUDA isn't wired up.)
+requires CUDA toolkit installed. get that wherever proprietary compute libraries are sold.
 
 #### HEVC support
 
@@ -68,45 +144,12 @@ sudo apt install libheif-dev libde265-dev
 sudo dnf install libheif-devel libde265-devel
 ```
 
-#### SIMD thumbnail generation
-
-`simd-thumbnails`
-
-accelerates thumbnail generation.
-
-**dependencies:**
-
-- `libwebp`
-
-```bash
-# Debian / Ubuntu
-sudo apt install libwebp-dev
-
-# Fedora
-sudo dnf install libwebp-devel
-```
-
-#### Local AI inference (candle)
-
-`candle`
-
-enables local inference using Hugging Face `candle`. Models are downloaded on first use via `hf-hub` and cached in `$HF_HOME` (default `~/.cache/huggingface`). Add a `[[models]]` entry to `config.toml` with `type = "local"` and the relevant output subtable (`[models.tags]`, `[models.description]`, etc.).
-
-```bash
-cargo build --features candle
-# or with CUDA support:
-cargo build --features candle,cuda
-```
-
-**notes:**
-
-- Local CPU inference can be very slow on large collections and only runs while Akasha is open.
-- The popular `SmilingWolf/wd-vit-tagger-v3` checkpoint uses a `timm`-style model config and is not directly compatible with `candle_transformers::models::vit`; use standard Hugging Face ViT checkpoints (e.g. `google/vit-base-patch16-224`) for the current scaffold.
-
 ## setup
 
-`~.config/akasha/config.toml` should be generated on first launch.
-modify the `[[imports]]` table array (including the `[imports.thumbnails]` tables) to your preferences.
+`~/.config/akasha/config.toml` should be generated on first launch.
+
+### import folders
+modify the `[[imports]]` table array (including the `[imports.thumbnails]` tables) to your preferences. the defaults should be fine for most people.
 you can copy these table arrays multiple times for multiple imports.
 
 refer to `config.example.toml` in this repo for info on all the available options.
