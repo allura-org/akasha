@@ -23,7 +23,9 @@ impl Backend for MistralRsBackend {
     }
 
     fn supports(&self, config: &ModelConfig) -> bool {
-        config.description.is_some()
+        config.kind == crate::config::ModelKind::Local
+            && config.description.is_some()
+            && config.backend.as_deref() == Some("mistralrs")
     }
 
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
