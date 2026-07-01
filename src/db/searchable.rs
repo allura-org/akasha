@@ -364,6 +364,7 @@ pub async fn sync_model_configs(
             "backend": model.backend,
             "remote": model.remote,
             "onnx": model.onnx,
+            "jtp3": model.jtp3,
             "kind": model.kind,
         });
 
@@ -436,6 +437,10 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         .get("onnx")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let jtp3: Option<crate::config::ModelJtp3Options> = opts
+        .get("jtp3")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
     let tags: Option<crate::config::ModelTagsOptions> = opts
         .get("threshold")
         .and_then(|_| serde_json::from_value(opts.clone()).ok());
@@ -461,7 +466,7 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         api_key: opts.get("api_key").and_then(|v| v.as_str()).map(|s| s.to_string()),
         remote,
         onnx,
-        jtp3: None,
+        jtp3,
         tags,
         description,
         classification,
