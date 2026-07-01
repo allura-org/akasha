@@ -30,6 +30,7 @@ const DEFAULT_MAX_SEQ_LEN: usize = 1024;
 const POS_EMBED_H: usize = 16;
 const POS_EMBED_W: usize = 16;
 const EMBED_DIM: usize = 1152;
+const ONNX_MODELS_DIR: &str = "models/onnx";
 
 pub struct Jtp3Backend;
 
@@ -52,15 +53,18 @@ impl Backend for Jtp3Backend {
             return true;
         }
 
-        // Auto-detect a JTP-3 layout in the configured path.
+        // Auto-detect a JTP-3 layout in the configured path.  Relative paths are
+        // resolved under the normal ONNX models directory so JTP-3 models can live
+        // alongside other ONNX models.
         if let Some(path) = &config.path {
-            let dir = Path::new(path);
-            if dir.is_dir()
-                && find_model_file(dir).is_ok()
-                && dir.join("pos_embed.safetensors").is_file()
-                && dir.join("tags.txt").is_file()
-            {
-                return true;
+            if let Ok(dir) = resolve_model_dir(path) {
+                if dir.is_dir()
+                    && find_model_file(&dir).is_ok()
+                    && dir.join("pos_embed.safetensors").is_file()
+                    && dir.join("tags.txt").is_file()
+                {
+                    return true;
+                }
             }
         }
 
@@ -85,12 +89,12 @@ pub struct Jtp3Model {
 impl Jtp3Model {
     fn load(config: &ModelConfig) -> Result<Self> {
         let path = config.path.as_deref().context("jtp3 model missing path")?;
-        let dir = Path::new(path);
+        let dir = resolve_model_dir(path)?;
         if !dir.is_dir() {
-            anyhow::bail!("jtp3 model path must be a directory: {}", dir.display());
+            anyhow::bail!("jtp3 model directory not found: {}", dir.display());
         }
 
-        let model_path = find_model_file(dir)?;
+        let model_path = find_model_file(&dir)?;
         tracing::info!(dir = %dir.display(), model = %model_path.display(), "Loading JTP-3 ONNX model");
 
         let session = Session::builder()
@@ -361,6 +365,21 @@ fn find_model_file(dir: &Path) -> Result<PathBuf> {
     anyhow::bail!("no ONNX model file found in {}", dir.display())
 }
 
+/// Resolve a model path the same way the regular OrtBackend does.
+///
+/// Absolute paths are used as-is. Relative paths are treated as a slug under
+/// `~/.local/share/akasha/models/onnx/`.
+fn resolve_model_dir(path: &str) -> Result<PathBuf> {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+
+    let slug = path.replace('/', "-");
+    let data_dir = crate::config::Config::data_dir()?;
+    Ok(data_dir.join(ONNX_MODELS_DIR).join(slug))
+}
+
 fn load_pos_embed(path: &Path) -> Result<Array4<f32>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read pos_embed file: {}", path.display()))?;
@@ -429,9 +448,20 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual: requires JTP-3 ONNX model in test_models/jtp3"]
+    #[ignore = "manual: requires JTP-3 ONNX model in test_models/jtp3 or ~/.local/share/akasha/models/onnx/jtp-3-hydra"]
     fn jtp3_backend_runs() {
-        let model_dir = PathBuf::from("test_models/jtp3");
+        // Prefer the normal ONNX models directory layout (relative slug).
+        let model_dir = if resolve_model_dir("jtp-3-hydra")
+            .map(|p| p.join("model.onnx").exists())
+            .unwrap_or(false)
+        {
+            resolve_model_dir("jtp-3-hydra").unwrap()
+        } else {
+            PathBuf::from("test_models/jtp3").canonicalize().unwrap_or_else(|_| {
+                PathBuf::from("test_models/jtp3")
+            })
+        };
+
         if !model_dir.join("model.onnx").exists() {
             eprintln!("Skipping: model not found at {}", model_dir.display());
             return;
