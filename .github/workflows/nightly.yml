@@ -23,16 +23,19 @@ jobs:
           # ONNX is kept out of release binaries for now because packaging
           # ONNX Runtime (glibc requirements + static/dynamic linking) is a
           # time sink; local `cargo run` still gets it via default features.
+          # `hf-hub` and `mistralrs` are included for HuggingFace downloads and
+          # local VLM inference; they link against OpenSSL, just like the
+          # libwebp dependency from `simd-thumbnails`.
           - os: ubuntu-22.04
             feature-flag: ""
             suffix: ""
-            cargo-features: "simd-thumbnails,remote,candle"
+            cargo-features: "simd-thumbnails,remote,candle,hf-hub,mistralrs"
           # HEVC build: needs libheif >= 1.17, which Ubuntu 24.04 provides.
           # Slightly newer glibc, but HEVC users likely run modern distros anyway.
           - os: ubuntu-24.04
             feature-flag: "hevc"
             suffix: "-hevc"
-            cargo-features: "simd-thumbnails,remote,candle,hevc"
+            cargo-features: "simd-thumbnails,remote,candle,hf-hub,mistralrs,hevc"
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -49,7 +52,8 @@ jobs:
             libxcb-xfixes0-dev \
             libegl1-mesa-dev \
             libheif-dev \
-            libde265-dev
+            libde265-dev \
+            libssl-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
