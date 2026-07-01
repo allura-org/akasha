@@ -144,11 +144,9 @@ impl Jtp3Model {
                 .with_inter_threads(t)
                 .map_err(|e| anyhow::anyhow!("failed to set inter-op threads: {e}"))?;
         }
-        if jtp3_opts.memory_pattern {
-            builder = builder
-                .with_memory_pattern(true)
-                .map_err(|e| anyhow::anyhow!("failed to enable memory pattern: {e}"))?;
-        }
+        builder = builder
+            .with_memory_pattern(jtp3_opts.memory_pattern)
+            .map_err(|e| anyhow::anyhow!("failed to set memory pattern: {e}"))?;
         let session = builder
             .commit_from_file(&model_path)
             .with_context(|| format!("failed to load JTP-3 ONNX model from {}", model_path.display()))?;
