@@ -45,7 +45,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | File system watching | `notify` 8, `notify-debouncer-full` 0.5 |
 | Local inference (optional) | `candle-core` 0.8, `candle-nn` 0.8, `candle-transformers` 0.8, `hf-hub` 0.4 |
 | Local ONNX inference (default) | `ort` 2.0.0-rc.12 (ONNX Runtime 1.24), `ndarray` 0.17 |
-| Remote inference (optional) | `reqwest` 0.12 (`blocking` + `rustls-tls`), `base64` 0.22 |
+| Remote inference (optional) | `reqwest` 0.12 (`blocking` + `native-tls`), `base64` 0.22 |
 
 ---
 
@@ -54,13 +54,13 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 Standard Cargo workflow:
 
 ```bash
-# Debug build (pure Rust, no C dependencies)
+# Debug build (default features; needs OpenSSL/libssl-dev)
 cargo build
 
 # Run
 cargo run
 
-# Release build (pure Rust)
+# Release build (default features; needs OpenSSL/libssl-dev)
 cargo build --release
 
 # With SIMD thumbnail acceleration (requires libwebp-dev / libwebp-devel)
