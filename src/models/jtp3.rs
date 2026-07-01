@@ -132,6 +132,12 @@ impl Jtp3Model {
             .map_err(|e| anyhow::anyhow!("failed to create ONNX Runtime session builder: {e}"))?
             .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
             .map_err(|e| anyhow::anyhow!("failed to configure CPU execution provider: {e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| anyhow::anyhow!("failed to set intra-op threads: {e}"))?
+            .with_inter_threads(1)
+            .map_err(|e| anyhow::anyhow!("failed to set inter-op threads: {e}"))?
+            .with_memory_pattern(true)
+            .map_err(|e| anyhow::anyhow!("failed to enable memory pattern: {e}"))?
             .commit_from_file(&model_path)
             .with_context(|| format!("failed to load JTP-3 ONNX model from {}", model_path.display()))?;
 
