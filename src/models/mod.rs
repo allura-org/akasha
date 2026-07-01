@@ -17,6 +17,8 @@ pub mod stub;
 pub mod remote;
 #[cfg(feature = "onnx")]
 pub mod onnx;
+#[cfg(feature = "onnx")]
+pub mod jtp3;
 #[cfg(feature = "mistralrs")]
 pub mod mistralrs;
 
@@ -61,6 +63,11 @@ impl BackendRegistry {
         reg.register(mistralrs::MistralRsBackend);
         #[cfg(feature = "candle")]
         reg.register(candle::CandleBackend);
+        // Register JTP-3 before the generic ONNX backend so its specific
+        // auto-detection (pos_embed.safetensors + tags.txt) wins for JTP-3
+        // folders, while normal ONNX models fall through to OrtBackend.
+        #[cfg(feature = "onnx")]
+        reg.register(jtp3::Jtp3Backend);
         #[cfg(feature = "onnx")]
         reg.register(onnx::OrtBackend);
         #[cfg(not(feature = "remote"))]
@@ -146,6 +153,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         assert!(reg.select(&config).is_some());
     }
@@ -166,6 +174,7 @@ mod tests {
             classification: None,
             remote: None,
             onnx: None,
+            jtp3: None,
         };
         assert!(reg.select(&config).is_none());
     }
