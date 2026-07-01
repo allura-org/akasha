@@ -205,6 +205,10 @@ pub struct ModelOnnxOptions {
     pub config_file: Option<String>,
 }
 
+fn default_jtp3_batch_size() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelJtp3Options {
     /// Implication mode for tag relationships. One of: inherit, constrain,
@@ -218,6 +222,10 @@ pub struct ModelJtp3Options {
     /// Explicit tag metadata CSV path. If omitted, the backend looks for
     /// `tags.csv` or `jtp-3-hydra-tags.csv` in the model directory.
     pub metadata_file: Option<String>,
+    /// Inference batch size for this JTP-3 model. JTP-3 activations scale
+    /// quickly with batch size, so the default is conservative.
+    #[serde(default = "default_jtp3_batch_size")]
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

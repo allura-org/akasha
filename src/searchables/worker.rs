@@ -121,8 +121,6 @@ impl SearchWorker {
         &mut self,
         jobs: &[crate::db::searchable::JobRow],
     ) -> anyhow::Result<()> {
-        use std::path::Path;
-
         let first_job = jobs.first().context("empty job batch")?;
         let cfg = crate::db::searchable::get_config_by_id(
             &self.pool,
@@ -163,6 +161,37 @@ impl SearchWorker {
         }
 
         let model = self.resident.as_ref().unwrap().model.clone();
+        let max_batch = model.max_batch_size().max(1);
+
+        // Split the config group into inference chunks sized to what the model
+        // says it can handle without blowing up memory.
+        for chunk in jobs.chunks(max_batch) {
+            if let Err(e) = self
+                .process_chunk(chunk, &cfg, &model_config, model.clone())
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    chunk_size = chunk.len(),
+                    "SearchWorker: inference chunk failed"
+                );
+                for job in chunk {
+                    let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_chunk(
+        &self,
+        jobs: &[crate::db::searchable::JobRow],
+        cfg: &crate::db::searchable::SearchableConfig,
+        model_config: &crate::config::ModelConfig,
+        model: Arc<dyn crate::models::Model>,
+    ) -> anyhow::Result<()> {
+        use std::path::Path;
 
         let mut paths = Vec::with_capacity(jobs.len());
         for job in jobs {

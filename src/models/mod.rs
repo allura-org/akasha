@@ -42,6 +42,12 @@ pub trait Model: Send + Sync {
             .map(|path| self.infer(path))
             .collect::<Result<Vec<_>>>()
     }
+
+    /// Maximum number of images this model will process in a single inference
+    /// call. Backends can raise this once memory usage is bounded.
+    fn max_batch_size(&self) -> usize {
+        1
+    }
 }
 
 pub trait Backend: Send + Sync {

@@ -114,6 +114,7 @@ pub struct Jtp3Model {
     categories: HashMap<String, i32>,
     implication_mode: ImplicationMode,
     pos_embed_dtype: ort::value::TensorElementType,
+    max_batch_size: usize,
 }
 
 impl Jtp3Model {
@@ -190,6 +191,8 @@ impl Jtp3Model {
             ImplicationMode::parse(&jtp3_opts.implications)
         };
 
+        let max_batch_size = jtp3_opts.batch_size.max(1);
+
         tracing::info!(
             tags = tags.len(),
             threshold,
@@ -197,6 +200,7 @@ impl Jtp3Model {
             calibrated = thresholds.len(),
             metadata = implications.len(),
             implication_mode = ?implication_mode,
+            max_batch_size,
             "JTP-3 model ready"
         );
 
@@ -212,6 +216,7 @@ impl Jtp3Model {
             categories,
             implication_mode,
             pos_embed_dtype,
+            max_batch_size,
         })
     }
 
@@ -274,6 +279,10 @@ impl Model for Jtp3Model {
             .into_iter()
             .next()
             .context("JTP-3 batch inference returned no outputs")
+    }
+
+    fn max_batch_size(&self) -> usize {
+        self.max_batch_size
     }
 
     fn infer_batch(&self, image_paths: &[&Path]) -> Result<Vec<ModelOutput>> {
