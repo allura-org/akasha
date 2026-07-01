@@ -1,24 +1,33 @@
 ## Summary
 
-Adds end-to-end support for vision-language model (VLM) description jobs inside the Candle backend, so visionlanguage / description AI jobs can run against local multimodal checkpoints. The first supported architecture is google/gemma-4-E2B-it.
+Add an optional `mistralrs` backend for local vision-language model (VLM) description jobs. This lets Akasha run multimodal captioning models (e.g., `google/gemma-4-E2B-it`, `Qwen/Qwen3-VL-2B-Instruct`) through `mistral.rs` instead of Candle, because Candle does not yet support the Gemma 4 architecture.
 
 ## What changed
 
-- Upgraded candle-core, candle-nn, and candle-transformers to 0.11.0; added optional tokenizers = "0.22" under the candle feature.
-- Extended ModelFiles / model loader to discover tokenizer.json and sharded model.safetensors.index.json files.
-- Added generation controls to ModelDescriptionOptions (max_tokens, temperature, top_p, top_k, repeat_penalty, repeat_last_n, plus optional image normalization overrides).
-- Introduced VlmModel / VlmArchitecture traits and VlmArchitectureRegistry, mirroring the existing backend registry pattern.
-- Implemented Gemma4Vlm with image preprocessing aligned to the official processor_config.json (rescale 1/255, Bicubic resize, 280 image tokens) and a manual prompt tokenization fallback.
-- Added a BLIP stub architecture for future expansion.
-- Wired the VLM registry into CandleBackend::load via VlmModelWrapper; description jobs now produce ModelOutput::Description through the existing SearchWorker pipeline.
-- Added integration and unit tests, including mock VLM description job coverage.
+- Added optional `mistralrs` Cargo feature and `mistralrs = "0.8.1"` dependency.
+- Implemented `MistralRsBackend` / `MistralRsModel` in `src/models/mistralrs.rs`:
+  - Bridges `mistral.rs`'s async `MultimodalModelBuilder` to the synchronous `Model::infer` trait by keeping a `tokio::runtime::Handle` (not a full `Runtime`), avoiding the nested-runtime drop panic seen when switching models.
+  - Supports configurable in-situ quantization via the new `isq` field in `ModelDescriptionOptions` (default `"Q8_0"`; `"none"` disables).
+  - Requires an explicit `backend = "mistralrs"` config value so it does not accidentally claim Candle or Remote description models.
+- Registered `MistralRsBackend` in `BackendRegistry`.
+- Improved `SearchWorker` robustness:
+  - Deletes existing predictions only after successful inference, preventing overwrite-enabled jobs from wiping data on failure.
+  - Fails the job if tags or description outputs are empty/whitespace.
+  - Resets any jobs left in `running` status to `failed` on startup (crash cleanup, no auto-resume).
+- Made the Properties window refresh every 2 seconds while open so inference results appear without closing/reopening.
+- Unified all HTTP/TLS usage on `native-tls` (`hf-hub`, `reqwest`, `ort`) to avoid `rustls` TLS `close_notify` and truncated-response failures when downloading large model files from Hugging Face.
+- Added `scripts/regenerate_imports.py` to rebuild `[[imports]]` config blocks from the database after the config key fix.
+- Added `run-gpu.sh` as a local test helper for the 32-bit `/usr/lib/libcuda.so` linker workaround (gitignored, not shipped).
+- Updated `AGENTS.md` and `config.example.toml` to document the new backend and `isq` option.
 
 ## Testing
 
-- cargo test passes: 66 passed, 0 failed, 4 ignored.
+- `cargo check --all-features` passes.
+- `cargo test --features "hevc simd-thumbnails candle remote onnx mistralrs"` passes: 67 passed, 0 failed, 4 ignored.
+- Verified end-to-end on GPU: `google/gemma-4-E2B-it` and `Qwen/Qwen3-VL-2B-Instruct` load via `mistralrs` and produce descriptions.
 
 ## Known limitations
 
-- The tokenizer fallback is hand-rolled because tokenizers 0.22 does not expose apply_chat_template.
-- Architecture selection currently relies on model name/path heuristics; explicit candle-* backend hints are not fully wired.
-- Real inference against the full Gemma 4 checkpoint has not been smoke-tested yet.
+- `mistral.rs` handles its own HuggingFace downloads; on some networks large model files may fail with truncated-body errors and need a retry/re-queue.
+- `mistralrs` models must specify `backend = "mistralrs"` explicitly.
+- Models still need to fit in VRAM; quantization via `isq` helps but very large VLMs will need a bigger card or CPU fallback.
