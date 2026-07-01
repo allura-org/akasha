@@ -264,6 +264,7 @@ classify_endpoint = "/classify"
 
 - **Commit often** — commits are useful for rolling back bad edits.
 - **Do not push unless explicitly instructed** — pushes should be deferred until a feature, fix, or rework is actually done.
+- **Never force-add `.gitignore`d files** — e.g., `.kimi/`, personal scripts, or secrets. If something genuinely needs to be tracked, update `.gitignore` first and confirm with the user; do not use `git add -f`.
 
 ---
 
