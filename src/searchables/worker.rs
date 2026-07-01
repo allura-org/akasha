@@ -94,22 +94,39 @@ impl SearchWorker {
 
         cluster_jobs(&mut to_process, self.resident.as_ref().map(|r| r.config_id));
 
-        for job in &to_process {
-            if let Err(e) = self.process_one(job).await {
-                tracing::warn!(job_id = job.id, error = %e, "SearchWorker: job failed");
-                let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+        // Process claimed jobs in config-homogeneous batches so backends that
+        // support batch inference (e.g., JTP-3 ONNX) can run multiple images
+        // in a single model call.
+        let mut i = 0;
+        while i < to_process.len() {
+            let config_id = to_process[i].searchable_config_id;
+            let mut j = i + 1;
+            while j < to_process.len() && to_process[j].searchable_config_id == config_id {
+                j += 1;
             }
+            let group = &to_process[i..j];
+            if let Err(e) = self.process_batch(group).await {
+                tracing::warn!(error = %e, "SearchWorker: batch failed");
+                for job in group {
+                    let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+                }
+            }
+            i = j;
         }
 
         Ok(count)
     }
 
-    async fn process_one(&mut self, job: &crate::db::searchable::JobRow) -> anyhow::Result<()> {
+    async fn process_batch(
+        &mut self,
+        jobs: &[crate::db::searchable::JobRow],
+    ) -> anyhow::Result<()> {
         use std::path::Path;
 
+        let first_job = jobs.first().context("empty job batch")?;
         let cfg = crate::db::searchable::get_config_by_id(
             &self.pool,
-            job.searchable_config_id.unwrap_or(0),
+            first_job.searchable_config_id.unwrap_or(0),
         )
         .await?
         .context("missing searchable_config for job")?;
@@ -145,76 +162,94 @@ impl SearchWorker {
             tracing::info!(model = model_config.name, "SearchWorker: model loaded");
         }
 
-        let overwrite = job
-            .params_json
-            .as_deref()
-            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
-            .and_then(|v| v.get("overwrite").and_then(|o| o.as_bool()))
-            .unwrap_or(false);
-
         let model = self.resident.as_ref().unwrap().model.clone();
-        let media = crate::db::media::get_by_id(&self.pool, job.media_file_id)
-            .await?
-            .context("missing media file")?;
-        let image_path = media.absolute_path.clone();
 
-        let output = tokio::task::spawn_blocking(move || model.infer(Path::new(&image_path)))
-            .await
-            .map_err(|e| anyhow::anyhow!("inference task panicked: {e}"))??;
-
-        match output {
-            crate::models::ModelOutput::Tags(tags) => {
-                if tags.is_empty() {
-                    anyhow::bail!("model {} returned no tags", model_config.name);
-                }
-                if overwrite {
-                    crate::db::searchable::delete_tags_for_source(
-                        &self.pool,
-                        job.media_file_id,
-                        &cfg.name,
-                    )
-                    .await?;
-                }
-                crate::db::searchable::update_tags_json(
-                    &self.pool,
-                    job.media_file_id,
-                    &cfg.name,
-                    tags,
-                )
-                .await?;
-            }
-            crate::models::ModelOutput::Description(text) => {
-                if text.trim().is_empty() {
-                    anyhow::bail!(
-                        "model {} returned an empty description",
-                        model_config.name
-                    );
-                }
-                if overwrite {
-                    crate::db::searchable::delete_description_for_source(
-                        &self.pool,
-                        job.media_file_id,
-                        &cfg.name,
-                    )
-                    .await?;
-                }
-                crate::db::searchable::update_description_json(
-                    &self.pool,
-                    job.media_file_id,
-                    &cfg.name,
-                    &text,
-                )
-                .await?;
-            }
-            _ => {
-                anyhow::bail!(
-                    "model {} returned unsupported output kind {:?}; only Tags and Description are implemented",
-                    model_config.name, output
-                );
-            }
+        let mut paths = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let media = crate::db::media::get_by_id(&self.pool, job.media_file_id)
+                .await?
+                .context("missing media file")?;
+            paths.push(media.absolute_path);
         }
 
-        crate::db::searchable::complete_job(&self.pool, job.id).await?;
+        let outputs = tokio::task::spawn_blocking(move || {
+            let path_refs: Vec<&Path> = paths.iter().map(|p| Path::new(p)).collect();
+            model.infer_batch(&path_refs)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("inference task panicked: {e}"))??;
+
+        if outputs.len() != jobs.len() {
+            anyhow::bail!(
+                "model returned {} outputs for {} jobs",
+                outputs.len(),
+                jobs.len()
+            );
+        }
+
+        for (job, output) in jobs.iter().zip(outputs.into_iter()) {
+            let overwrite = job
+                .params_json
+                .as_deref()
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                .and_then(|v| v.get("overwrite").and_then(|o| o.as_bool()))
+                .unwrap_or(false);
+
+            match output {
+                crate::models::ModelOutput::Tags(tags) => {
+                    if tags.is_empty() {
+                        anyhow::bail!("model {} returned no tags", model_config.name);
+                    }
+                    if overwrite {
+                        crate::db::searchable::delete_tags_for_source(
+                            &self.pool,
+                            job.media_file_id,
+                            &cfg.name,
+                        )
+                        .await?;
+                    }
+                    crate::db::searchable::update_tags_json(
+                        &self.pool,
+                        job.media_file_id,
+                        &cfg.name,
+                        tags,
+                    )
+                    .await?;
+                }
+                crate::models::ModelOutput::Description(text) => {
+                    if text.trim().is_empty() {
+                        anyhow::bail!(
+                            "model {} returned an empty description",
+                            model_config.name
+                        );
+                    }
+                    if overwrite {
+                        crate::db::searchable::delete_description_for_source(
+                            &self.pool,
+                            job.media_file_id,
+                            &cfg.name,
+                        )
+                        .await?;
+                    }
+                    crate::db::searchable::update_description_json(
+                        &self.pool,
+                        job.media_file_id,
+                        &cfg.name,
+                        &text,
+                    )
+                    .await?;
+                }
+                _ => {
+                    anyhow::bail!(
+                        "model {} returned unsupported output kind {:?}; only Tags and Description are implemented",
+                        model_config.name, output
+                    );
+                }
+            }
+
+            crate::db::searchable::complete_job(&self.pool, job.id).await?;
+        }
+
         Ok(())
     }
 }

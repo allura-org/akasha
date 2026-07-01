@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use image::imageops::FilterType;
 use image::{ImageDecoder, RgbImage};
-use ndarray::{Array1, Array2, Array3, Array4, ArrayView3, Axis, s};
+use ndarray::{Array1, Array2, Array3, Array4, ArrayView3, Axis, s, stack};
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -270,12 +270,40 @@ impl Jtp3Model {
 
 impl Model for Jtp3Model {
     fn infer(&self, image_path: &Path) -> Result<ModelOutput> {
-        let (patches, valid, pos_embed) = self.preprocess(image_path)?;
+        self.infer_batch(&[image_path])?
+            .into_iter()
+            .next()
+            .context("JTP-3 batch inference returned no outputs")
+    }
 
-        // ONNX Runtime wants (batch, seq_len, ...); we run batch=1.
-        let patches_batch = patches.insert_axis(Axis(0));
-        let valid_batch = valid.insert_axis(Axis(0));
-        let pos_embed_batch = pos_embed.insert_axis(Axis(0));
+    fn infer_batch(&self, image_paths: &[&Path]) -> Result<Vec<ModelOutput>> {
+        if image_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Preprocess every image independently, then stack into one batch.
+        let mut patches_list = Vec::with_capacity(image_paths.len());
+        let mut valid_list = Vec::with_capacity(image_paths.len());
+        let mut pos_embed_list = Vec::with_capacity(image_paths.len());
+
+        for path in image_paths {
+            let (patches, valid, pos_embed) = self
+                .preprocess(path)
+                .with_context(|| format!("failed to preprocess {}", path.display()))?;
+            patches_list.push(patches);
+            valid_list.push(valid);
+            pos_embed_list.push(pos_embed);
+        }
+
+        let patches_batch = stack(Axis(0), &patches_list.iter().map(|a| a.view()).collect::<Vec<_>>())
+            .context("failed to stack patch tensors")?;
+        let valid_batch = stack(Axis(0), &valid_list.iter().map(|a| a.view()).collect::<Vec<_>>())
+            .context("failed to stack patch_valid tensors")?;
+        let pos_embed_batch = stack(
+            Axis(0),
+            &pos_embed_list.iter().map(|a| a.view()).collect::<Vec<_>>(),
+        )
+        .context("failed to stack pos_embed tensors")?;
 
         let patches_tensor = Tensor::from_array(patches_batch)
             .context("failed to create patches tensor")?;
@@ -309,62 +337,67 @@ impl Model for Jtp3Model {
                 "patch_valid" => valid_tensor,
                 "pos_embed_padded" => pos_embed_tensor
             ])
-            .context("JTP-3 ONNX inference failed")?;
+            .context("JTP-3 ONNX batch inference failed")?;
 
         let output = outputs["logits"]
             .try_extract_array::<f32>()
             .context("failed to extract logits tensor")?;
 
-        let scores: Vec<f32> = output
-            .slice(s![0, ..])
-            .iter()
-            .copied()
-            .collect();
+        let mut results = Vec::with_capacity(image_paths.len());
+        for (batch_idx, path) in image_paths.iter().enumerate() {
+            let scores: Vec<f32> = output
+                .slice(s![batch_idx, ..])
+                .iter()
+                .copied()
+                .collect();
 
-        let mut labels: HashMap<String, f32> = HashMap::new();
-        let mut max_score = 0.0f32;
-        let mut min_score = f32::INFINITY;
-        let mut sum_score = 0.0f32;
+            let mut labels: HashMap<String, f32> = HashMap::new();
+            let mut max_score = 0.0f32;
+            let mut min_score = f32::INFINITY;
+            let mut sum_score = 0.0f32;
 
-        for (idx, &score) in scores.iter().enumerate() {
-            let prob = 1.0 / (1.0 + (-score).exp());
-            max_score = max_score.max(prob);
-            min_score = min_score.min(prob);
-            sum_score += prob;
+            for (idx, &score) in scores.iter().enumerate() {
+                let prob = 1.0 / (1.0 + (-score).exp());
+                max_score = max_score.max(prob);
+                min_score = min_score.min(prob);
+                sum_score += prob;
 
-            let tag = self.tags.get(idx).map(|s| s.as_str()).unwrap_or("");
-            if tag.is_empty() {
-                continue;
+                let tag = self.tags.get(idx).map(|s| s.as_str()).unwrap_or("");
+                if tag.is_empty() {
+                    continue;
+                }
+
+                let threshold = self.thresholds.get(tag).copied().unwrap_or(self.threshold);
+                if prob >= threshold {
+                    labels.insert(tag.to_string(), prob);
+                }
             }
 
-            let threshold = self.thresholds.get(tag).copied().unwrap_or(self.threshold);
-            if prob >= threshold {
-                labels.insert(tag.to_string(), prob);
-            }
+            apply_implications(&mut labels, &self.implications, self.implication_mode);
+
+            let tags = crate::models::tagger::apply_top_k(labels, self.top_k);
+
+            let mean_score = if !scores.is_empty() {
+                sum_score / scores.len() as f32
+            } else {
+                0.0
+            };
+
+            tracing::info!(
+                image = ?path,
+                labels = self.tags.len(),
+                threshold = self.threshold,
+                max_score,
+                min_score = if min_score.is_finite() { min_score } else { 0.0 },
+                mean_score,
+                above_threshold = tags.len(),
+                "JTP-3 inference stats"
+            );
+
+            results.push(ModelOutput::Tags(tags));
         }
 
-        apply_implications(&mut labels, &self.implications, self.implication_mode);
-
-        let mut tags = crate::models::tagger::apply_top_k(labels, self.top_k);
-
-        let mean_score = if !scores.is_empty() {
-            sum_score / scores.len() as f32
-        } else {
-            0.0
-        };
-
-        tracing::info!(
-            image = ?image_path,
-            labels = self.tags.len(),
-            threshold = self.threshold,
-            max_score,
-            min_score = if min_score.is_finite() { min_score } else { 0.0 },
-            mean_score,
-            above_threshold = tags.len(),
-            "JTP-3 inference stats"
-        );
-
-        Ok(ModelOutput::Tags(tags))
+        Ok(results)
     }
 }
 

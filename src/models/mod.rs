@@ -32,6 +32,16 @@ pub enum ModelOutput {
 
 pub trait Model: Send + Sync {
     fn infer(&self, image_path: &Path) -> Result<ModelOutput>;
+
+    /// Run inference on a batch of images. Backends that can batch efficiently
+    /// should override this; the default implementation calls `infer` for each
+    /// path sequentially.
+    fn infer_batch(&self, image_paths: &[&Path]) -> Result<Vec<ModelOutput>> {
+        image_paths
+            .iter()
+            .map(|path| self.infer(path))
+            .collect::<Result<Vec<_>>>()
+    }
 }
 
 pub trait Backend: Send + Sync {
