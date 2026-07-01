@@ -38,6 +38,19 @@ fn labels_from_config(config: &serde_json::Value) -> Result<Vec<String>> {
     Ok(pairs.into_iter().map(|(_, label)| label).collect())
 }
 
+/// Keep only the `k` highest-scoring tags when `top_k` is set.
+pub fn apply_top_k(tags: HashMap<String, f32>, top_k: Option<usize>) -> HashMap<String, f32> {
+    match top_k {
+        Some(k) if tags.len() > k => {
+            let mut sorted: Vec<_> = tags.into_iter().collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sorted.truncate(k);
+            sorted.into_iter().collect()
+        }
+        _ => tags,
+    }
+}
+
 /// Standard Hugging Face ViT image-classifier tagger.
 ///
 /// This uses the `candle_transformers` ViT implementation and applies a
@@ -50,6 +63,7 @@ pub struct ViTTagger {
     device: Device,
     input_size: usize,
     threshold: f32,
+    top_k: Option<usize>,
 }
 
 impl ViTTagger {
@@ -57,7 +71,7 @@ impl ViTTagger {
         _name: &str,
         files: &loader::ModelFiles,
         device: Device,
-        threshold: f32,
+        options: &crate::config::ModelTagsOptions,
     ) -> Result<Self> {
         let config_text = std::fs::read_to_string(&files.config_path)
             .with_context(|| format!("failed to read config: {}", files.config_path.display()))?;
@@ -82,13 +96,13 @@ impl ViTTagger {
         // Memory-map the weights once and reuse the same mapping for metadata inspection and
         // model construction.
         let tensors = unsafe {
-            // SAFETY: `MmapedSafetensors::new` memory-maps the weight file. The underlying file
+            // SAFETY: `MmapedSafetensors::multi` memory-maps the weight files. The underlying files
             // must not be modified, truncated, or deleted for the lifetime of the returned
             // `MmapedSafetensors` (and any tensors/models derived from it), or the process may
             // encounter undefined behavior from the OS memory mapping.
-            candle_core::safetensors::MmapedSafetensors::new(&files.weights_path)
+            candle_core::safetensors::MmapedSafetensors::multi(&files.weights_paths)
         }
-        .with_context(|| format!("failed to mmap weights: {}", files.weights_path.display()))?;
+        .with_context(|| format!("failed to mmap weights: {:?}", files.weights_paths))?;
 
         // Inspect the classifier head output dimension directly from the weights so mismatches
         // with the labels file fail fast instead of loading garbage.
@@ -121,7 +135,8 @@ impl ViTTagger {
             labels,
             device,
             input_size: config.image_size,
-            threshold,
+            threshold: options.threshold,
+            top_k: options.top_k,
         })
     }
 }
@@ -158,6 +173,8 @@ impl Model for ViTTagger {
             }
         }
 
+        tags = apply_top_k(tags, self.top_k);
+
         tracing::info!(
             image = ?image_path,
             labels = self.labels.len(),
@@ -188,7 +205,11 @@ mod manual_tests {
     fn vit_base_tagger_smoke() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+        let options = crate::config::ModelTagsOptions {
+            threshold: 0.1,
+            top_k: None,
+        };
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, &options)?;
 
         let output = tagger.infer(Path::new("test_imgs/dagnpats.png"))?;
         let ModelOutput::Tags(tags) = output else {
@@ -213,7 +234,11 @@ mod manual_tests {
     fn vit_base_tagger_default_threshold() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.35)?;
+        let options = crate::config::ModelTagsOptions {
+            threshold: 0.35,
+            top_k: None,
+        };
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, &options)?;
 
         let output = tagger.infer(Path::new("test_imgs/dagnpats.png"))?;
         let ModelOutput::Tags(tags) = output else {
@@ -237,7 +262,11 @@ mod manual_tests {
     fn vit_base_tagger_baseline() -> Result<()> {
         let source = loader::resolve_source("google/vit-base-patch16-224")?;
         let files = loader::load_model_files(&source)?;
-        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, 0.1)?;
+        let options = crate::config::ModelTagsOptions {
+            threshold: 0.1,
+            top_k: None,
+        };
+        let tagger = ViTTagger::load("vit-base-patch16-224", &files, Device::Cpu, &options)?;
 
         let image_paths: Vec<&str> = vec![
             "test_imgs/dagnpats.png",

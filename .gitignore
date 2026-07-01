@@ -7,3 +7,4 @@ Cargo.lock
 test_imgs/
 .DS_Store
 .kimi
+run-gpu.sh

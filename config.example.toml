@@ -32,13 +32,21 @@ disable_cache = false
 
 [ui]
 theme = "dark"
+show_advanced_media_properties = false
 double_click_debounce_ms = 300
 scroll_speed = 1.0
 viewer_default_scale_mode = "smallest"
 sort_key = "filename"
 sort_order = "ascending"
 
-[[import]]
+[remote]
+# Default HTTP endpoints for remote models. Per-model overrides are supported via
+# [models.remote].
+chat_endpoint = "/chat/completions"
+tag_endpoint = "/tags"
+classify_endpoint = "/classify"
+
+[[imports]]
 path = ""
 # The path to the import root. If this is unset or reading the path fails, the import is ignored, and if it was previously imported, it's hidden from the gallery. A toast will be shown at startup informing the user of the issue.
 
@@ -58,7 +66,7 @@ include = []
 # Folders or items to include, *ignoring* everything else. Behaves the same as `exclude`, but `exclude` takes precedence (so you can selectively exclude from included folders, but NOT vice-versa.)
 # Useful for e.g. asset libraries, where you have compatible media in some folders but not others, or for when you have a couple folders that you want to import in the same high-level folder.
 
-[import.thumbnails]
+[imports.thumbnails]
 cache_mode = "global"
 # How to cache thumbnails for this import.
 # If "global", uses the global thumbnail cache.
@@ -95,6 +103,7 @@ cache_fallback = "disable"
 #
 # [models.tags]
 # threshold = 0.35
+# top_k = 100  # Cap the number of returned tags to the N highest-scoring ones.
 
 # Example: an ONNX tagger. The model files are downloaded from HuggingFace on first use
 # and cached under `~/.local/share/akasha/models/onnx/SmilingWolf-wd-vit-tagger-v3/`.
@@ -124,3 +133,38 @@ cache_fallback = "disable"
 #
 # [models.description]
 # prompt = "Describe this image in one sentence."
+
+# Example: a local Gemma 4 vision-language model for image captioning.
+# Requires the `candle` feature. Model files are downloaded from HuggingFace on
+# first use and cached under `~/.local/share/akasha/models/`.
+# [[models]]
+# name = "gemma-4-E2B-it"
+# type = "local"
+# backend = "candle"
+# path = "google/gemma-4-E2B-it"
+#
+# [models.description]
+# prompt = "Describe this image in one sentence."
+# max_tokens = 128
+# temperature = 0.7
+# top_p = 0.9
+# top_k = 20
+# repeat_penalty = 1.0
+# repeat_last_n = 64
+# # Optional per-channel normalization overrides. If omitted, pixels are scaled by 1/255.
+# # image_mean = [0.5, 0.5, 0.5]
+# # image_std = [0.5, 0.5, 0.5]
+
+# Example: a local Gemma 4 vision-language model for image captioning via mistral.rs.
+# Requires the `mistralrs` feature. The model is downloaded from HuggingFace on first use.
+# [[models]]
+# name = "gemma4-description"
+# type = "local"
+# backend = "mistralrs"
+# model_id = "google/gemma-4-E2B-it"
+#
+# [models.description]
+# prompt = "Describe this image in detail."
+# max_tokens = 128
+# temperature = 0.7
+# isq = "Q8_0"  # mistral.rs ISQ type (e.g. Q8_0, Q6K, Q4K) or "none" to disable.

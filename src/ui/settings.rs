@@ -8,6 +8,7 @@ pub enum SettingsAction {
     DoubleClickDebounceChanged,
     ScrollSpeedChanged(f32),
     ViewerDefaultScaleModeChanged,
+    AdvancedMediaPropertiesChanged(bool),
 }
 
 pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> Vec<SettingsAction> {
@@ -80,6 +81,16 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> Vec<Se
                         }
                     });
             });
+
+            ui.add_space(16.0);
+            ui.heading("Properties");
+            ui.separator();
+
+            let mut advanced = config.ui.show_advanced_media_properties;
+            if ui.checkbox(&mut advanced, "Show advanced media properties").changed() {
+                config.ui.show_advanced_media_properties = advanced;
+                actions.push(SettingsAction::AdvancedMediaPropertiesChanged(advanced));
+            }
 
             ui.add_space(16.0);
             ui.heading("Imports");

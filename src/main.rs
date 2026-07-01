@@ -31,6 +31,15 @@ fn main() -> anyhow::Result<()> {
     let pool = rt.block_on(db::init_pool(db_path))?;
     info!("Database initialized");
 
+    match rt.block_on(db::searchable::reset_running_jobs(&pool)) {
+        Ok(0) => {}
+        Ok(n) => info!(
+            "Marked {} job(s) left in 'running' state as failed from previous session",
+            n
+        ),
+        Err(e) => tracing::warn!("Failed to clean up running jobs: {e}"),
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])

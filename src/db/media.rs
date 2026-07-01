@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use anyhow::Context;
 use futures_util::stream::TryStreamExt;
 use sqlx::SqlitePool;
 
@@ -14,6 +17,18 @@ pub struct MediaFile {
     pub file_size: Option<i64>,
     pub is_present: bool,
     pub missing_since: Option<chrono::NaiveDateTime>,
+    pub created_at: chrono::NaiveDateTime,
+    pub modified_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertiesData {
+    pub media: MediaFile,
+    pub folder_path: String,
+    pub tags: HashMap<String, HashMap<String, f32>>,
+    pub descriptions: HashMap<String, String>,
+    pub classifications: HashMap<String, Vec<String>>,
+    pub embeddings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,7 +170,7 @@ pub async fn search_summaries(
 pub async fn get_by_id(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<MediaFile>> {
     let row = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE id = ?1"
     )
     .bind(id)
@@ -165,6 +180,60 @@ pub async fn get_by_id(pool: &SqlitePool, id: i64) -> anyhow::Result<Option<Medi
     Ok(row.map(into_media))
 }
 
+pub async fn get_properties_data(
+    pool: &SqlitePool,
+    media_file_id: i64,
+) -> anyhow::Result<PropertiesData> {
+    let media = get_by_id(pool, media_file_id)
+        .await?
+        .context("media file not found")?;
+
+    let folder_path: String = sqlx::query_scalar(
+        "SELECT path FROM folders WHERE id = ?1"
+    )
+    .bind(media.folder_id)
+    .fetch_one(pool)
+    .await
+    .context("folder not found for media file")?;
+
+    let tags_json: Option<String> = sqlx::query_scalar(
+        "SELECT tags_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_one(pool)
+    .await?;
+
+    let tags: HashMap<String, HashMap<String, f32>> = tags_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let descriptions_json: Option<String> = sqlx::query_scalar(
+        "SELECT descriptions_json FROM media_files WHERE id = ?1"
+    )
+    .bind(media_file_id)
+    .fetch_one(pool)
+    .await?;
+
+    let descriptions: HashMap<String, String> = descriptions_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    // Classifications and embeddings stored similarly once wired.
+    let classifications: HashMap<String, Vec<String>> = HashMap::new();
+    let embeddings: Vec<String> = Vec::new();
+
+    Ok(PropertiesData {
+        media,
+        folder_path,
+        tags,
+        descriptions,
+        classifications,
+        embeddings,
+    })
+}
+
 pub async fn get_by_path(
     pool: &SqlitePool,
     folder_id: i64,
@@ -172,7 +241,7 @@ pub async fn get_by_path(
 ) -> anyhow::Result<Option<MediaFile>> {
     let row = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
     )
     .bind(folder_id)
@@ -188,14 +257,39 @@ pub async fn delete_by_path(
     folder_id: i64,
     relative_path: &str,
 ) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+
+    // Virtual FTS5 tables cannot have foreign keys, so clean them up explicitly
+    // before deleting the parent media_files row.
+    let media_id: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
+    )
+    .bind(folder_id)
+    .bind(relative_path)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(id) = media_id {
+        sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM searchable_text_fts WHERE media_file_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
     let rows = sqlx::query(
         "DELETE FROM media_files WHERE folder_id = ?1 AND relative_path = ?2"
     )
     .bind(folder_id)
     .bind(relative_path)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+
+    tx.commit().await?;
     Ok(rows)
 }
 
@@ -207,7 +301,7 @@ pub async fn list_page_by_folder(
 ) -> anyhow::Result<Vec<MediaFile>> {
     let rows = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files
          WHERE folder_id = ?1 AND id > ?2
          ORDER BY id
@@ -235,7 +329,8 @@ pub async fn list_page_by_folder_recursive(
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
          )
          SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash,
-                m.width, m.height, m.format, m.file_size, m.is_present, m.missing_since
+                m.width, m.height, m.format, m.file_size, m.is_present, m.missing_since,
+                m.created_at, m.modified_at
          FROM media_files m
          JOIN subtree s ON m.folder_id = s.id
          WHERE m.id > ?2
@@ -255,7 +350,7 @@ pub async fn list_page_by_folder_recursive(
 pub async fn list_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<Vec<MediaFile>> {
     let rows = sqlx::query_as::<_, MediaFileRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE folder_id = ?1"
     )
     .bind(folder_id)
@@ -273,7 +368,7 @@ pub async fn list_by_folder_recursive(pool: &SqlitePool, folder_id: i64) -> anyh
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
          )
          SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-                width, height, format, file_size, is_present, missing_since
+                width, height, format, file_size, is_present, missing_since, created_at, modified_at
          FROM media_files WHERE folder_id IN (SELECT id FROM subtree)"
     )
     .bind(folder_id)
@@ -387,10 +482,26 @@ pub async fn mark_present_by_path(
 /// Permanently delete all rows that are currently marked missing.
 /// This is an explicit, user-initiated action from the DB Management menu.
 pub async fn delete_missing(pool: &SqlitePool) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+
+    // Virtual FTS5 tables cannot declare foreign keys, so clean up orphans
+    // explicitly before deleting the parent media_files rows.
+    sqlx::query(
+        "DELETE FROM searchable_tags_fts WHERE media_file_id IN (SELECT id FROM media_files WHERE is_present = 0)"
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM searchable_text_fts WHERE media_file_id IN (SELECT id FROM media_files WHERE is_present = 0)"
+    )
+    .execute(&mut *tx)
+    .await?;
+
     let result = sqlx::query("DELETE FROM media_files WHERE is_present = 0")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
+    tx.commit().await?;
     Ok(result.rows_affected())
 }
 
@@ -407,6 +518,8 @@ struct MediaFileRow {
     file_size: Option<i64>,
     is_present: i64,
     missing_since: Option<chrono::NaiveDateTime>,
+    created_at: chrono::NaiveDateTime,
+    modified_at: Option<chrono::NaiveDateTime>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -439,6 +552,8 @@ fn into_media(row: MediaFileRow) -> MediaFile {
         file_size: row.file_size,
         is_present: row.is_present != 0,
         missing_since: row.missing_since,
+        created_at: row.created_at,
+        modified_at: row.modified_at,
     }
 }
 
@@ -465,6 +580,7 @@ fn into_summary(row: MediaSummaryRow) -> MediaSummary {
 mod tests {
     use super::*;
     use crate::db::folder;
+    use crate::db::searchable;
 
     async fn setup_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -606,5 +722,56 @@ mod tests {
         let all = list_by_folder(&pool, fid).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].relative_path, "present.jpg");
+    }
+
+    #[tokio::test]
+    async fn get_properties_data_returns_tags_and_descriptions() {
+        let pool = setup_pool().await;
+        let fid = folder::insert(&pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+
+        let id = upsert(
+            &pool,
+            fid,
+            "foo.jpg",
+            "/tmp/root/foo.jpg",
+            "hash",
+            Some(100),
+            Some(200),
+            Some("jpeg"),
+            Some(1024),
+            Some(chrono::Local::now().naive_local()),
+        )
+        .await
+        .unwrap();
+
+        let mut tags = HashMap::new();
+        tags.insert("cat".to_string(), 0.95f32);
+        tags.insert("dog".to_string(), 0.23f32);
+        searchable::update_tags_json(&pool, id, "wd-vit", tags.clone())
+            .await
+            .unwrap();
+
+        searchable::update_description_json(&pool, id, "blip", "a cat on a mat")
+            .await
+            .unwrap();
+
+        let props = get_properties_data(&pool, id).await.unwrap();
+        assert_eq!(props.media.id, id);
+        assert_eq!(props.media.relative_path, "foo.jpg");
+        assert_eq!(props.folder_path, "/tmp/root");
+
+        let source_tags = props.tags.get("wd-vit").expect("wd-vit tags missing");
+        assert_eq!(source_tags.len(), 2);
+        assert!((source_tags.get("cat").copied().unwrap() - 0.95f32).abs() < f32::EPSILON);
+        assert!((source_tags.get("dog").copied().unwrap() - 0.23f32).abs() < f32::EPSILON);
+
+        assert_eq!(
+            props.descriptions.get("blip"),
+            Some(&"a cat on a mat".to_string())
+        );
+        assert!(props.classifications.is_empty());
+        assert!(props.embeddings.is_empty());
     }
 }

@@ -69,6 +69,7 @@ pub struct OrtModel {
     preprocessing: Preprocessing,
     tags: Vec<String>,
     threshold: f32,
+    top_k: Option<usize>,
     input_name: String,
     output_name: String,
 }
@@ -127,12 +128,14 @@ impl OrtModel {
         preprocessing.channels_last = channels_last;
         let tags = discover_tags(&dir, onnx_opts.tags_file.as_deref())?;
         let threshold = config.tags.as_ref().map(|t| t.threshold).unwrap_or(0.35);
+        let top_k = config.tags.as_ref().and_then(|t| t.top_k);
 
         Ok(Self {
             session: std::sync::Mutex::new(session),
             preprocessing,
             tags,
             threshold,
+            top_k,
             input_name,
             output_name,
         })
@@ -186,8 +189,8 @@ impl Model for OrtModel {
                 let g = pixel[1] as f32 / 255.0;
                 let b = pixel[2] as f32 / 255.0;
 
-                tensor_data[0 * h * w + y * w + x] = (r - self.preprocessing.mean[0]) / self.preprocessing.std[0];
-                tensor_data[1 * h * w + y * w + x] = (g - self.preprocessing.mean[1]) / self.preprocessing.std[1];
+                tensor_data[y * w + x] = (r - self.preprocessing.mean[0]) / self.preprocessing.std[0];
+                tensor_data[h * w + y * w + x] = (g - self.preprocessing.mean[1]) / self.preprocessing.std[1];
                 tensor_data[2 * h * w + y * w + x] = (b - self.preprocessing.mean[2]) / self.preprocessing.std[2];
             }
             let array = ndarray::Array::from_shape_vec((1, 3, h, w), tensor_data)
@@ -232,6 +235,9 @@ impl Model for OrtModel {
                 }
             }
         }
+
+        tags = crate::models::tagger::apply_top_k(tags, self.top_k);
+
         let mean_score = if !scores.is_empty() { sum_score / scores.len() as f32 } else { 0.0 };
 
         tracing::info!(
@@ -718,7 +724,7 @@ mod tests {
             base_url: None,
             model_id: None,
             api_key: None,
-            tags: Some(crate::config::ModelTagsOptions { threshold: 0.35 }),
+            tags: Some(crate::config::ModelTagsOptions { threshold: 0.35, top_k: None }),
             description: None,
             classification: None,
             remote: None,

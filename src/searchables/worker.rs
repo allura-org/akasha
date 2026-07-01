@@ -133,6 +133,13 @@ impl SearchWorker {
             tracing::info!(model = model_config.name, "SearchWorker: model loaded");
         }
 
+        let overwrite = job
+            .params_json
+            .as_deref()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .and_then(|v| v.get("overwrite").and_then(|o| o.as_bool()))
+            .unwrap_or(false);
+
         let model = self.resident.as_ref().unwrap().model.clone();
         let media = crate::db::media::get_by_id(&self.pool, job.media_file_id)
             .await?
@@ -145,6 +152,17 @@ impl SearchWorker {
 
         match output {
             crate::models::ModelOutput::Tags(tags) => {
+                if tags.is_empty() {
+                    anyhow::bail!("model {} returned no tags", model_config.name);
+                }
+                if overwrite {
+                    crate::db::searchable::delete_tags_for_source(
+                        &self.pool,
+                        job.media_file_id,
+                        &cfg.name,
+                    )
+                    .await?;
+                }
                 crate::db::searchable::update_tags_json(
                     &self.pool,
                     job.media_file_id,
@@ -154,6 +172,20 @@ impl SearchWorker {
                 .await?;
             }
             crate::models::ModelOutput::Description(text) => {
+                if text.trim().is_empty() {
+                    anyhow::bail!(
+                        "model {} returned an empty description",
+                        model_config.name
+                    );
+                }
+                if overwrite {
+                    crate::db::searchable::delete_description_for_source(
+                        &self.pool,
+                        job.media_file_id,
+                        &cfg.name,
+                    )
+                    .await?;
+                }
                 crate::db::searchable::update_description_json(
                     &self.pool,
                     job.media_file_id,
@@ -206,6 +238,13 @@ mod tests {
         }
     }
 
+    struct MockDescriptionModel;
+    impl Model for MockDescriptionModel {
+        fn infer(&self, _path: &Path) -> anyhow::Result<ModelOutput> {
+            Ok(ModelOutput::Description("a cat on a mat".to_string()))
+        }
+    }
+
     struct MockBackend;
     impl Backend for MockBackend {
         fn id(&self) -> &'static str {
@@ -217,8 +256,12 @@ mod tests {
         fn supports(&self, config: &ModelConfig) -> bool {
             config.backend.as_deref() == Some("mock")
         }
-        fn load(&self, _config: &ModelConfig) -> anyhow::Result<Arc<dyn Model>> {
-            Ok(Arc::new(MockModel))
+        fn load(&self, config: &ModelConfig) -> anyhow::Result<Arc<dyn Model>> {
+            if config.description.is_some() {
+                Ok(Arc::new(MockDescriptionModel))
+            } else {
+                Ok(Arc::new(MockModel))
+            }
         }
     }
 
@@ -274,5 +317,59 @@ mod tests {
         .unwrap();
         assert_eq!(tag_row.0, "mock_tag");
         assert!((tag_row.1 - 0.99).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn search_worker_runs_mock_backend_description_job() {
+        use crate::db;
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let fid = db::folder::insert(&pool, None, "/tmp", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+        let mid = db::media::upsert(
+            &pool, fid, "b.jpg", "/tmp/b.jpg", "hash", None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        let cfg_id = db::searchable::upsert_config(
+            &pool,
+            "mock",
+            "description",
+            true,
+            serde_json::json!({"backend": "mock", "kind": "local", "prompt": "describe"}),
+        )
+        .await
+        .unwrap();
+        db::searchable::enqueue_job(&pool, mid, "visionlanguage", "{}", Some(cfg_id))
+            .await
+            .unwrap();
+
+        let mut reg = BackendRegistry::empty();
+        reg.register(MockBackend);
+        let mut worker = SearchWorker::with_registry(Arc::new(pool.clone()), reg);
+        worker.tick().await.unwrap();
+
+        let row: (String,) =
+            sqlx::query_as("SELECT descriptions_json FROM media_files WHERE id = ?1")
+                .bind(mid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row.0.contains("a cat on a mat"));
+
+        let fts_row: (String, String) = sqlx::query_as(
+            "SELECT source, content FROM searchable_text_fts WHERE media_file_id = ?1"
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fts_row.0, "mock");
+        assert_eq!(fts_row.1, "a cat on a mat");
     }
 }

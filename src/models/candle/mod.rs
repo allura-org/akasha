@@ -1,12 +1,41 @@
 //! Local candle-based backend.
 
+pub mod vlm;
+
+use std::path::Path;
 use std::sync::Arc;
 use anyhow::{Context, Result};
 use candle_core::Device;
 
 use crate::config::ModelConfig;
+use crate::models::{loader, Backend, Model, ModelOutput};
+use vlm::{VlmArchitectureRegistry, VlmModel};
 
-use super::{loader, Backend, Model};
+/// Adapts a stateful `VlmModel` to the `Model` trait used by the worker.
+pub struct VlmModelWrapper {
+    inner: std::sync::Mutex<Box<dyn VlmModel>>,
+    prompt: Option<String>,
+}
+
+impl VlmModelWrapper {
+    pub fn new(model: Box<dyn VlmModel>, prompt: Option<String>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(model),
+            prompt,
+        }
+    }
+}
+
+impl Model for VlmModelWrapper {
+    fn infer(&self, image_path: &Path) -> Result<ModelOutput> {
+        // Recover from a poisoned mutex. If a previous generation panicked inside
+        // spawn_blocking, the guard is poisoned, but the underlying model/KV-cache state
+        // is discarded on the next clear_kv_cache() call, so continuing is safe.
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let text = inner.generate(image_path, self.prompt.as_deref())?;
+        Ok(ModelOutput::Description(text))
+    }
+}
 
 pub struct CandleBackend;
 
@@ -42,6 +71,7 @@ impl Backend for CandleBackend {
         let source = loader::resolve_source(path)?;
         let files = loader::load_model_files(&source)
             .with_context(|| format!("failed to load model files for {}", config.name))?;
+
         #[cfg(feature = "cuda")]
         let device = {
             match Device::new_cuda(0) {
@@ -55,17 +85,19 @@ impl Backend for CandleBackend {
         #[cfg(not(feature = "cuda"))]
         let device = Device::Cpu;
 
+        if config.description.is_some() {
+            let registry = VlmArchitectureRegistry::with_defaults();
+            let vlm = registry.select(config, &files, &device)?;
+            let prompt = config.description.as_ref().and_then(|d| d.prompt.clone());
+            return Ok(Arc::new(VlmModelWrapper::new(vlm, prompt)));
+        }
+
         match config.tags.as_ref() {
             Some(options) => {
-                let tagger = super::tagger::ViTTagger::load(
-                    &config.name,
-                    &files,
-                    device,
-                    options.threshold,
-                )?;
+                let tagger = super::tagger::ViTTagger::load(&config.name, &files, device, options)?;
                 Ok(Arc::new(tagger))
             }
-            None => anyhow::bail!("candle backend only supports tags output kind right now"),
+            None => anyhow::bail!("candle backend requires either tags or description configuration"),
         }
     }
 }
@@ -86,7 +118,7 @@ mod tests {
             base_url: None,
             model_id: None,
             api_key: None,
-            tags: Some(ModelTagsOptions { threshold: 0.1 }),
+            tags: Some(ModelTagsOptions { threshold: 0.1, top_k: None }),
             description: None,
             classification: None,
             remote: None,

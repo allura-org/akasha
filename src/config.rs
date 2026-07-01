@@ -9,7 +9,7 @@ pub struct Config {
     pub debug: DebugConfig,
     pub models: ModelsConfig,
     pub remote: RemoteConfig,
-    #[serde(alias = "folders")]
+    #[serde(alias = "folders", alias = "import")]
     pub imports: Vec<ImportConfig>,
 }
 
@@ -103,6 +103,8 @@ pub struct UiConfig {
     pub viewer_default_scale_mode: ViewerScaleMode,
     pub sort_key: SortKey,
     pub sort_order: SortOrder,
+    #[serde(default)]
+    pub show_advanced_media_properties: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,25 @@ pub struct ModelConfig {
     pub onnx: Option<ModelOnnxOptions>,
 }
 
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: ModelKind::Local,
+            backend: None,
+            path: None,
+            base_url: None,
+            model_id: None,
+            api_key: None,
+            tags: None,
+            description: None,
+            classification: None,
+            remote: None,
+            onnx: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelRemoteOptions {
     #[serde(default = "default_chat_endpoint")]
@@ -186,11 +207,49 @@ pub struct ModelOnnxOptions {
 pub struct ModelTagsOptions {
     #[serde(default = "default_threshold")]
     pub threshold: f32,
+    #[serde(default = "default_top_k")]
+    pub top_k: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ModelDescriptionOptions {
     pub prompt: Option<String>,
+    pub max_tokens: usize,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<usize>,
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+    /// Optional per-channel mean for image normalization. If both `image_mean`
+    /// and `image_std` are provided, preprocessing applies `(pixel/255 - mean) / std`
+    /// per channel, overriding the model-specific defaults. If omitted, the model's
+    /// default normalization is used (for Gemma 4 this is a no-op: mean `[0,0,0]`,
+    /// std `[1,1,1]`).
+    pub image_mean: Option<Vec<f32>>,
+    /// Optional per-channel standard deviation for image normalization. See `image_mean`.
+    pub image_std: Option<Vec<f32>>,
+    /// In-situ quantization type for local `mistralrs` models. Accepts any `mistral.rs`
+    /// `IsqType` value (e.g. `"Q8_0"`, `"Q4K"`, `"Q6K"`) or `"none"` to disable ISQ.
+    /// Defaults to `"Q8_0"` when omitted.
+    pub isq: Option<String>,
+}
+
+impl Default for ModelDescriptionOptions {
+    fn default() -> Self {
+        Self {
+            prompt: None,
+            max_tokens: 128,
+            temperature: Some(0.7),
+            top_p: None,
+            top_k: None,
+            repeat_penalty: 1.0,
+            repeat_last_n: 64,
+            image_mean: None,
+            image_std: None,
+            isq: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,10 +259,15 @@ fn default_threshold() -> f32 {
     0.35
 }
 
+fn default_top_k() -> Option<usize> {
+    Some(100)
+}
+
 impl Default for ModelTagsOptions {
     fn default() -> Self {
         Self {
             threshold: default_threshold(),
+            top_k: default_top_k(),
         }
     }
 }
@@ -264,6 +328,7 @@ impl Default for UiConfig {
             viewer_default_scale_mode: ViewerScaleMode::Smallest,
             sort_key: SortKey::Filename,
             sort_order: SortOrder::Ascending,
+            show_advanced_media_properties: false,
         }
     }
 }
@@ -372,6 +437,7 @@ threshold = 0.35
         assert_eq!(config.models.models[0].kind, ModelKind::Local);
         assert_eq!(config.models.models[0].path.as_deref(), Some("SmilingWolf/wd-vit-tagger-v3"));
         assert_eq!(config.models.models[0].tags.as_ref().unwrap().threshold, 0.35);
+        assert_eq!(config.models.models[0].tags.as_ref().unwrap().top_k, Some(100));
     }
 
     #[test]
@@ -398,5 +464,33 @@ classify_endpoint = "/v1/classify"
         assert_eq!(model.backend.as_deref(), Some("remote"));
         assert_eq!(model.remote.as_ref().unwrap().classify_endpoint.as_str(), "/v1/classify");
         assert_eq!(config.remote.chat_endpoint.as_str(), "/v1/chat");
+    }
+
+    #[test]
+    fn parse_model_description_options() {
+        let text = r#"
+[[models]]
+name = "gemma-4-E2B-it"
+type = "local"
+path = "google/gemma-4-E2B-it"
+
+[models.description]
+prompt = "Describe this image in one sentence."
+max_tokens = 64
+temperature = 0.5
+top_p = 0.9
+top_k = 20
+repeat_penalty = 1.1
+repeat_last_n = 32
+"#;
+        let config: Config = toml::from_str(text).unwrap();
+        let desc = config.models.models[0].description.as_ref().unwrap();
+        assert_eq!(desc.prompt.as_deref(), Some("Describe this image in one sentence."));
+        assert_eq!(desc.max_tokens, 64);
+        assert_eq!(desc.temperature, Some(0.5));
+        assert_eq!(desc.top_p, Some(0.9));
+        assert_eq!(desc.top_k, Some(20));
+        assert!((desc.repeat_penalty - 1.1).abs() < f32::EPSILON);
+        assert_eq!(desc.repeat_last_n, 32);
     }
 }
