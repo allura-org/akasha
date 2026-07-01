@@ -226,6 +226,22 @@ pub struct ModelJtp3Options {
     /// quickly with batch size, so the default is conservative.
     #[serde(default = "default_jtp3_batch_size")]
     pub batch_size: usize,
+    /// Number of ONNX Runtime intra-op threads. If omitted, ORT uses its
+    /// default (usually all CPU cores). Set to a lower value to trade speed for
+    /// memory.
+    pub intra_threads: Option<usize>,
+    /// Number of ONNX Runtime inter-op threads. If omitted, ORT uses its
+    /// default (usually one).
+    pub inter_threads: Option<usize>,
+    /// Enable ONNX Runtime memory-pattern optimization. Defaults to false
+    /// because JTP-3 uses dynamic shapes, which can make the static memory
+    /// pattern allocate more than necessary.
+    #[serde(default = "default_jtp3_memory_pattern")]
+    pub memory_pattern: bool,
+}
+
+fn default_jtp3_memory_pattern() -> bool {
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

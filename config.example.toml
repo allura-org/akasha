@@ -168,3 +168,22 @@ cache_fallback = "disable"
 # max_tokens = 128
 # temperature = 0.7
 # isq = "Q8_0"  # mistral.rs ISQ type (e.g. Q8_0, Q6K, Q4K) or "none" to disable.
+
+# Example: JTP-3 tagger (ONNX). JTP-3 is memory-hungry on the CPU EP; the
+# default batch size is 1. Increase it only if you have RAM to spare, and tune
+# `intra_threads` to use more CPU cores without exploding memory.
+# [[models]]
+# name = "jtp3"
+# type = "local"
+# backend = "jtp3"
+# path = "/path/to/jtp-3-hydra"
+#
+# [models.tags]
+# threshold = 0.35
+#
+# [models.jtp3]
+# batch_size = 1
+# # Number of ONNX Runtime intra-op threads. Omit to let ORT use all cores.
+# # intra_threads = 4
+# # inter_threads = 1
+# # memory_pattern = false

@@ -125,19 +125,31 @@ impl Jtp3Model {
             anyhow::bail!("jtp3 model directory not found: {}", dir.display());
         }
 
+        let jtp3_opts = config.jtp3.clone().unwrap_or_default();
+
         let model_path = find_model_file(&dir)?;
         tracing::info!(dir = %dir.display(), model = %model_path.display(), "Loading JTP-3 ONNX model");
 
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create ONNX Runtime session builder: {e}"))?
             .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
-            .map_err(|e| anyhow::anyhow!("failed to configure CPU execution provider: {e}"))?
-            .with_intra_threads(1)
-            .map_err(|e| anyhow::anyhow!("failed to set intra-op threads: {e}"))?
-            .with_inter_threads(1)
-            .map_err(|e| anyhow::anyhow!("failed to set inter-op threads: {e}"))?
-            .with_memory_pattern(true)
-            .map_err(|e| anyhow::anyhow!("failed to enable memory pattern: {e}"))?
+            .map_err(|e| anyhow::anyhow!("failed to configure CPU execution provider: {e}"))?;
+        if let Some(t) = jtp3_opts.intra_threads {
+            builder = builder
+                .with_intra_threads(t)
+                .map_err(|e| anyhow::anyhow!("failed to set intra-op threads: {e}"))?;
+        }
+        if let Some(t) = jtp3_opts.inter_threads {
+            builder = builder
+                .with_inter_threads(t)
+                .map_err(|e| anyhow::anyhow!("failed to set inter-op threads: {e}"))?;
+        }
+        if jtp3_opts.memory_pattern {
+            builder = builder
+                .with_memory_pattern(true)
+                .map_err(|e| anyhow::anyhow!("failed to enable memory pattern: {e}"))?;
+        }
+        let session = builder
             .commit_from_file(&model_path)
             .with_context(|| format!("failed to load JTP-3 ONNX model from {}", model_path.display()))?;
 
@@ -161,8 +173,6 @@ impl Jtp3Model {
 
         let threshold = config.tags.as_ref().map(|t| t.threshold).unwrap_or(0.35);
         let top_k = config.tags.as_ref().and_then(|t| t.top_k);
-
-        let jtp3_opts = config.jtp3.clone().unwrap_or_default();
 
         // Optional per-tag calibration thresholds.
         let calibration_path = jtp3_opts
@@ -210,6 +220,9 @@ impl Jtp3Model {
             metadata = implications.len(),
             implication_mode = ?implication_mode,
             max_batch_size,
+            intra_threads = ?jtp3_opts.intra_threads,
+            inter_threads = ?jtp3_opts.inter_threads,
+            memory_pattern = jtp3_opts.memory_pattern,
             "JTP-3 model ready"
         );
 
