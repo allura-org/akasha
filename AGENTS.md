@@ -34,7 +34,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Database | `sqlx` 0.8 (sqlite, runtime-tokio, chrono, json) |
 | Migrations | `sqlx::migrate!()` (embedded in binary) |
 | Serialization | `serde`, `serde_json`, `toml` |
-| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEVC → HEIF/HEIC); `fast_image_resize` 6 + `webp` 0.3 (optional SIMD thumbnails) |
+| Image processing | `image` 0.25 (png, jpeg, webp, gif, bmp, tiff); `libheif-rs` 2.7 (optional HEVC → HEIF/HEIC); `fast_image_resize` 6 + `webp` 0.3 with static `libwebp` (optional SIMD thumbnails) |
 | File hashing | `blake3` |
 | Directory traversal | `walkdir` |
 | Exclude/include path filters | exact path + substring matching |
@@ -65,7 +65,7 @@ cargo run
 # Release build (default features; pure Rust, no C dependencies)
 cargo build --release
 
-# With SIMD thumbnail acceleration (requires libwebp-dev / libwebp-devel)
+# With SIMD thumbnail acceleration (default; builds libwebp from source)
 cargo build --release --features simd-thumbnails
 
 cargo test
@@ -84,7 +84,7 @@ cargo test
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
   - Build with the feature: `cargo build --features hevc`
   - This feature is **excluded from default builds** for license reasons and is only included in the dedicated HEVC binary.
-- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; requires `libwebp-dev` (Debian/Ubuntu) or `libwebp-devel` (Fedora).
+- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; `libwebp` is built from source and linked statically, so no system `libwebp-dev`/`libwebp-devel` is required.
 - `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Uses a statically vendored OpenSSL on Linux.
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
