@@ -561,6 +561,7 @@ impl AkashaApp {
                     self.browser.thumbnail_queue.clear();
                     self.browser.queued_indices.clear();
                     self.browser.media_summaries = items;
+                    self.browser.invalidate_sort();
                     if is_search {
                         self.browser.search_active = true;
                         self.browser.sort_key = crate::config::SortKey::Score;

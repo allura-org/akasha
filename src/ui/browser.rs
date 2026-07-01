@@ -152,6 +152,10 @@ impl BrowserPanel {
         }
     }
 
+    pub fn invalidate_sort(&mut self) {
+        self.last_sorted_len = 0;
+    }
+
     fn ensure_sorted(&mut self) {
         if self.media_summaries.is_empty() {
             return;
