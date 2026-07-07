@@ -7,14 +7,15 @@ pub mod weights;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use burn::prelude::*;
 use burn::tensor::DType;
 use ndarray::Array4;
 
-// NdArray backend does not implement BF16. Use F32 for the NdArray backend;
-// switch to BF16 when the Flex backend is enabled.
+// NdArray backend does not implement BF16. Flex supports BF16 at runtime.
+// Candle CPU does not support BF16 matmul, so use F32 there.
 #[cfg(feature = "burn-flex")]
 const MODEL_DTYPE: DType = DType::BF16;
 #[cfg(not(feature = "burn-flex"))]
@@ -76,12 +77,15 @@ impl<B: Backend> HydraModel<B> {
 impl<B: Backend + 'static> HydraModel<B> {
     /// Run the model and return raw logits (one score per label).
     pub fn infer_logits(&self, image_path: &Path) -> Result<Vec<f32>> {
+        let t0 = Instant::now();
         let device = <B::Device as Default>::default();
         let pre = preprocess(image_path, &self.pos_embed, self.max_seq_len, self.background)
             .with_context(|| format!("failed to preprocess image: {}", image_path.display()))?;
+        let t_pre = t0.elapsed();
 
         // Convert ndarray outputs to Burn tensors. F32 is used for the CPU spike
         // because the NdArray backend does not support BF16 yet.
+        let t1 = Instant::now();
         let patches = Tensor::<B, 1>::from_data(
             pre.patches.into_raw_vec_and_offset().0.as_slice(),
             (&device, MODEL_DTYPE),
@@ -94,17 +98,39 @@ impl<B: Backend + 'static> HydraModel<B> {
         )
         .reshape([1, self.max_seq_len, 1152]);
 
-        let valid = Tensor::<B, 1, Bool>::from_data(
-            pre.valid.into_raw_vec_and_offset().0.as_slice(),
-            &device,
-        )
-        .reshape([1, 1, self.max_seq_len]);
+        // Candle does not support bool_from_data, so build the mask as an Int
+        // tensor and compare to 1.
+        let valid_raw: Vec<i32> = pre
+            .valid
+            .into_raw_vec_and_offset()
+            .0
+            .into_iter()
+            .map(|b| if b { 1i32 } else { 0i32 })
+            .collect();
+        let valid = Tensor::<B, 1, Int>::from_data(valid_raw.as_slice(), &device)
+            .reshape([1, 1, self.max_seq_len])
+            .equal_elem(1);
+        let t_tensors = t1.elapsed();
 
         let logits = self.model.forward(patches, pos_embed, valid);
+        let t_forward = t1.elapsed();
 
         // Convert to f32 for post-processing.
+        let t2 = Instant::now();
         let logits_f32 = logits.cast(DType::F32);
-        logits_f32.to_data().to_vec::<f32>().map_err(Into::into)
+        let out = logits_f32.to_data().to_vec::<f32>().map_err(Into::into);
+        let t_post = t2.elapsed();
+
+        tracing::debug!(
+            "infer_logits total={:.3}s preprocess={:.3}s tensor_create={:.3}s forward={:.3}s postprocess={:.3}s",
+            t0.elapsed().as_secs_f64(),
+            t_pre.as_secs_f64(),
+            t_tensors.as_secs_f64(),
+            t_forward.as_secs_f64(),
+            t_post.as_secs_f64()
+        );
+
+        out
     }
 }
 

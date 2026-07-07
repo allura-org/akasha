@@ -4,9 +4,11 @@
 //! The first supported model is Hydra-3.5 (RedRocket/Hydra), loaded from its
 //! original `.safetensors` checkpoint.
 //!
-//! By default the Burn NdArray backend is used (pure Rust, F32 only). Enable
-//! the `burn-flex` feature to use Burn's Flex backend, which supports BF16/F16
-//! at runtime and can be extended to CUDA/Metal later.
+//! By default the Burn NdArray backend is used (pure Rust, F32 only).
+//!
+//! - `burn-flex` — Burn's Flex backend, supports BF16/F16 at runtime.
+//! - `burn-candle` — Burn's Candle backend; much faster CPU GEMM and can use
+//!   CUDA/Metal via Candle's own feature flags.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,7 +22,15 @@ use super::{Backend, Model};
 
 pub mod hydra;
 
-#[cfg(feature = "burn-flex")]
+#[cfg(feature = "burn-candle")]
+mod backend {
+    // Candle backend uses candle-core under the hood and has much better CPU
+    // GEMM than Burn's pure-Rust NdArray/Flex backends.
+    pub type BurnBackendType = burn::backend::candle::Candle;
+    pub type BurnDevice = burn::backend::candle::CandleDevice;
+}
+
+#[cfg(all(feature = "burn-flex", not(feature = "burn-candle")))]
 mod backend {
     // Flex implements Backend only for its default type parameters, but it
     // supports BF16/F16 at runtime via explicit DType.
@@ -28,7 +38,7 @@ mod backend {
     pub type BurnDevice = burn::backend::flex::FlexDevice;
 }
 
-#[cfg(not(feature = "burn-flex"))]
+#[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 mod backend {
     pub type BurnBackendType = burn::backend::NdArray;
     pub type BurnDevice = burn::backend::ndarray::NdArrayDevice;

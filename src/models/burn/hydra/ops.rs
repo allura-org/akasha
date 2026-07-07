@@ -2,6 +2,8 @@
 //!
 //! These replace einops rearrangements and PyTorch-specific primitives.
 
+use std::time::Instant;
+
 use burn::prelude::*;
 
 /// Apply the GELU tanh approximation used by PyTorch's
@@ -68,21 +70,41 @@ pub fn scaled_dot_product_attention<B: Backend>(
     v: Tensor<B, 4>,
     mask: Option<Tensor<B, 4, Bool>>,
 ) -> Tensor<B, 4> {
-    let [_batch, _heads, _seq_q, head_dim] = q.dims();
+    let t0 = Instant::now();
+    let [batch, heads, seq_q, head_dim] = q.dims();
+    let [_, _, seq_k, _] = k.dims();
     let scale = (head_dim as f32).sqrt();
 
     // scores: [batch, heads, seq_q, seq_k]
     let k_t = k.swap_dims(2, 3);
     let mut scores = q.matmul(k_t) / scale;
+    let t_matmul1 = t0.elapsed();
 
+    let t1 = Instant::now();
     if let Some(mask) = mask {
         // mask=true => keep; mask=false => -inf
         let neg_inf = -1e9f32;
         scores = scores.mask_fill(mask.bool_not(), neg_inf);
     }
+    let t_mask = t1.elapsed();
 
+    let t2 = Instant::now();
     let weights = softmax(scores, 3);
-    weights.matmul(v)
+    let t_softmax = t2.elapsed();
+
+    let t3 = Instant::now();
+    let out = weights.matmul(v);
+    let t_matmul2 = t3.elapsed();
+
+    tracing::debug!(
+        "scaled_dot_product_attention [{batch},{heads},{seq_q},{seq_k}] matmul1={:.3}s mask={:.3}s softmax={:.3}s matmul2={:.3}s",
+        t_matmul1.as_secs_f64(),
+        t_mask.as_secs_f64(),
+        t_softmax.as_secs_f64(),
+        t_matmul2.as_secs_f64()
+    );
+
+    out
 }
 
 /// Softmax over a dimension.

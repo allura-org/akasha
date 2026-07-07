@@ -1,5 +1,7 @@
 //! Burn modules for Hydra-3.5.
 
+use std::time::Instant;
+
 use burn::module::Param;
 use burn::nn::{LayerNorm, Linear};
 use burn::prelude::*;
@@ -32,22 +34,46 @@ impl<B: Backend> Hydra<B> {
         pos_embed: Tensor<B, 3>,
         mask: Tensor<B, 3, Bool>,
     ) -> Tensor<B, 2> {
+        let t0 = Instant::now();
         let [batch, seq, _patch_dim] = patches.dims();
         let pos_embed = pos_embed.reshape([batch, seq, 1152]);
         let mask = mask.reshape([batch, seq]);
 
         let mut x = self.embeds.forward(patches, pos_embed, mask.clone());
+        let t_embeds = t0.elapsed();
 
         // attention mask for Burn: [batch, 1, 1, seq]
         let attn_mask = mask.reshape([batch, 1, 1, seq]);
 
+        let t1 = Instant::now();
         for block in &self.blocks {
             x = block.forward(x, attn_mask.clone());
         }
+        let t_blocks = t1.elapsed();
 
+        let t2 = Instant::now();
         x = self.norm.forward(x);
+        let t_norm = t2.elapsed();
+
+        let t3 = Instant::now();
         x = self.attn_pool.forward(x, attn_mask);
-        self.head.forward(x)
+        let t_pool = t3.elapsed();
+
+        let t4 = Instant::now();
+        let out = self.head.forward(x);
+        let t_head = t4.elapsed();
+
+        tracing::debug!(
+            "Hydra::forward total={:.3}s embeds={:.3}s blocks={:.3}s norm={:.3}s pool={:.3}s head={:.3}s",
+            t0.elapsed().as_secs_f64(),
+            t_embeds.as_secs_f64(),
+            t_blocks.as_secs_f64(),
+            t_norm.as_secs_f64(),
+            t_pool.as_secs_f64(),
+            t_head.as_secs_f64()
+        );
+
+        out
     }
 }
 
@@ -96,11 +122,35 @@ pub struct NaFlexAttn<B: Backend> {
 
 impl<B: Backend> NaFlexAttn<B> {
     pub fn forward(&self, x: Tensor<B, 3>, mask: Tensor<B, 4, Bool>) -> Tensor<B, 3> {
+        let t0 = Instant::now();
         let qkv = self.qkv.forward(x);
+        let t_qkv = t0.elapsed();
+
+        let t1 = Instant::now();
         let (q, k, v) = split_qkv(qkv, NAFLEX_HEADS, NAFLEX_HEAD_DIM);
+        let t_split = t1.elapsed();
+
+        let t2 = Instant::now();
         let out = scaled_dot_product_attention(q, k, v, Some(mask));
+        let t_attn = t2.elapsed();
+
+        let t3 = Instant::now();
         let out = merge_heads(out);
-        self.proj.forward(out)
+        let t_merge = t3.elapsed();
+
+        let t4 = Instant::now();
+        let out = self.proj.forward(out);
+        let t_proj = t4.elapsed();
+
+        tracing::debug!(
+            "NaFlexAttn qkv={:.3}s split={:.3}s attn={:.3}s merge={:.3}s proj={:.3}s",
+            t_qkv.as_secs_f64(),
+            t_split.as_secs_f64(),
+            t_attn.as_secs_f64(),
+            t_merge.as_secs_f64(),
+            t_proj.as_secs_f64()
+        );
+        out
     }
 }
 
@@ -112,9 +162,25 @@ pub struct NaFlexMlp<B: Backend> {
 
 impl<B: Backend> NaFlexMlp<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let t0 = Instant::now();
         let x = self.fc1.forward(x);
+        let t_fc1 = t0.elapsed();
+
+        let t1 = Instant::now();
         let x = gelu_approx_tanh(x);
-        self.fc2.forward(x)
+        let t_gelu = t1.elapsed();
+
+        let t2 = Instant::now();
+        let out = self.fc2.forward(x);
+        let t_fc2 = t2.elapsed();
+
+        tracing::debug!(
+            "NaFlexMlp fc1={:.3}s gelu={:.3}s fc2={:.3}s",
+            t_fc1.as_secs_f64(),
+            t_gelu.as_secs_f64(),
+            t_fc2.as_secs_f64()
+        );
+        out
     }
 }
 
@@ -129,25 +195,48 @@ pub struct HydraPool<B: Backend> {
 
 impl<B: Backend> HydraPool<B> {
     pub fn forward(&self, x: Tensor<B, 3>, mask: Tensor<B, 4, Bool>) -> Tensor<B, 3> {
+        let t0 = Instant::now();
         let batch = x.dims()[0];
         let (k, v) = self.forward_kv(x.clone());
+        let t_kv = t0.elapsed();
 
         let [heads, n_classes, head_dim] = self.q.dims();
         // q: [heads, n_classes, head_dim] -> [batch, heads, n_classes, head_dim]
+        let t1 = Instant::now();
         let q = self
             .q
             .val()
             .reshape([1, heads, n_classes, head_dim])
             .expand([batch, heads, n_classes, head_dim]);
+        let t_q = t1.elapsed();
 
+        let t2 = Instant::now();
         let out = scaled_dot_product_attention(q, k.clone(), v.clone(), Some(mask.clone()));
+        let t_attn = t2.elapsed();
+
+        let t3 = Instant::now();
         let mut out = merge_heads_pool(out); // [batch, n_classes, attn_dim]
+        let t_merge = t3.elapsed();
 
+        let t4 = Instant::now();
         out = out.clone() + self.ff.forward(out);
+        let t_ff = t4.elapsed();
 
+        let t5 = Instant::now();
         for block in &self.mid_blocks {
             out = block.forward(out, k.clone(), v.clone(), mask.clone());
         }
+        let t_mid = t5.elapsed();
+
+        tracing::debug!(
+            "HydraPool kv={:.3}s q={:.3}s attn={:.3}s merge={:.3}s ff={:.3}s mid_blocks={:.3}s",
+            t_kv.as_secs_f64(),
+            t_q.as_secs_f64(),
+            t_attn.as_secs_f64(),
+            t_merge.as_secs_f64(),
+            t_ff.as_secs_f64(),
+            t_mid.as_secs_f64()
+        );
 
         out
     }
