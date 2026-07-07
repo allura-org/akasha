@@ -69,6 +69,18 @@ impl<
         let mut x = self.embeds.forward(patches, pos_embed, mask.clone());
         let t_embeds = t0.elapsed();
 
+        // Determine the actual number of valid patch positions. Hydra pads to
+        // `max_seq_len` with a contiguous suffix of invalid positions, so the
+        // valid prefix length is all we need for the rest of the forward pass.
+        let n_valid: usize = mask
+            .as_ref()
+            .map(|m| {
+                let data = m.to_data();
+                let slice = data.as_slice::<bool>().expect("mask is contiguous bool");
+                slice.iter().take(seq).filter(|&&b| b).count()
+            })
+            .unwrap_or(seq);
+
         // Burn's attention treats `true` as "mask out"; our mask semantics are
         // `true` = attend, so invert the mask.
         let attn_mask: Option<Tensor<B, 4, Bool>> =
@@ -84,8 +96,14 @@ impl<
         x = self.norm.forward(x);
         let t_norm = t2.elapsed();
 
+        // Slice to the valid prefix before the pool. Padded positions are masked
+        // out of attention anyway, so dropping them avoids wasted work in the
+        // large kv projection and cross-attention without changing semantics.
+        let hidden = x.dims()[2];
+        let mut x = x.slice([0..batch, 0..n_valid, 0..hidden]);
+
         let t3 = Instant::now();
-        x = self.attn_pool.forward(x, attn_mask);
+        x = self.attn_pool.forward(x, None);
         let t_pool = t3.elapsed();
 
         let t4 = Instant::now();
