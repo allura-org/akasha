@@ -433,7 +433,7 @@ impl Model for Jtp3Model {
 /// Read the EXIF Orientation tag from `image_path` and apply the corresponding
 /// transform to `rgb`.  If no orientation tag is present, `rgb` is returned
 /// unchanged.  This matches PIL's `ImageOps.exif_transpose` behavior.
-fn apply_exif_orientation(image_path: &Path, rgb: RgbImage) -> Result<RgbImage> {
+pub(crate) fn apply_exif_orientation(image_path: &Path, rgb: RgbImage) -> Result<RgbImage> {
     let file = std::fs::File::open(image_path)
         .with_context(|| format!("failed to open image for EXIF: {}", image_path.display()))?;
     let mut bufreader = std::io::BufReader::new(file);
@@ -464,7 +464,7 @@ fn apply_exif_orientation(image_path: &Path, rgb: RgbImage) -> Result<RgbImage> 
 }
 
 /// Convert `rgb` from its embedded ICC profile to sRGB using qcms.
-fn apply_icc_profile(icc: &[u8], rgb: RgbImage) -> Result<RgbImage> {
+pub(crate) fn apply_icc_profile(icc: &[u8], rgb: RgbImage) -> Result<RgbImage> {
     let src_profile = qcms::Profile::new_from_slice(icc, false)
         .context("failed to parse embedded ICC profile")?;
 

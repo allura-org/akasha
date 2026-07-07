@@ -19,6 +19,8 @@ pub mod remote;
 pub mod onnx;
 #[cfg(feature = "onnx")]
 pub mod jtp3;
+#[cfg(feature = "burn")]
+pub mod burn;
 #[cfg(feature = "mistralrs")]
 pub mod mistralrs;
 
@@ -86,6 +88,8 @@ impl BackendRegistry {
         reg.register(jtp3::Jtp3Backend);
         #[cfg(feature = "onnx")]
         reg.register(onnx::OrtBackend);
+        #[cfg(feature = "burn")]
+        reg.register(burn::BurnBackend);
         #[cfg(not(feature = "remote"))]
         let _ = remote;
         reg
