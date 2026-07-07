@@ -1927,7 +1927,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
         let v_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v));
 
-        if mask.is_some() || x_t.dtype() != DType::F32 {
+        if x_t.dtype() != DType::F32 {
             let out = block.forward(
                 x_t,
                 &k_t,
@@ -2000,6 +2000,46 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             .as_slice::<f32>()
             .expect("HydraMidBlock v is contiguous F32");
 
+        // Hydra pads images to max_seq_len with a contiguous suffix of invalid
+        // positions. Burn's attention mask uses true = mask out, so the valid
+        // prefix is the leading run of false values.
+        let n_valids: Vec<usize> = if let Some(mask) = mask {
+            let mask_t = Tensor::<Self, 4, Bool>::from_primitive(mask);
+            let [mb, mh, mw, ms] = mask_t.dims();
+            if mb != batch || mh != 1 || mw != 1 || ms != seq_kv {
+                let out = block.forward(x_t, &k_t, &v_t, Some(mask_t));
+                return match out.into_primitive() {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("HydraMidBlock returns a float tensor"),
+                };
+            }
+            let mask_data = mask_t.to_data();
+            let mask_slice = mask_data
+                .as_slice::<bool>()
+                .expect("mask is contiguous bool");
+            let mut n_valids = vec![seq_kv; batch];
+            let mut is_prefix = true;
+            for b in 0..batch {
+                let row = &mask_slice[b * seq_kv..(b + 1) * seq_kv];
+                let first_true = row.iter().position(|&v| v).unwrap_or(seq_kv);
+                n_valids[b] = first_true;
+                if row[first_true..].iter().any(|&v| !v) {
+                    is_prefix = false;
+                    break;
+                }
+            }
+            if !is_prefix || n_valids.iter().any(|&v| v == 0) {
+                let out = block.forward(x_t, &k_t, &v_t, Some(mask_t));
+                return match out.into_primitive() {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("HydraMidBlock returns a float tensor"),
+                };
+            }
+            n_valids
+        } else {
+            vec![seq_kv; batch]
+        };
+
         use std::time::Instant;
         let t_mid0 = Instant::now();
 
@@ -2040,6 +2080,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         (0..batch * heads).into_par_iter().for_each(|flat| {
             let b_idx = flat / heads;
             let h = flat % heads;
+            let seq_kv_eff = n_valids[b_idx];
 
             // Gather contiguous q for this head.
             let mut q_head = vec![0.0f32; seq_q * head_dim];
@@ -2053,18 +2094,18 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
 
             let kv_stride_head = seq_kv * head_dim;
             let kv_off = (b_idx * heads + h) * kv_stride_head;
-            let k_head = &k_slice[kv_off..kv_off + kv_stride_head];
-            let v_head = &v_slice[kv_off..kv_off + kv_stride_head];
+            let k_head = &k_slice[kv_off..kv_off + seq_kv_eff * head_dim];
+            let v_head = &v_slice[kv_off..kv_off + seq_kv_eff * head_dim];
 
-            let mut scores = vec![0.0f32; seq_q * seq_kv];
+            let mut scores = vec![0.0f32; seq_q * seq_kv_eff];
             {
                 let a = MatRef::from_row_major_slice(&q_head, seq_q, head_dim);
-                let b = MatRef::from_column_major_slice(k_head, head_dim, seq_kv);
-                let mut c = MatMut::from_row_major_slice_mut(&mut scores, seq_q, seq_kv);
+                let b = MatRef::from_column_major_slice(k_head, head_dim, seq_kv_eff);
+                let mut c = MatMut::from_row_major_slice_mut(&mut scores, seq_q, seq_kv_eff);
                 matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
             }
 
-            scores.par_chunks_exact_mut(seq_kv).for_each(|row| {
+            scores.par_chunks_exact_mut(seq_kv_eff).for_each(|row| {
                 let mut max = f32::NEG_INFINITY;
                 for &v in row.iter() {
                     max = max.max(v);
@@ -2083,8 +2124,8 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
 
             let mut head_out = vec![0.0f32; seq_q * head_dim];
             {
-                let a = MatRef::from_row_major_slice(&scores, seq_q, seq_kv);
-                let b = MatRef::from_row_major_slice(v_head, seq_kv, head_dim);
+                let a = MatRef::from_row_major_slice(&scores, seq_q, seq_kv_eff);
+                let b = MatRef::from_row_major_slice(v_head, seq_kv_eff, head_dim);
                 let mut c = MatMut::from_row_major_slice_mut(&mut head_out, seq_q, head_dim);
                 matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
             }
@@ -2282,7 +2323,7 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
 
-        if mask.is_some() || x_t.dtype() != DType::F32 {
+        if x_t.dtype() != DType::F32 {
             let out = block.attn.forward(
                 block.norm1.forward(x_t),
                 mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
@@ -2325,6 +2366,46 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
             .as_slice::<f32>()
             .expect("NaFlexAttn input is contiguous F32");
 
+        // Hydra pads images to max_seq_len with a contiguous suffix of invalid
+        // positions. Burn's attention mask uses true = mask out, so the valid
+        // prefix is the leading run of false values.
+        let n_valids: Vec<usize> = if let Some(mask) = mask {
+            let mask_t = Tensor::<Self, 4, Bool>::from_primitive(mask);
+            let [mb, mh, mw, ms] = mask_t.dims();
+            if mb != batch || mh != 1 || mw != 1 || ms != seq {
+                let out = block.attn.forward(block.norm1.forward(x_t), Some(mask_t));
+                return match out.into_primitive() {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("NaFlexAttn returns a float tensor"),
+                };
+            }
+            let mask_data = mask_t.to_data();
+            let mask_slice = mask_data
+                .as_slice::<bool>()
+                .expect("mask is contiguous bool");
+            let mut n_valids = vec![seq; batch];
+            let mut is_prefix = true;
+            for b in 0..batch {
+                let row = &mask_slice[b * seq..(b + 1) * seq];
+                let first_true = row.iter().position(|&v| v).unwrap_or(seq);
+                n_valids[b] = first_true;
+                if row[first_true..].iter().any(|&v| !v) {
+                    is_prefix = false;
+                    break;
+                }
+            }
+            if !is_prefix || n_valids.iter().any(|&v| v == 0) {
+                let out = block.attn.forward(block.norm1.forward(x_t), Some(mask_t));
+                return match out.into_primitive() {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("NaFlexAttn returns a float tensor"),
+                };
+            }
+            n_valids
+        } else {
+            vec![seq; batch]
+        };
+
         // LayerNorm1.
         let mut norm1 = vec![0.0f32; m * hidden];
         x_slice
@@ -2366,27 +2447,33 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
         (0..batch * heads).into_par_iter().for_each(|flat| {
             let b_idx = flat / heads;
             let h = flat % heads;
+            let seq_kv_eff = n_valids[b_idx];
 
             let mut q_buf = vec![0.0f32; seq * head_dim];
-            let mut k_buf = vec![0.0f32; seq * head_dim];
-            let mut v_buf = vec![0.0f32; seq * head_dim];
+            let mut k_buf = vec![0.0f32; seq_kv_eff * head_dim];
+            let mut v_buf = vec![0.0f32; seq_kv_eff * head_dim];
 
             for p in 0..seq {
                 let row = b_idx * seq + p;
                 let qkv_base = row * qkv_out;
                 let q_off = qkv_base + h * head_dim;
+                let buf_base = p * head_dim;
+                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
+            }
+            for p in 0..seq_kv_eff {
+                let row = b_idx * seq + p;
+                let qkv_base = row * qkv_out;
                 let k_off = qkv_base + hidden + h * head_dim;
                 let v_off = qkv_base + 2 * hidden + h * head_dim;
                 let buf_base = p * head_dim;
-                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
                 k_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[k_off..k_off + head_dim]);
                 v_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[v_off..v_off + head_dim]);
             }
 
-            let mut scores = vec![0.0f32; seq * seq];
+            let mut scores = vec![0.0f32; seq * seq_kv_eff];
             gemm_a_bt_scaled(
                 seq,
-                seq,
+                seq_kv_eff,
                 head_dim,
                 q_buf.as_slice(),
                 k_buf.as_slice(),
@@ -2396,19 +2483,19 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
             );
 
             for i in 0..seq {
-                let row_start = i * seq;
+                let row_start = i * seq_kv_eff;
                 let mut max = f32::NEG_INFINITY;
-                for j in 0..seq {
+                for j in 0..seq_kv_eff {
                     max = max.max(scores[row_start + j]);
                 }
                 let mut sum = 0.0f32;
-                for j in 0..seq {
+                for j in 0..seq_kv_eff {
                     let e = (scores[row_start + j] - max).exp();
                     scores[row_start + j] = e;
                     sum += e;
                 }
                 let inv_sum = 1.0f32 / sum;
-                for j in 0..seq {
+                for j in 0..seq_kv_eff {
                     scores[row_start + j] *= inv_sum;
                 }
             }
@@ -2417,7 +2504,7 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
             gemm_row_major(
                 seq,
                 head_dim,
-                seq,
+                seq_kv_eff,
                 scores.as_slice(),
                 v_buf.as_slice(),
                 &mut head_out,
