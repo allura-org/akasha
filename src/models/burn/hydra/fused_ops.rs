@@ -1009,6 +1009,8 @@ impl FusedGluBackend for burn::backend::candle::Candle {
         norm: &burn::nn::LayerNorm<Self>,
         ff: &super::modules::HydraFeedForward<Self>,
     ) -> FloatTensor<Self> {
+        use faer::linalg::matmul::matmul;
+        use faer::{Accum, MatMut, MatRef, Par};
         use rayon::prelude::*;
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
@@ -1091,19 +1093,22 @@ impl FusedGluBackend for burn::backend::candle::Candle {
         let mut glu_proj = vec![0.0f32; m * out2];
         best_row_major(m, out2, k, &normed, glu_w_slice, &mut glu_proj);
 
-        let mut glu_out = vec![0.0f32; m * out];
-        glu_proj
-            .par_chunks_exact(out2)
-            .zip(glu_out.par_chunks_exact_mut(out))
-            .for_each(|(src, dst)| {
-                for j in 0..out {
-                    let gate = softplus_f32(src[j]);
-                    dst[j] = gate * src[out + j];
-                }
-            });
+        // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
+        glu_proj.par_chunks_exact_mut(out2).for_each(|row| {
+            for j in 0..out {
+                let gate = softplus_f32(row[j]);
+                row[j] = gate * row[out + j];
+            }
+        });
 
+        // Output projection from the activated half of glu_proj with row stride out2.
         let mut output = vec![0.0f32; m * proj_out_dim];
-        best_row_major(m, proj_out_dim, out, &glu_out, proj_w_slice, &mut output);
+        {
+            let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, out, out2);
+            let b = MatRef::from_row_major_slice(proj_w_slice, out, proj_out_dim);
+            let mut c = MatMut::from_row_major_slice_mut(&mut output, m, proj_out_dim);
+            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        }
 
         if let Some(bias) = proj_b_slice {
             output.par_chunks_exact_mut(proj_out_dim).for_each(|row| {
@@ -2257,25 +2262,29 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         let mut glu_proj = vec![0.0f32; m * glu_out2];
         best_row_major(m, glu_out2, hidden, &normed, &glu_w, &mut glu_proj);
 
-        let mut glu_out_buf = vec![0.0f32; m * glu_out_dim];
-        glu_proj
-            .par_chunks_exact(glu_out2)
-            .zip(glu_out_buf.par_chunks_exact_mut(glu_out_dim))
-            .for_each(|(src, dst)| {
-                for j in 0..glu_out_dim {
-                    let gate = softplus_f32(src[j]);
-                    dst[j] = gate * src[glu_out_dim + j];
-                }
-            });
+        // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
+        // The activated values remain packed as [activated_gate, up], which the
+        // strided faer matmul below reads directly without a separate copy.
+        glu_proj.par_chunks_exact_mut(glu_out2).for_each(|row| {
+            for j in 0..glu_out_dim {
+                let gate = softplus_f32(row[j]);
+                row[j] = gate * row[glu_out_dim + j];
+            }
+        });
 
-        best_row_major(
-            m,
-            hidden,
-            glu_out_dim,
-            glu_out_buf.as_slice(),
-            proj_out_w,
-            &mut ff_out,
-        );
+        // Output projection from the activated half of glu_proj. Row stride is
+        // 2*glu_out_dim because the gate/up pairs are packed in each row.
+        {
+            let a = MatRef::from_row_major_slice_with_stride(
+                &glu_proj,
+                m,
+                glu_out_dim,
+                glu_out2,
+            );
+            let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
+            let mut c = MatMut::from_row_major_slice_mut(&mut ff_out, m, hidden);
+            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        }
         if let Some(ref b) = proj_out_b {
             ff_out.par_chunks_exact_mut(hidden).for_each(|row| {
                 for j in 0..hidden {
