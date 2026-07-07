@@ -19,10 +19,156 @@ use burn::tensor::{DType, TensorPrimitive};
 use burn::backend::flex::FlexDevice;
 
 // ---------------------------------------------------------------------------
+// Low-level GEMM helper (pure Rust, no C/C++)
+// ---------------------------------------------------------------------------
+
+/// Wrapper around the `gemm` crate's pure-Rust GEMM.
+///
+/// All strides are in units of elements. Row-major storage uses
+/// `row_stride = ncols`, `col_stride = 1`. For `C = A @ B` set
+/// `read_dst = false`; existing `c` contents are then ignored.
+#[inline]
+unsafe fn gemm_f32(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    rsa: isize,
+    csa: isize,
+    b: &[f32],
+    rsb: isize,
+    csb: isize,
+    c: &mut [f32],
+    rsc: isize,
+    csc: isize,
+    par: gemm::Parallelism,
+) {
+    gemm::gemm(
+        m,
+        n,
+        k,
+        c.as_mut_ptr(),
+        csc,
+        rsc,
+        false,
+        a.as_ptr(),
+        csa,
+        rsa,
+        b.as_ptr(),
+        csb,
+        rsb,
+        0.0,
+        1.0,
+        false,
+        false,
+        false,
+        par,
+    );
+}
+
+/// `C = A @ B` with row-major A, B, C.
+#[inline]
+fn gemm_row_major(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm_f32(
+            m, n, k, a, k as isize, 1, b, n as isize, 1, c, n as isize, 1, par,
+        );
+    }
+}
+
+/// `C = A @ B^T` where A is row-major `[m, k]` and `b_t` is row-major `[n, k]`
+/// (i.e. the transpose of the desired B).
+#[inline]
+fn gemm_a_bt(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b_t: &[f32],
+    c: &mut [f32],
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm_f32(
+            m, n, k, a, k as isize, 1, b_t, 1, k as isize, c, n as isize, 1, par,
+        );
+    }
+}
+
+/// `C = scale * (A @ B)` with row-major A, B, C.
+#[inline]
+fn gemm_row_major_scaled(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    scale: f32,
+    par: gemm::Parallelism,
+) {
+    gemm_row_major(m, n, k, a, b, c, par);
+    for v in c.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// `C = scale * (A @ B^T)` where A is row-major `[m, k]` and `b_t` is row-major `[n, k]`.
+#[inline]
+fn gemm_a_bt_scaled(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b_t: &[f32],
+    c: &mut [f32],
+    scale: f32,
+    par: gemm::Parallelism,
+) {
+    gemm_a_bt(m, n, k, a, b_t, c, par);
+    for v in c.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// Dispatch to the fastest pure-Rust GEMM for the given shape.
+///
+/// Benchmarks showed `faer` wins on very large square-ish matmuls while `gemm`
+/// is faster for small/medium and attention-sized shapes.
+#[inline]
+fn best_row_major(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    if (m as u64) * (n as u64) * (k as u64) >= 20_000_000_000u64 {
+        use faer::linalg::matmul::matmul;
+        use faer::{Accum, MatMut, MatRef, Par};
+        let a_ref = MatRef::from_row_major_slice(a, m, k);
+        let b_ref = MatRef::from_row_major_slice(b, k, n);
+        let mut c_mut = MatMut::from_row_major_slice_mut(c, m, n);
+        matmul(
+            c_mut.as_mut(),
+            Accum::Replace,
+            a_ref,
+            b_ref,
+            1.0f32,
+            Par::rayon(0),
+        );
+    } else {
+        gemm_row_major(m, n, k, a, b, c, gemm::Parallelism::Rayon(0));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Backend-specific fast linear dispatch
 // ---------------------------------------------------------------------------
 
-/// Backends that provide a fast linear path with optional faer acceleration.
+/// Backends that provide a fast linear path with optional pure-Rust GEMM acceleration.
 pub trait FastLinearBackend: Backend {
     /// Compute `x @ weight + bias`.
     ///
@@ -70,9 +216,6 @@ impl FastLinearBackend for burn::backend::candle::Candle {
         weight: FloatTensor<Self>,
         bias: Option<FloatTensor<Self>>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
-
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let w_t = Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(weight));
 
@@ -105,10 +248,7 @@ impl FastLinearBackend for burn::backend::candle::Candle {
             .expect("fast_linear weight is contiguous F32");
 
         let mut out = vec![0.0f32; m * n];
-        let a = MatRef::from_row_major_slice(x_slice, m, k);
-        let b = MatRef::from_row_major_slice(w_slice, k, n);
-        let mut c = MatMut::from_row_major_slice_mut(&mut out, m, n);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, n, k, x_slice, w_slice, &mut out);
 
         if let Some(bias) = bias {
             let bias_t = Tensor::<Self, 1>::from_primitive(TensorPrimitive::Float(bias));
@@ -152,26 +292,31 @@ pub trait FusedMlpBackend: Backend {
     /// * `x`:  `[batch, seq, in_features]`
     /// * `mlp`: NaFlexMlp module (cached weights are used by fast backends)
     /// * returns: `[batch, seq, out_features]`
-    fn fused_mlp(
-        x: FloatTensor<Self>,
-        mlp: &super::modules::NaFlexMlp<Self>,
-    ) -> FloatTensor<Self> {
+    fn fused_mlp(x: FloatTensor<Self>, mlp: &super::modules::NaFlexMlp<Self>) -> FloatTensor<Self> {
         let fc1_weight = match mlp.fc1.weight.val().into_primitive() {
             TensorPrimitive::Float(t) => t,
             _ => unreachable!("fc1 weight is a float tensor"),
         };
-        let fc1_bias = mlp.fc1.bias.as_ref().map(|b| match b.val().into_primitive() {
-            TensorPrimitive::Float(t) => t,
-            _ => unreachable!("fc1 bias is a float tensor"),
-        });
+        let fc1_bias = mlp
+            .fc1
+            .bias
+            .as_ref()
+            .map(|b| match b.val().into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("fc1 bias is a float tensor"),
+            });
         let fc2_weight = match mlp.fc2.weight.val().into_primitive() {
             TensorPrimitive::Float(t) => t,
             _ => unreachable!("fc2 weight is a float tensor"),
         };
-        let fc2_bias = mlp.fc2.bias.as_ref().map(|b| match b.val().into_primitive() {
-            TensorPrimitive::Float(t) => t,
-            _ => unreachable!("fc2 bias is a float tensor"),
-        });
+        let fc2_bias = mlp
+            .fc2
+            .bias
+            .as_ref()
+            .map(|b| match b.val().into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("fc2 bias is a float tensor"),
+            });
         match fused_mlp_fallback_tensor(
             Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
             Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(fc1_weight)),
@@ -266,7 +411,10 @@ fn fused_mlp_fallback_tensor<B: Backend>(
 
     let [in_features, hidden_features] = fc1_weight.dims();
     let [hidden2, out_features] = fc2_weight.dims();
-    assert_eq!(hidden_features, hidden2, "fc1 hidden must match fc2 in features");
+    assert_eq!(
+        hidden_features, hidden2,
+        "fc1 hidden must match fc2 in features"
+    );
 
     let fc1_weight = fc1_weight.reshape([1, in_features, hidden_features]);
     let mut x = x.matmul(fc1_weight);
@@ -285,13 +433,7 @@ fn fused_mlp_fallback_tensor<B: Backend>(
 
 #[cfg(feature = "burn-candle")]
 impl FusedMlpBackend for burn::backend::candle::Candle {
-    fn fused_mlp(
-        x: FloatTensor<Self>,
-        mlp: &super::modules::NaFlexMlp<Self>,
-    ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
-
+    fn fused_mlp(x: FloatTensor<Self>, mlp: &super::modules::NaFlexMlp<Self>) -> FloatTensor<Self> {
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
 
         let [batch, seq, k] = x_t.dims();
@@ -307,18 +449,26 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
                 TensorPrimitive::Float(t) => t,
                 _ => unreachable!("fc1 weight is a float tensor"),
             };
-            let fc1_b_t = mlp.fc1.bias.as_ref().map(|b| match b.val().into_primitive() {
-                TensorPrimitive::Float(t) => t,
-                _ => unreachable!("fc1 bias is a float tensor"),
-            });
+            let fc1_b_t = mlp
+                .fc1
+                .bias
+                .as_ref()
+                .map(|b| match b.val().into_primitive() {
+                    TensorPrimitive::Float(t) => t,
+                    _ => unreachable!("fc1 bias is a float tensor"),
+                });
             let fc2_w_t = match mlp.fc2.weight.val().into_primitive() {
                 TensorPrimitive::Float(t) => t,
                 _ => unreachable!("fc2 weight is a float tensor"),
             };
-            let fc2_b_t = mlp.fc2.bias.as_ref().map(|b| match b.val().into_primitive() {
-                TensorPrimitive::Float(t) => t,
-                _ => unreachable!("fc2 bias is a float tensor"),
-            });
+            let fc2_b_t = mlp
+                .fc2
+                .bias
+                .as_ref()
+                .map(|b| match b.val().into_primitive() {
+                    TensorPrimitive::Float(t) => t,
+                    _ => unreachable!("fc2 bias is a float tensor"),
+                });
             return match fused_mlp_fallback_tensor(
                 x_t,
                 Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(fc1_w_t)),
@@ -343,10 +493,7 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
         let fc2_b_slice = mlp.fc2_b_cache.as_deref();
 
         let mut tmp = vec![0.0f32; m * hidden];
-        let a = MatRef::from_row_major_slice(x_slice, m, k);
-        let b = MatRef::from_row_major_slice(fc1_w_slice, k, hidden);
-        let mut c = MatMut::from_row_major_slice_mut(&mut tmp, m, hidden);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, hidden, k, x_slice, fc1_w_slice, &mut tmp);
 
         if let Some(bias) = fc1_b_slice {
             for i in 0..m {
@@ -363,10 +510,7 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
         }
 
         let mut out = vec![0.0f32; m * n];
-        let a = MatRef::from_row_major_slice(&tmp, m, hidden);
-        let b = MatRef::from_row_major_slice(fc2_w_slice, hidden, n);
-        let mut c = MatMut::from_row_major_slice_mut(&mut out, m, n);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, n, hidden, &tmp, fc2_w_slice, &mut out);
 
         if let Some(bias) = fc2_b_slice {
             for i in 0..m {
@@ -393,8 +537,6 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
         norm: &burn::nn::LayerNorm<Self>,
         mlp: &super::modules::NaFlexMlp<Self>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
         use rayon::prelude::*;
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
@@ -463,7 +605,8 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
                         let d = *v - mean;
                         d * d
                     })
-                    .sum::<f32>() / k as f32;
+                    .sum::<f32>()
+                    / k as f32;
                 let inv_std = 1.0f32 / (var + eps).sqrt();
                 for j in 0..k {
                     row_n[j] = (row_x[j] - mean) * inv_std * gamma[j]
@@ -472,20 +615,14 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
             });
 
         let mut tmp = vec![0.0f32; m * hidden];
-        {
-            let a = MatRef::from_row_major_slice(&normed, m, k);
-            let b = MatRef::from_row_major_slice(fc1_w_slice, k, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut tmp, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, hidden, k, &normed, fc1_w_slice, &mut tmp);
 
         if let Some(bias) = fc1_b_slice {
-            tmp.par_chunks_exact_mut(hidden)
-                .for_each(|row| {
-                    for j in 0..hidden {
-                        row[j] += bias[j];
-                    }
-                });
+            tmp.par_chunks_exact_mut(hidden).for_each(|row| {
+                for j in 0..hidden {
+                    row[j] += bias[j];
+                }
+            });
         }
 
         tmp.par_iter_mut().for_each(|v| {
@@ -495,18 +632,14 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
         let device = x_t.device();
 
         let mut out = vec![0.0f32; m * n];
-        let a = MatRef::from_row_major_slice(tmp.as_slice(), m, hidden);
-        let b = MatRef::from_row_major_slice(fc2_w_slice, hidden, n);
-        let mut c = MatMut::from_row_major_slice_mut(&mut out, m, n);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, n, hidden, tmp.as_slice(), fc2_w_slice, &mut out);
 
         if let Some(bias) = fc2_b_slice {
-            out.par_chunks_exact_mut(n)
-                .for_each(|row| {
-                    for j in 0..n {
-                        row[j] += bias[j];
-                    }
-                });
+            out.par_chunks_exact_mut(n).for_each(|row| {
+                for j in 0..n {
+                    row[j] += bias[j];
+                }
+            });
         }
 
         // Add residual.
@@ -545,10 +678,7 @@ pub trait FusedGluBackend: FastLinearBackend {
     /// * `x`:      `[batch, seq, in_features]`
     /// * `weight`: `[in_features, 2 * out_features]`
     /// * returns:  `[batch, seq, out_features]`
-    fn fused_linear_glu(
-        x: FloatTensor<Self>,
-        weight: FloatTensor<Self>,
-    ) -> FloatTensor<Self> {
+    fn fused_linear_glu(x: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self> {
         match fused_linear_glu_fallback_tensor(
             Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
             Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(weight)),
@@ -607,10 +737,14 @@ pub trait FusedGluBackend: FastLinearBackend {
             TensorPrimitive::Float(t) => t,
             _ => unreachable!("proj weight is a float tensor"),
         };
-        let proj_bias = ff.proj_out.bias.as_ref().map(|b| match b.val().into_primitive() {
-            TensorPrimitive::Float(t) => t,
-            _ => unreachable!("proj bias is a float tensor"),
-        });
+        let proj_bias = ff
+            .proj_out
+            .bias
+            .as_ref()
+            .map(|b| match b.val().into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("proj bias is a float tensor"),
+            });
         let normalized = norm.forward(Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)));
         Self::fused_linear_glu_proj(
             match normalized.into_primitive() {
@@ -625,10 +759,7 @@ pub trait FusedGluBackend: FastLinearBackend {
 }
 
 /// Tensor-level entry point for the fused GLU path.
-pub fn fused_linear_glu<B: FusedGluBackend>(
-    x: Tensor<B, 3>,
-    weight: Tensor<B, 2>,
-) -> Tensor<B, 3> {
+pub fn fused_linear_glu<B: FusedGluBackend>(x: Tensor<B, 3>, weight: Tensor<B, 2>) -> Tensor<B, 3> {
     Tensor::from_primitive(TensorPrimitive::Float(B::fused_linear_glu(
         match x.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
@@ -735,13 +866,7 @@ fn fused_linear_glu_proj_fallback_tensor<B: Backend>(
 
 #[cfg(feature = "burn-candle")]
 impl FusedGluBackend for burn::backend::candle::Candle {
-    fn fused_linear_glu(
-        x: FloatTensor<Self>,
-        weight: FloatTensor<Self>,
-    ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
-
+    fn fused_linear_glu(x: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self> {
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let w_t = Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(weight));
 
@@ -769,10 +894,7 @@ impl FusedGluBackend for burn::backend::candle::Candle {
             .expect("fused_linear_glu weight is contiguous F32");
 
         let mut proj = vec![0.0f32; m * out2];
-        let a = MatRef::from_row_major_slice(x_slice, m, k);
-        let b = MatRef::from_row_major_slice(w_slice, k, out2);
-        let mut c = MatMut::from_row_major_slice_mut(&mut proj, m, out2);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, out2, k, x_slice, w_slice, &mut proj);
 
         // In-place convert the full projection to GLU output:
         // output[i, j] = softplus(proj[i, j]) * proj[i, out + j]
@@ -802,9 +924,6 @@ impl FusedGluBackend for burn::backend::candle::Candle {
         proj_weight: FloatTensor<Self>,
         proj_bias: Option<FloatTensor<Self>>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
-
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let glu_w_t = Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(glu_weight));
         let proj_w_t = Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(proj_weight));
@@ -846,10 +965,7 @@ impl FusedGluBackend for burn::backend::candle::Candle {
             .expect("proj_weight is contiguous F32");
 
         let mut glu_proj = vec![0.0f32; m * out2];
-        let a = MatRef::from_row_major_slice(x_slice, m, k);
-        let b = MatRef::from_row_major_slice(glu_w_slice, k, out2);
-        let mut c = MatMut::from_row_major_slice_mut(&mut glu_proj, m, out2);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, out2, k, x_slice, glu_w_slice, &mut glu_proj);
 
         let mut glu_out = vec![0.0f32; m * out];
         for i in 0..m {
@@ -862,10 +978,7 @@ impl FusedGluBackend for burn::backend::candle::Candle {
         }
 
         let mut output = vec![0.0f32; m * proj_out_dim];
-        let a = MatRef::from_row_major_slice(&glu_out, m, out);
-        let b = MatRef::from_row_major_slice(proj_w_slice, out, proj_out_dim);
-        let mut c = MatMut::from_row_major_slice_mut(&mut output, m, proj_out_dim);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
+        best_row_major(m, proj_out_dim, out, &glu_out, proj_w_slice, &mut output);
 
         if let Some(bias) = proj_bias {
             let bias_t = Tensor::<Self, 1>::from_primitive(TensorPrimitive::Float(bias));
@@ -896,8 +1009,6 @@ impl FusedGluBackend for burn::backend::candle::Candle {
         norm: &burn::nn::LayerNorm<Self>,
         ff: &super::modules::HydraFeedForward<Self>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
         use rayon::prelude::*;
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
@@ -925,10 +1036,13 @@ impl FusedGluBackend for burn::backend::candle::Candle {
                     TensorPrimitive::Float(t) => t,
                     _ => unreachable!("proj weight is a float tensor"),
                 },
-                ff.proj_out.bias.as_ref().map(|b| match b.val().into_primitive() {
-                    TensorPrimitive::Float(t) => t,
-                    _ => unreachable!("proj bias is a float tensor"),
-                }),
+                ff.proj_out
+                    .bias
+                    .as_ref()
+                    .map(|b| match b.val().into_primitive() {
+                        TensorPrimitive::Float(t) => t,
+                        _ => unreachable!("proj bias is a float tensor"),
+                    }),
             );
         }
 
@@ -965,7 +1079,8 @@ impl FusedGluBackend for burn::backend::candle::Candle {
                         let d = *v - mean;
                         d * d
                     })
-                    .sum::<f32>() / k as f32;
+                    .sum::<f32>()
+                    / k as f32;
                 let inv_std = 1.0f32 / (var + eps).sqrt();
                 for j in 0..k {
                     row_n[j] = (row_x[j] - mean) * inv_std * gamma[j]
@@ -974,12 +1089,7 @@ impl FusedGluBackend for burn::backend::candle::Candle {
             });
 
         let mut glu_proj = vec![0.0f32; m * out2];
-        {
-            let a = MatRef::from_row_major_slice(&normed, m, k);
-            let b = MatRef::from_row_major_slice(glu_w_slice, k, out2);
-            let mut c = MatMut::from_row_major_slice_mut(&mut glu_proj, m, out2);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, out2, k, &normed, glu_w_slice, &mut glu_proj);
 
         let mut glu_out = vec![0.0f32; m * out];
         glu_proj
@@ -993,12 +1103,7 @@ impl FusedGluBackend for burn::backend::candle::Candle {
             });
 
         let mut output = vec![0.0f32; m * proj_out_dim];
-        {
-            let a = MatRef::from_row_major_slice(&glu_out, m, out);
-            let b = MatRef::from_row_major_slice(proj_w_slice, out, proj_out_dim);
-            let mut c = MatMut::from_row_major_slice_mut(&mut output, m, proj_out_dim);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, proj_out_dim, out, &glu_out, proj_w_slice, &mut output);
 
         if let Some(bias) = proj_b_slice {
             output.par_chunks_exact_mut(proj_out_dim).for_each(|row| {
@@ -1024,10 +1129,7 @@ impl FusedGluBackend for burn::backend::NdArray {}
 
 #[cfg(feature = "burn-flex")]
 impl FusedGluBackend for burn::backend::flex::Flex {
-    fn fused_linear_glu(
-        x: FloatTensor<Self>,
-        weight: FloatTensor<Self>,
-    ) -> FloatTensor<Self> {
+    fn fused_linear_glu(x: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self> {
         use burn::backend::flex::{Flex, FlexTensor};
 
         // Single fused linear projection [batch, seq, 2*out].
@@ -1057,15 +1159,13 @@ impl FusedGluBackend for burn::backend::flex::Flex {
 
         // Allocate the output tensor and get its raw storage.
         let device = <FlexDevice as Default>::default();
-        let mut output: FlexTensor = match Tensor::<Flex, 3>::zeros(
-            [batch, seq, out],
-            (&device, DType::F32),
-        )
-        .into_primitive()
-        {
-            TensorPrimitive::Float(tensor) => tensor,
-            _ => unreachable!("zeros returns a float tensor"),
-        };
+        let mut output: FlexTensor =
+            match Tensor::<Flex, 3>::zeros([batch, seq, out], (&device, DType::F32))
+                .into_primitive()
+            {
+                TensorPrimitive::Float(tensor) => tensor,
+                _ => unreachable!("zeros returns a float tensor"),
+            };
 
         let src = proj.storage::<f32>();
         let dst = output.storage_mut::<f32>();
@@ -1268,9 +1368,8 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
         let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
         let v_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v));
 
-        // Only accelerate the no-mask F32 path; fall back to Burn's attention
-        // implementation for masked attention or other dtypes.
-        if mask.is_some() || q_t.dtype() != DType::F32 {
+        // Only accelerate the F32 path; fall back to Burn's attention for other dtypes.
+        if q_t.dtype() != DType::F32 {
             return match attention(
                 q_t,
                 k_t,
@@ -1296,6 +1395,64 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
         let [batch, heads, seq_q, head_dim] = q_shape;
         let seq_kv = k_shape[2];
 
+        // For masked attention, try to use a prefix-valid fast path. Hydra pads images
+        // to max_seq_len with a contiguous block of invalid positions at the end, so
+        // we only need to attend to the first n_valid key/value positions.
+        // Burn's attention treats `true` as "mask out"; our preprocess produces
+        // `true` = attend, and Hydra::forward inverts that before passing the mask here.
+        let n_valids: Vec<usize> = if let Some(mask) = mask {
+            let mask_t = Tensor::<Self, 4, Bool>::from_primitive(mask);
+            let [mb, mh, mw, ms] = mask_t.dims();
+            if mb != batch || mh != 1 || mw != 1 || ms != seq_kv {
+                return match attention(
+                    q_t,
+                    k_t,
+                    v_t,
+                    Some(mask_t),
+                    None,
+                    AttentionModuleOptions::default(),
+                )
+                .into_primitive()
+                {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("attention returns a float tensor"),
+                };
+            }
+            let mask_data = mask_t.to_data();
+            let mask_slice = mask_data
+                .as_slice::<bool>()
+                .expect("mask is contiguous bool");
+            let mut n_valids = vec![seq_kv; batch];
+            let mut is_prefix = true;
+            for b in 0..batch {
+                let row = &mask_slice[b * seq_kv..(b + 1) * seq_kv];
+                let first_true = row.iter().position(|&v| v).unwrap_or(seq_kv);
+                n_valids[b] = first_true;
+                if row[first_true..].iter().any(|&v| !v) {
+                    is_prefix = false;
+                    break;
+                }
+            }
+            if !is_prefix || n_valids.iter().any(|&v| v == 0) {
+                return match attention(
+                    q_t,
+                    k_t,
+                    v_t,
+                    Some(mask_t),
+                    None,
+                    AttentionModuleOptions::default(),
+                )
+                .into_primitive()
+                {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("attention returns a float tensor"),
+                };
+            }
+            n_valids
+        } else {
+            vec![seq_kv; batch]
+        };
+
         let q_data = q_t.to_data();
         let k_data = k_t.to_data();
         let v_data = v_t.to_data();
@@ -1306,8 +1463,8 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
         let device = q_t.device();
 
         let q_stride_head = seq_q * head_dim;
-        let kv_stride_head = seq_kv * head_dim;
         let q_stride_batch = heads * q_stride_head;
+        let kv_stride_head = seq_kv * head_dim;
         let kv_stride_batch = heads * kv_stride_head;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -1319,47 +1476,51 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
             .for_each(|(flat, out_head)| {
                 let b = flat / heads;
                 let h = flat % heads;
+                let seq_kv_eff = n_valids[b];
 
                 let q_offset = b * q_stride_batch + h * q_stride_head;
                 let kv_offset = b * kv_stride_batch + h * kv_stride_head;
 
                 let q_slice = &q_slice_all[q_offset..q_offset + q_stride_head];
-                let k_slice = &k_slice_all[kv_offset..kv_offset + kv_stride_head];
-                let v_slice = &v_slice_all[kv_offset..kv_offset + kv_stride_head];
+                let k_slice = &k_slice_all[kv_offset..kv_offset + seq_kv_eff * head_dim];
+                let v_slice = &v_slice_all[kv_offset..kv_offset + seq_kv_eff * head_dim];
 
                 // scores = q @ k^T, scaled by 1/sqrt(head_dim).
-                // k_slice is row-major [seq_kv, head_dim]; reinterpret it as
-                // column-major [head_dim, seq_kv] to avoid an explicit transpose.
-                let mut scores = vec![0.0f32; seq_q * seq_kv];
-                let a = MatRef::from_row_major_slice(q_slice, seq_q, head_dim);
-                let b = MatRef::from_column_major_slice(k_slice, head_dim, seq_kv);
-                let mut c = MatMut::from_row_major_slice_mut(&mut scores, seq_q, seq_kv);
-                matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
+                // k_slice is row-major [seq_kv_eff, head_dim]; reinterpret as column-major
+                // [head_dim, seq_kv_eff] to avoid an explicit transpose.
+                let mut scores = vec![0.0f32; seq_q * seq_kv_eff];
+                {
+                    let a = MatRef::from_row_major_slice(q_slice, seq_q, head_dim);
+                    let b = MatRef::from_column_major_slice(k_slice, head_dim, seq_kv_eff);
+                    let mut c = MatMut::from_row_major_slice_mut(&mut scores, seq_q, seq_kv_eff);
+                    matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
+                }
 
-                // Softmax over the last dimension (seq_kv) for each row.
-                for i in 0..seq_q {
-                    let row_start = i * seq_kv;
+                // Softmax over the last dimension (seq_kv_eff) for each row.
+                scores.par_chunks_exact_mut(seq_kv_eff).for_each(|row| {
                     let mut max = f32::NEG_INFINITY;
-                    for j in 0..seq_kv {
-                        max = max.max(scores[row_start + j]);
+                    for &v in row.iter() {
+                        max = max.max(v);
                     }
                     let mut sum = 0.0f32;
-                    for j in 0..seq_kv {
-                        let e = (scores[row_start + j] - max).exp();
-                        scores[row_start + j] = e;
+                    for v in row.iter_mut() {
+                        let e = (*v - max).exp();
+                        *v = e;
                         sum += e;
                     }
                     let inv_sum = 1.0f32 / sum;
-                    for j in 0..seq_kv {
-                        scores[row_start + j] *= inv_sum;
+                    for v in row.iter_mut() {
+                        *v *= inv_sum;
                     }
-                }
+                });
 
                 // out_head = scores @ v.
-                let a = MatRef::from_row_major_slice(&scores, seq_q, seq_kv);
-                let b = MatRef::from_row_major_slice(v_slice, seq_kv, head_dim);
-                let mut c = MatMut::from_row_major_slice_mut(out_head, seq_q, head_dim);
-                matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
+                {
+                    let a = MatRef::from_row_major_slice(&scores, seq_q, seq_kv_eff);
+                    let b = MatRef::from_row_major_slice(v_slice, seq_kv_eff, head_dim);
+                    let mut c = MatMut::from_row_major_slice_mut(out_head, seq_q, head_dim);
+                    matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
+                }
             });
 
         match Tensor::<Self, 1>::from_data(output.as_slice(), (&device, DType::F32))
@@ -1403,22 +1564,9 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         block: &super::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
         use rayon::prelude::*;
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
-
-        // Faer's threaded GEMM has overhead on the small matrices inside each
-        // block; use sequential faer there and reserve the global thread pool
-        // for the large pool/mid-block passes.
-        let par_policy = |m: usize, n: usize, k: usize| {
-            if m as u64 * n as u64 * k as u64 > 20_000_000_000u64 {
-                Par::rayon(0)
-            } else {
-                Par::Seq
-            }
-        };
 
         // The fast path is for the all-valid F32 case; otherwise delegate back
         // to the standard module implementation.
@@ -1504,24 +1652,24 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         for i in 0..m {
             let row = &mut norm1[i * hidden..(i + 1) * hidden];
             let mean = row.iter().copied().sum::<f32>() / hidden as f32;
-            let var = row.iter().map(|v| {
-                let d = *v - mean;
-                d * d
-            }).sum::<f32>() / hidden as f32;
+            let var = row
+                .iter()
+                .map(|v| {
+                    let d = *v - mean;
+                    d * d
+                })
+                .sum::<f32>()
+                / hidden as f32;
             let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
             for j in 0..hidden {
-                row[j] = (row[j] - mean) * inv_std * norm1_gamma[j] + norm1_beta.as_ref().map(|b| b[j]).unwrap_or(0.0f32);
+                row[j] = (row[j] - mean) * inv_std * norm1_gamma[j]
+                    + norm1_beta.as_ref().map(|b| b[j]).unwrap_or(0.0f32);
             }
         }
 
         // ---- 2. QKV projection. ----
         let mut qkv = vec![0.0f32; m * qkv_out];
-        {
-            let a = MatRef::from_row_major_slice(&norm1, m, hidden);
-            let b = MatRef::from_row_major_slice(&qkv_w, hidden, qkv_out);
-            let mut c = MatMut::from_row_major_slice_mut(&mut qkv, m, qkv_out);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, par_policy(m, qkv_out, hidden));
-        }
+        best_row_major(m, qkv_out, hidden, &norm1, &qkv_w, &mut qkv);
         if let Some(ref b) = qkv_b {
             for i in 0..m {
                 let base = i * qkv_out;
@@ -1541,83 +1689,82 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         (0..batch * heads).into_par_iter().for_each(|flat| {
             let b_idx = flat / heads;
             let h = flat % heads;
-                let mut q_buf = vec![0.0f32; seq * head_dim];
-                let mut k_buf = vec![0.0f32; seq * head_dim];
-                let mut v_buf = vec![0.0f32; seq * head_dim];
+            let mut q_buf = vec![0.0f32; seq * head_dim];
+            let mut k_buf = vec![0.0f32; seq * head_dim];
+            let mut v_buf = vec![0.0f32; seq * head_dim];
 
-                for p in 0..seq {
-                    let row = b_idx * seq + p;
-                    let qkv_base = row * qkv_out;
-                    let q_off = qkv_base + h * head_dim;
-                    let k_off = qkv_base + hidden + h * head_dim;
-                    let v_off = qkv_base + 2 * hidden + h * head_dim;
-                    let buf_base = p * head_dim;
-                    q_buf[buf_base..buf_base + head_dim]
-                        .copy_from_slice(&qkv[q_off..q_off + head_dim]);
-                    k_buf[buf_base..buf_base + head_dim]
-                        .copy_from_slice(&qkv[k_off..k_off + head_dim]);
-                    v_buf[buf_base..buf_base + head_dim]
-                        .copy_from_slice(&qkv[v_off..v_off + head_dim]);
-                }
+            for p in 0..seq {
+                let row = b_idx * seq + p;
+                let qkv_base = row * qkv_out;
+                let q_off = qkv_base + h * head_dim;
+                let k_off = qkv_base + hidden + h * head_dim;
+                let v_off = qkv_base + 2 * hidden + h * head_dim;
+                let buf_base = p * head_dim;
+                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
+                k_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[k_off..k_off + head_dim]);
+                v_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[v_off..v_off + head_dim]);
+            }
 
-                let mut scores = vec![0.0f32; seq * seq];
-                {
-                    let a = MatRef::from_row_major_slice(&q_buf, seq, head_dim);
-                    let b = MatRef::from_column_major_slice(&k_buf, head_dim, seq);
-                    let mut c = MatMut::from_row_major_slice_mut(&mut scores, seq, seq);
-                    matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
-                }
+            let mut scores = vec![0.0f32; seq * seq];
+            gemm_a_bt_scaled(
+                seq,
+                seq,
+                head_dim,
+                &q_buf,
+                &k_buf,
+                &mut scores,
+                scale,
+                gemm::Parallelism::None,
+            );
 
-                // Softmax rows over seq_kv.
-                for i in 0..seq {
-                    let row_start = i * seq;
-                    let mut max = f32::NEG_INFINITY;
-                    for j in 0..seq {
-                        max = max.max(scores[row_start + j]);
-                    }
-                    let mut sum = 0.0f32;
-                    for j in 0..seq {
-                        let e = (scores[row_start + j] - max).exp();
-                        scores[row_start + j] = e;
-                        sum += e;
-                    }
-                    let inv_sum = 1.0f32 / sum;
-                    for j in 0..seq {
-                        scores[row_start + j] *= inv_sum;
-                    }
+            // Softmax rows over seq_kv.
+            for i in 0..seq {
+                let row_start = i * seq;
+                let mut max = f32::NEG_INFINITY;
+                for j in 0..seq {
+                    max = max.max(scores[row_start + j]);
                 }
+                let mut sum = 0.0f32;
+                for j in 0..seq {
+                    let e = (scores[row_start + j] - max).exp();
+                    scores[row_start + j] = e;
+                    sum += e;
+                }
+                let inv_sum = 1.0f32 / sum;
+                for j in 0..seq {
+                    scores[row_start + j] *= inv_sum;
+                }
+            }
 
-                let mut head_out = vec![0.0f32; seq * head_dim];
-                {
-                    let a = MatRef::from_row_major_slice(&scores, seq, seq);
-                    let b = MatRef::from_row_major_slice(&v_buf, seq, head_dim);
-                    let mut c = MatMut::from_row_major_slice_mut(&mut head_out, seq, head_dim);
-                    matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
-                }
+            let mut head_out = vec![0.0f32; seq * head_dim];
+            gemm_row_major(
+                seq,
+                head_dim,
+                seq,
+                &scores,
+                &v_buf,
+                &mut head_out,
+                gemm::Parallelism::None,
+            );
 
-                for p in 0..seq {
-                    let row = b_idx * seq + p;
-                    let out_base = row * hidden + h * head_dim;
-                    let buf_base = p * head_dim;
-                    unsafe {
-                        let attn_out_ptr = attn_out_addr as *mut f32;
-                        std::ptr::copy_nonoverlapping(
-                            head_out.as_ptr().add(buf_base),
-                            attn_out_ptr.add(out_base),
-                            head_dim,
-                        );
-                    }
+            for p in 0..seq {
+                let row = b_idx * seq + p;
+                let out_base = row * hidden + h * head_dim;
+                let buf_base = p * head_dim;
+                unsafe {
+                    let attn_out_ptr = attn_out_addr as *mut f32;
+                    std::ptr::copy_nonoverlapping(
+                        head_out.as_ptr().add(buf_base),
+                        attn_out_ptr.add(out_base),
+                        head_dim,
+                    );
                 }
+            }
         });
 
         // ---- 4. Output projection + first residual. ----
         let mut post_attn = vec![0.0f32; m * hidden];
-        {
-            let a = MatRef::from_row_major_slice(&attn_out, m, hidden);
-            let b = MatRef::from_row_major_slice(&proj_w, hidden, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut post_attn, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, par_policy(m, hidden, hidden));
-        }
+        best_row_major(m, hidden, hidden, &attn_out, &proj_w, &mut post_attn);
         if let Some(ref b) = proj_b {
             for i in 0..m {
                 let base = i * hidden;
@@ -1641,24 +1788,31 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         for i in 0..m {
             let row = &mut post_attn[i * hidden..(i + 1) * hidden];
             let mean = row.iter().copied().sum::<f32>() / hidden as f32;
-            let var = row.iter().map(|v| {
-                let d = *v - mean;
-                d * d
-            }).sum::<f32>() / hidden as f32;
+            let var = row
+                .iter()
+                .map(|v| {
+                    let d = *v - mean;
+                    d * d
+                })
+                .sum::<f32>()
+                / hidden as f32;
             let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
             for j in 0..hidden {
-                row[j] = (row[j] - mean) * inv_std * norm2_gamma[j] + norm2_beta.as_ref().map(|b| b[j]).unwrap_or(0.0f32);
+                row[j] = (row[j] - mean) * inv_std * norm2_gamma[j]
+                    + norm2_beta.as_ref().map(|b| b[j]).unwrap_or(0.0f32);
             }
         }
 
         // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual. ----
         let mut mlp_hidden_buf = vec![0.0f32; m * fc1_hidden];
-        {
-            let a = MatRef::from_row_major_slice(&post_attn, m, hidden);
-            let b = MatRef::from_row_major_slice(&fc1_w, hidden, fc1_hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut mlp_hidden_buf, m, fc1_hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, par_policy(m, fc1_hidden, hidden));
-        }
+        best_row_major(
+            m,
+            fc1_hidden,
+            hidden,
+            &post_attn,
+            &fc1_w,
+            &mut mlp_hidden_buf,
+        );
         if let Some(ref b) = fc1_b {
             for i in 0..m {
                 let base = i * fc1_hidden;
@@ -1672,12 +1826,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         }
 
         let mut output = vec![0.0f32; m * hidden];
-        {
-            let a = MatRef::from_row_major_slice(&mlp_hidden_buf, m, fc1_hidden);
-            let b = MatRef::from_row_major_slice(&fc2_w, fc1_hidden, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut output, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, par_policy(m, hidden, fc1_hidden));
-        }
+        best_row_major(m, hidden, fc1_hidden, &mlp_hidden_buf, &fc2_w, &mut output);
         if let Some(ref b) = fc2_b {
             for i in 0..m {
                 let base = i * hidden;
@@ -1799,7 +1948,11 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         assert_eq!(seq_kv, v_seq, "k and v seq lengths must match");
         assert_eq!(head_dim, v_head_dim, "k and v head dims must match");
         assert_eq!(batch, k_batch, "x and k batch sizes must match");
-        assert_eq!(hidden, heads * head_dim, "x hidden dim must match heads*head_dim");
+        assert_eq!(
+            hidden,
+            heads * head_dim,
+            "x hidden dim must match heads*head_dim"
+        );
         let m = batch * seq_q;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
@@ -1853,12 +2006,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         // ---- 1. Q projection. ----
         let t_q_proj0 = Instant::now();
         let mut q_buf = vec![0.0f32; m * hidden];
-        {
-            let a = MatRef::from_row_major_slice(x_slice, m, hidden);
-            let b = MatRef::from_row_major_slice(&q_proj_w, hidden, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut q_buf, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, hidden, hidden, x_slice, &q_proj_w, &mut q_buf);
         if let Some(ref b) = q_proj_b {
             q_buf.par_chunks_exact_mut(hidden).for_each(|row| {
                 for j in 0..hidden {
@@ -1916,23 +2064,22 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                 matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
             }
 
-            for i in 0..seq_q {
-                let row_start = i * seq_kv;
+            scores.par_chunks_exact_mut(seq_kv).for_each(|row| {
                 let mut max = f32::NEG_INFINITY;
-                for j in 0..seq_kv {
-                    max = max.max(scores[row_start + j]);
+                for &v in row.iter() {
+                    max = max.max(v);
                 }
                 let mut sum = 0.0f32;
-                for j in 0..seq_kv {
-                    let e = (scores[row_start + j] - max).exp();
-                    scores[row_start + j] = e;
+                for v in row.iter_mut() {
+                    let e = (*v - max).exp();
+                    *v = e;
                     sum += e;
                 }
                 let inv_sum = 1.0f32 / sum;
-                for j in 0..seq_kv {
-                    scores[row_start + j] *= inv_sum;
+                for v in row.iter_mut() {
+                    *v *= inv_sum;
                 }
-            }
+            });
 
             let mut head_out = vec![0.0f32; seq_q * head_dim];
             {
@@ -1961,12 +2108,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         // ---- 4. Output projection + first residual. ----
         let t_o_proj0 = Instant::now();
         let mut post_attn = vec![0.0f32; m * hidden];
-        {
-            let a = MatRef::from_row_major_slice(&attn_out, m, hidden);
-            let b = MatRef::from_row_major_slice(&o_proj_w, hidden, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut post_attn, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, hidden, hidden, &attn_out, &o_proj_w, &mut post_attn);
         if let Some(ref b) = o_proj_b {
             post_attn.par_chunks_exact_mut(hidden).for_each(|row| {
                 for j in 0..hidden {
@@ -2001,7 +2143,8 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                         let d = *v - mean;
                         d * d
                     })
-                    .sum::<f32>() / hidden as f32;
+                    .sum::<f32>()
+                    / hidden as f32;
                 let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
                 for j in 0..hidden {
                     row_n[j] = (row_x[j] - mean) * inv_std * ff_gamma[j]
@@ -2010,12 +2153,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             });
 
         let mut glu_proj = vec![0.0f32; m * glu_out2];
-        {
-            let a = MatRef::from_row_major_slice(&normed, m, hidden);
-            let b = MatRef::from_row_major_slice(&glu_w, hidden, glu_out2);
-            let mut c = MatMut::from_row_major_slice_mut(&mut glu_proj, m, glu_out2);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, glu_out2, hidden, &normed, &glu_w, &mut glu_proj);
 
         let mut glu_out_buf = vec![0.0f32; m * glu_out_dim];
         glu_proj
@@ -2028,12 +2166,14 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                 }
             });
 
-        {
-            let a = MatRef::from_row_major_slice(glu_out_buf.as_slice(), m, glu_out_dim);
-            let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut ff_out, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(
+            m,
+            hidden,
+            glu_out_dim,
+            glu_out_buf.as_slice(),
+            proj_out_w,
+            &mut ff_out,
+        );
         if let Some(ref b) = proj_out_b {
             ff_out.par_chunks_exact_mut(hidden).for_each(|row| {
                 for j in 0..hidden {
@@ -2138,8 +2278,6 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
         block: &super::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
         use rayon::prelude::*;
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
@@ -2175,9 +2313,10 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
             .as_slice::<f32>()
             .expect("NaFlexAttn norm1 gamma is contiguous F32");
         let norm1_beta_data = block.norm1.beta.as_ref().map(|b| b.val().to_data());
-        let norm1_beta = norm1_beta_data
-            .as_ref()
-            .map(|d| d.as_slice::<f32>().expect("NaFlexAttn norm1 beta is contiguous F32"));
+        let norm1_beta = norm1_beta_data.as_ref().map(|d| {
+            d.as_slice::<f32>()
+                .expect("NaFlexAttn norm1 beta is contiguous F32")
+        });
 
         let eps = 1e-5f32; // Burn LayerNorm default; field is private
 
@@ -2199,7 +2338,8 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
                         let d = *v - mean;
                         d * d
                     })
-                    .sum::<f32>() / hidden as f32;
+                    .sum::<f32>()
+                    / hidden as f32;
                 let inv_std = 1.0f32 / (var + eps).sqrt();
                 for j in 0..hidden {
                     row_n[j] = (row_x[j] - mean) * inv_std * norm1_gamma[j]
@@ -2209,12 +2349,7 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
 
         // QKV projection.
         let mut qkv = vec![0.0f32; m * qkv_out];
-        {
-            let a = MatRef::from_row_major_slice(norm1.as_slice(), m, hidden);
-            let b = MatRef::from_row_major_slice(qkv_w, hidden, qkv_out);
-            let mut c = MatMut::from_row_major_slice_mut(&mut qkv, m, qkv_out);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, qkv_out, hidden, norm1.as_slice(), qkv_w, &mut qkv);
         if let Some(ref b) = qkv_b {
             qkv.par_chunks_exact_mut(qkv_out).for_each(|row| {
                 for j in 0..qkv_out {
@@ -2243,21 +2378,22 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
                 let k_off = qkv_base + hidden + h * head_dim;
                 let v_off = qkv_base + 2 * hidden + h * head_dim;
                 let buf_base = p * head_dim;
-                q_buf[buf_base..buf_base + head_dim]
-                    .copy_from_slice(&qkv[q_off..q_off + head_dim]);
-                k_buf[buf_base..buf_base + head_dim]
-                    .copy_from_slice(&qkv[k_off..k_off + head_dim]);
-                v_buf[buf_base..buf_base + head_dim]
-                    .copy_from_slice(&qkv[v_off..v_off + head_dim]);
+                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
+                k_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[k_off..k_off + head_dim]);
+                v_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[v_off..v_off + head_dim]);
             }
 
             let mut scores = vec![0.0f32; seq * seq];
-            {
-                let a = MatRef::from_row_major_slice(q_buf.as_slice(), seq, head_dim);
-                let b = MatRef::from_column_major_slice(k_buf.as_slice(), head_dim, seq);
-                let mut c = MatMut::from_row_major_slice_mut(&mut scores, seq, seq);
-                matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
-            }
+            gemm_a_bt_scaled(
+                seq,
+                seq,
+                head_dim,
+                q_buf.as_slice(),
+                k_buf.as_slice(),
+                &mut scores,
+                scale,
+                gemm::Parallelism::None,
+            );
 
             for i in 0..seq {
                 let row_start = i * seq;
@@ -2278,12 +2414,15 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
             }
 
             let mut head_out = vec![0.0f32; seq * head_dim];
-            {
-                let a = MatRef::from_row_major_slice(scores.as_slice(), seq, seq);
-                let b = MatRef::from_row_major_slice(v_buf.as_slice(), seq, head_dim);
-                let mut c = MatMut::from_row_major_slice_mut(&mut head_out, seq, head_dim);
-                matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
-            }
+            gemm_row_major(
+                seq,
+                head_dim,
+                seq,
+                scores.as_slice(),
+                v_buf.as_slice(),
+                &mut head_out,
+                gemm::Parallelism::None,
+            );
 
             unsafe {
                 let attn_out_ptr = attn_out_addr as *mut f32;
@@ -2302,12 +2441,7 @@ impl FusedNaFlexAttnBackend for burn::backend::candle::Candle {
 
         // Output projection + residual.
         let mut output = vec![0.0f32; m * hidden];
-        {
-            let a = MatRef::from_row_major_slice(attn_out.as_slice(), m, hidden);
-            let b = MatRef::from_row_major_slice(proj_w, hidden, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut output, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
+        best_row_major(m, hidden, hidden, attn_out.as_slice(), proj_w, &mut output);
         if let Some(ref b) = proj_b {
             output.par_chunks_exact_mut(hidden).for_each(|row| {
                 for j in 0..hidden {
@@ -2343,7 +2477,9 @@ impl FusedNaFlexAttnBackend for burn::backend::flex::Flex {
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
         let out = block.attn.forward(
-            block.norm1.forward(Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x))),
+            block
+                .norm1
+                .forward(Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x))),
             mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
         );
         match out.into_primitive() {
@@ -2361,7 +2497,9 @@ impl FusedNaFlexAttnBackend for burn::backend::NdArray {
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
         let out = block.attn.forward(
-            block.norm1.forward(Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x))),
+            block
+                .norm1
+                .forward(Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x))),
             mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
         );
         match out.into_primitive() {

@@ -44,14 +44,14 @@ pub struct HydraModel<B: Backend> {
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedMlpBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend
-            + FusedNaFlexAttnBackend,
-    > HydraModel<B>
+    B: FusedGluBackend
+        + FusedMlpBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedNaFlexAttnBackend,
+> HydraModel<B>
 {
     pub fn load(config: &ModelConfig, device: B::Device) -> Result<Self> {
         let path = config.path.as_deref().context("hydra model missing path")?;
@@ -86,22 +86,27 @@ impl<
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedMlpBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend
-            + FusedNaFlexAttnBackend
-            + 'static,
-    > HydraModel<B>
+    B: FusedGluBackend
+        + FusedMlpBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedNaFlexAttnBackend
+        + 'static,
+> HydraModel<B>
 {
     /// Run the model and return raw logits (one score per label).
     pub fn infer_logits(&self, image_path: &Path) -> Result<Vec<f32>> {
         let t0 = Instant::now();
         let device = <B::Device as Default>::default();
-        let pre = preprocess(image_path, &self.pos_embed, self.max_seq_len, self.background)
-            .with_context(|| format!("failed to preprocess image: {}", image_path.display()))?;
+        let pre = preprocess(
+            image_path,
+            &self.pos_embed,
+            self.max_seq_len,
+            self.background,
+        )
+        .with_context(|| format!("failed to preprocess image: {}", image_path.display()))?;
         let t_pre = t0.elapsed();
 
         // Convert ndarray outputs to Burn tensors.
@@ -164,15 +169,15 @@ impl<
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedMlpBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend
-            + FusedNaFlexAttnBackend
-            + 'static,
-    > Model for HydraModel<B>
+    B: FusedGluBackend
+        + FusedMlpBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedNaFlexAttnBackend
+        + 'static,
+> Model for HydraModel<B>
 {
     fn infer(&self, image_path: &Path) -> Result<crate::models::ModelOutput> {
         let scores = self.infer_logits(image_path)?;
@@ -239,11 +244,16 @@ mod tests {
             name: "hydra-3.5".into(),
             kind: crate::config::ModelKind::Local,
             backend: Some("burn".into()),
-            path: Some("/home/asriel/Projects/RedRocket--Hydra/models/hydra-3.5.safetensors".into()),
+            path: Some(
+                "/home/asriel/Projects/RedRocket--Hydra/models/hydra-3.5.safetensors".into(),
+            ),
             base_url: None,
             model_id: None,
             api_key: None,
-            tags: Some(crate::config::ModelTagsOptions { threshold: 0.35, top_k: Some(20) }),
+            tags: Some(crate::config::ModelTagsOptions {
+                threshold: 0.35,
+                top_k: Some(20),
+            }),
             description: None,
             classification: None,
             remote: None,
@@ -253,68 +263,95 @@ mod tests {
 
         let model = HydraModel::<crate::models::burn::BurnBackendType>::load(&cfg, device)
             .expect("load model");
-        let img_path = Path::new("/home/asriel/Projects/akasha/test_imgs/dagnpats.png");
+        let img_paths = [
+            Path::new("/home/asriel/Projects/akasha/test_imgs/dagnpats.png"),
+            Path::new("/home/asriel/Projects/akasha/test_imgs/portrait.png"),
+            Path::new("/home/asriel/Projects/akasha/test_imgs/landscape.webp"),
+        ];
 
-        let logits = model.infer_logits(img_path).expect("infer");
-        assert!(!logits.is_empty(), "expected non-empty logits");
+        for img_path in &img_paths {
+            eprintln!("\n--- Testing {img_path:?} ---");
+            let logits = model.infer_logits(img_path).expect("infer");
+            assert!(!logits.is_empty(), "expected non-empty logits");
 
-        // Compare probabilities against a PyTorch reference. The reference file
-        // contains the *sigmoid* output from Hydra's default `load_model()` call
-        // (logit=False), so we apply sigmoid to our raw logits before comparing.
-        let ref_path = Path::new("/tmp/hydra_ref_logits.f32");
-        if ref_path.is_file() {
-            let ref_bytes = std::fs::read(ref_path).expect("read reference logits");
-            let ref_probs: Vec<f32> = ref_bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
+            // Compare probabilities against a PyTorch reference for the canonical image.
+            // The reference file contains the *sigmoid* output from Hydra's default
+            // `load_model()` call (logit=False), so we apply sigmoid to our raw logits
+            // before comparing.
+            if img_path
+                .file_name()
+                .map(|n| n == "dagnpats.png")
+                .unwrap_or(false)
+            {
+                let ref_path = Path::new("/tmp/hydra_ref_logits.f32");
+                if ref_path.is_file() {
+                    let ref_bytes = std::fs::read(ref_path).expect("read reference logits");
+                    let ref_probs: Vec<f32> = ref_bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
 
-            assert_eq!(
-                ref_probs.len(),
-                logits.len(),
-                "reference and Burn logits have different lengths"
-            );
+                    assert_eq!(
+                        ref_probs.len(),
+                        logits.len(),
+                        "reference and Burn logits have different lengths"
+                    );
 
-            let mut max_diff = 0.0f32;
-            let mut mean_diff = 0.0f32;
-            for (&r, &logit) in ref_probs.iter().zip(&logits) {
-                let prob = 1.0 / (1.0 + (-logit).exp());
-                let d = (r - prob).abs();
-                max_diff = max_diff.max(d);
-                mean_diff += d;
+                    let mut max_diff = 0.0f32;
+                    let mut mean_diff = 0.0f32;
+                    for (&r, &logit) in ref_probs.iter().zip(&logits) {
+                        let prob = 1.0 / (1.0 + (-logit).exp());
+                        let d = (r - prob).abs();
+                        max_diff = max_diff.max(d);
+                        mean_diff += d;
+                    }
+                    mean_diff /= logits.len() as f32;
+
+                    eprintln!(
+                        "Probs: {} values | max abs diff vs PyTorch BF16 ref: {:.6} | mean abs diff: {:.6}",
+                        logits.len(),
+                        max_diff,
+                        mean_diff
+                    );
+
+                    // Reference is BF16 sigmoid output; allow tolerance for F32 CPU spike.
+                    assert!(
+                        max_diff < 0.1,
+                        "max abs prob diff too large: {max_diff} (reference is BF16, spike is F32)"
+                    );
+                } else {
+                    eprintln!("Reference logits not found at {ref_path:?}; skipping comparison");
+                }
             }
-            mean_diff /= logits.len() as f32;
+
+            let output = model.infer(img_path).expect("infer tags");
+            let tags = match output {
+                crate::models::ModelOutput::Tags(tags) => {
+                    assert!(
+                        !tags.is_empty(),
+                        "expected at least one tag above threshold"
+                    );
+                    tags
+                }
+                other => panic!("expected ModelOutput::Tags, got {:?}", other),
+            };
 
             eprintln!(
-                "Probs: {} values | max abs diff vs PyTorch BF16 ref: {:.6} | mean abs diff: {:.6}",
-                logits.len(), max_diff, mean_diff
+                "Got {} tags, max score {}",
+                tags.len(),
+                tags.values().copied().fold(0.0f32, |a, b| a.max(b))
             );
-
-            // Reference is BF16 sigmoid output; allow tolerance for F32 CPU spike.
-            assert!(
-                max_diff < 0.1,
-                "max abs prob diff too large: {max_diff} (reference is BF16, spike is F32)"
-            );
-        } else {
-            eprintln!("Reference logits not found at {ref_path:?}; skipping comparison");
         }
-
-        let output = model.infer(img_path).expect("infer tags");
-        let tags = match output {
-            crate::models::ModelOutput::Tags(tags) => {
-                assert!(!tags.is_empty(), "expected at least one tag above threshold");
-                tags
-            }
-            other => panic!("expected ModelOutput::Tags, got {:?}", other),
-        };
-
-        eprintln!("Got {} tags, max score {}", tags.len(), tags.values().copied().fold(0.0f32, |a, b| a.max(b)));
     }
 }
 
 fn load_background(path: &Path) -> Result<[u8; 3]> {
-    let metadata = crate::models::burn::read_safetensors_metadata(path)
-        .with_context(|| format!("failed to read safetensors metadata from {}", path.display()))?;
+    let metadata = crate::models::burn::read_safetensors_metadata(path).with_context(|| {
+        format!(
+            "failed to read safetensors metadata from {}",
+            path.display()
+        )
+    })?;
 
     match metadata.get("classifier.background").map(String::as_str) {
         Some("white") => Ok([255, 255, 255]),
@@ -328,8 +365,12 @@ fn load_background(path: &Path) -> Result<[u8; 3]> {
 }
 
 fn load_labels(path: &Path) -> Result<Vec<String>> {
-    let metadata = crate::models::burn::read_safetensors_metadata(path)
-        .with_context(|| format!("failed to read safetensors metadata from {}", path.display()))?;
+    let metadata = crate::models::burn::read_safetensors_metadata(path).with_context(|| {
+        format!(
+            "failed to read safetensors metadata from {}",
+            path.display()
+        )
+    })?;
 
     let labels_str = metadata
         .get("classifier.labels")
@@ -380,6 +421,5 @@ fn load_pos_embed(path: &Path) -> Result<Array4<f32>> {
         other => anyhow::bail!("unsupported pos_embed dtype: {other:?}"),
     };
 
-    Array4::from_shape_vec((1, 16, 16, 1152), data)
-        .context("failed to build pos_embed array")
+    Array4::from_shape_vec((1, 16, 16, 1152), data).context("failed to build pos_embed array")
 }
