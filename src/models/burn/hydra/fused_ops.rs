@@ -1470,16 +1470,19 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
 
         let mut output = vec![0.0f32; batch * heads * seq_q * head_dim];
 
-        // Pre-allocate the scores buffer once for all heads; each head uses a
-        // slice sized for the maximum effective kv length in the batch.
+        // Tiled attention: keep per-tile scores cache-resident and avoid the
+        // full [seq_q, seq_kv] allocation for every head.
+        const QUERY_TILE: usize = 64;
         let max_n_valid = n_valids.iter().copied().max().unwrap_or(seq_kv);
-        let mut scores_all = vec![0.0f32; batch * heads * seq_q * max_n_valid];
+        let mut scores_tile_all = vec![0.0f32; batch * heads * QUERY_TILE * max_n_valid];
+        let mut head_out_tile_all = vec![0.0f32; batch * heads * QUERY_TILE * head_dim];
 
         output
             .par_chunks_exact_mut(q_stride_head)
-            .zip(scores_all.par_chunks_exact_mut(seq_q * max_n_valid))
+            .zip(scores_tile_all.par_chunks_exact_mut(QUERY_TILE * max_n_valid))
+            .zip(head_out_tile_all.par_chunks_exact_mut(QUERY_TILE * head_dim))
             .enumerate()
-            .for_each(|(flat, (out_head, scores))| {
+            .for_each(|(flat, ((out_head, scores_tile), head_out_tile))| {
                 let b = flat / heads;
                 let h = flat % heads;
                 let seq_kv_eff = n_valids[b];
@@ -1491,40 +1494,60 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
                 let k_slice = &k_slice_all[kv_offset..kv_offset + seq_kv_eff * head_dim];
                 let v_slice = &v_slice_all[kv_offset..kv_offset + seq_kv_eff * head_dim];
 
-                // scores = q @ k^T, scaled by 1/sqrt(head_dim).
-                // k_slice is row-major [seq_kv_eff, head_dim]; reinterpret as column-major
-                // [head_dim, seq_kv_eff] to avoid an explicit transpose.
-                {
-                    let a = MatRef::from_row_major_slice(q_slice, seq_q, head_dim);
-                    let b = MatRef::from_column_major_slice(k_slice, head_dim, seq_kv_eff);
-                    let mut c = MatMut::from_row_major_slice_mut(&mut scores[..seq_q * seq_kv_eff], seq_q, seq_kv_eff);
-                    matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
-                }
+                let n_tiles = (seq_q + QUERY_TILE - 1) / QUERY_TILE;
+                for t in 0..n_tiles {
+                    let tile_start = t * QUERY_TILE;
+                    let tile_q = (tile_start + QUERY_TILE).min(seq_q) - tile_start;
 
-                // Softmax over the last dimension (seq_kv_eff) for each row.
-                scores[..seq_q * seq_kv_eff].par_chunks_exact_mut(seq_kv_eff).for_each(|row| {
-                    let mut max = f32::NEG_INFINITY;
-                    for &v in row.iter() {
-                        max = max.max(v);
-                    }
-                    let mut sum = 0.0f32;
-                    for v in row.iter_mut() {
-                        let e = (*v - max).exp();
-                        *v = e;
-                        sum += e;
-                    }
-                    let inv_sum = 1.0f32 / sum;
-                    for v in row.iter_mut() {
-                        *v *= inv_sum;
-                    }
-                });
+                    let q_tile = &q_slice[tile_start * head_dim..(tile_start + tile_q) * head_dim];
+                    let scores = &mut scores_tile[..tile_q * seq_kv_eff];
+                    let head_out = &mut head_out_tile[..tile_q * head_dim];
 
-                // out_head = scores @ v.
-                {
-                    let a = MatRef::from_row_major_slice(&scores[..seq_q * seq_kv_eff], seq_q, seq_kv_eff);
-                    let b = MatRef::from_row_major_slice(v_slice, seq_kv_eff, head_dim);
-                    let mut c = MatMut::from_row_major_slice_mut(out_head, seq_q, head_dim);
-                    matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
+                    gemm_a_bt_scaled(
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        q_tile,
+                        k_slice,
+                        scores,
+                        scale,
+                        gemm::Parallelism::None,
+                    );
+
+                    for i in 0..tile_q {
+                        let row_start = i * seq_kv_eff;
+                        let mut max = f32::NEG_INFINITY;
+                        for j in 0..seq_kv_eff {
+                            max = max.max(scores[row_start + j]);
+                        }
+                        let mut sum = 0.0f32;
+                        for j in 0..seq_kv_eff {
+                            let e = (scores[row_start + j] - max).exp();
+                            scores[row_start + j] = e;
+                            sum += e;
+                        }
+                        let inv_sum = 1.0f32 / sum;
+                        for j in 0..seq_kv_eff {
+                            scores[row_start + j] *= inv_sum;
+                        }
+                    }
+
+                    gemm_row_major(
+                        tile_q,
+                        head_dim,
+                        seq_kv_eff,
+                        scores,
+                        v_slice,
+                        head_out,
+                        gemm::Parallelism::None,
+                    );
+
+                    for p in 0..tile_q {
+                        let out_base = (tile_start + p) * head_dim;
+                        let buf_base = p * head_dim;
+                        out_head[out_base..out_base + head_dim]
+                            .copy_from_slice(&head_out[buf_base..buf_base + head_dim]);
+                    }
                 }
             });
 
@@ -2078,24 +2101,28 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         let t_q_norm = t_q_norm0.elapsed();
 
         // ---- 3. Cross-attention, writing merged output [m, hidden]. ----
+        // Use a tiled attention kernel: process queries in small tiles so the
+        // per-tile scores matrix stays in cache and we never materialise the
+        // full [seq_q, seq_kv] attention scores for every head at once.
         let t_attn0 = Instant::now();
         let mut attn_out = vec![0.0f32; m * hidden];
         let attn_out_addr = attn_out.as_mut_ptr() as usize;
 
-        // Pre-allocate the per-head buffers once and reuse slices across heads.
-        // The scores buffer is sized for the maximum effective kv length so that
-        // every head can use the same allocation.
+        const QUERY_TILE: usize = 64;
         let max_n_valid = n_valids.iter().copied().max().unwrap_or(seq_kv);
+
+        // Pre-allocate per-head working buffers. Each head gets a contiguous
+        // q slice plus small reusable tile buffers for scores and output.
         let mut q_head_all = vec![0.0f32; batch * heads * seq_q * head_dim];
-        let mut scores_all = vec![0.0f32; batch * heads * seq_q * max_n_valid];
-        let mut head_out_all = vec![0.0f32; batch * heads * seq_q * head_dim];
+        let mut scores_tile_all = vec![0.0f32; batch * heads * QUERY_TILE * max_n_valid];
+        let mut head_out_tile_all = vec![0.0f32; batch * heads * QUERY_TILE * head_dim];
 
         q_head_all
             .par_chunks_exact_mut(seq_q * head_dim)
-            .zip(scores_all.par_chunks_exact_mut(seq_q * max_n_valid))
-            .zip(head_out_all.par_chunks_exact_mut(seq_q * head_dim))
+            .zip(scores_tile_all.par_chunks_exact_mut(QUERY_TILE * max_n_valid))
+            .zip(head_out_tile_all.par_chunks_exact_mut(QUERY_TILE * head_dim))
             .enumerate()
-            .for_each(|(flat, ((q_head, scores), head_out))| {
+            .for_each(|(flat, ((q_head, scores_tile), head_out_tile))| {
                 let b_idx = flat / heads;
                 let h = flat % heads;
                 let seq_kv_eff = n_valids[b_idx];
@@ -2114,48 +2141,67 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                 let k_head = &k_slice[kv_off..kv_off + seq_kv_eff * head_dim];
                 let v_head = &v_slice[kv_off..kv_off + seq_kv_eff * head_dim];
 
-                {
-                    let a = MatRef::from_row_major_slice(q_head, seq_q, head_dim);
-                    let b = MatRef::from_column_major_slice(k_head, head_dim, seq_kv_eff);
-                    let mut c = MatMut::from_row_major_slice_mut(&mut scores[..seq_q * seq_kv_eff], seq_q, seq_kv_eff);
-                    matmul(c.as_mut(), Accum::Replace, a, b, scale, Par::Seq);
-                }
+                // Process queries in tiles to keep working set cache-resident.
+                let n_tiles = (seq_q + QUERY_TILE - 1) / QUERY_TILE;
+                for t in 0..n_tiles {
+                    let tile_start = t * QUERY_TILE;
+                    let tile_q = (tile_start + QUERY_TILE).min(seq_q) - tile_start;
 
-                scores[..seq_q * seq_kv_eff].par_chunks_exact_mut(seq_kv_eff).for_each(|row| {
-                    let mut max = f32::NEG_INFINITY;
-                    for &v in row.iter() {
-                        max = max.max(v);
-                    }
-                    let mut sum = 0.0f32;
-                    for v in row.iter_mut() {
-                        let e = (*v - max).exp();
-                        *v = e;
-                        sum += e;
-                    }
-                    let inv_sum = 1.0f32 / sum;
-                    for v in row.iter_mut() {
-                        *v *= inv_sum;
-                    }
-                });
+                    let q_tile = &q_head[tile_start * head_dim..(tile_start + tile_q) * head_dim];
+                    let scores = &mut scores_tile[..tile_q * seq_kv_eff];
+                    let head_out = &mut head_out_tile[..tile_q * head_dim];
 
-                {
-                    let a = MatRef::from_row_major_slice(&scores[..seq_q * seq_kv_eff], seq_q, seq_kv_eff);
-                    let b = MatRef::from_row_major_slice(v_head, seq_kv_eff, head_dim);
-                    let mut c = MatMut::from_row_major_slice_mut(head_out, seq_q, head_dim);
-                    matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::Seq);
-                }
+                    gemm_a_bt_scaled(
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        q_tile,
+                        k_head,
+                        scores,
+                        scale,
+                        gemm::Parallelism::None,
+                    );
 
-                unsafe {
-                    let attn_out_ptr = attn_out_addr as *mut f32;
-                    for p in 0..seq_q {
-                        let row = b_idx * seq_q + p;
-                        let out_base = row * hidden + h * head_dim;
-                        let buf_base = p * head_dim;
-                        std::ptr::copy_nonoverlapping(
-                            head_out.as_ptr().add(buf_base),
-                            attn_out_ptr.add(out_base),
-                            head_dim,
-                        );
+                    for i in 0..tile_q {
+                        let row_start = i * seq_kv_eff;
+                        let mut max = f32::NEG_INFINITY;
+                        for j in 0..seq_kv_eff {
+                            max = max.max(scores[row_start + j]);
+                        }
+                        let mut sum = 0.0f32;
+                        for j in 0..seq_kv_eff {
+                            let e = (scores[row_start + j] - max).exp();
+                            scores[row_start + j] = e;
+                            sum += e;
+                        }
+                        let inv_sum = 1.0f32 / sum;
+                        for j in 0..seq_kv_eff {
+                            scores[row_start + j] *= inv_sum;
+                        }
+                    }
+
+                    gemm_row_major(
+                        tile_q,
+                        head_dim,
+                        seq_kv_eff,
+                        scores,
+                        v_head,
+                        head_out,
+                        gemm::Parallelism::None,
+                    );
+
+                    unsafe {
+                        let attn_out_ptr = attn_out_addr as *mut f32;
+                        for p in 0..tile_q {
+                            let row = b_idx * seq_q + tile_start + p;
+                            let out_base = row * hidden + h * head_dim;
+                            let buf_base = p * head_dim;
+                            std::ptr::copy_nonoverlapping(
+                                head_out.as_ptr().add(buf_base),
+                                attn_out_ptr.add(out_base),
+                                head_dim,
+                            );
+                        }
                     }
                 }
             });
