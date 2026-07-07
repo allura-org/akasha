@@ -8,7 +8,7 @@ use image::imageops::FilterType;
 use image::ImageDecoder;
 use ndarray::{Array2, Array3, Array4, Axis, s};
 
-use crate::models::jtp3::{apply_exif_orientation, apply_icc_profile};
+use crate::models::image_utils::{apply_exif_orientation, apply_icc_profile};
 
 const PATCH_SIZE: usize = 16;
 const POS_EMBED_H: usize = 16;

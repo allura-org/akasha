@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use crate::config::{ModelConfig, RemoteConfig};
 
 pub mod loader;
+#[cfg(any(feature = "onnx", feature = "burn"))]
+pub mod image_utils;
 #[cfg(feature = "candle")]
 pub mod preprocess;
 #[cfg(feature = "candle")]

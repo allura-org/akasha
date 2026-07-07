@@ -1,5 +1,6 @@
 //! Hydra-3.5 model implemented in Burn.
 
+pub mod fused_ops;
 pub mod image;
 pub mod modules;
 pub mod ops;
@@ -14,16 +15,17 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use ndarray::Array4;
 
-// NdArray backend does not implement BF16. Flex supports BF16 at runtime.
-// Candle CPU does not support BF16 matmul, so use F32 there.
-#[cfg(feature = "burn-flex")]
-const MODEL_DTYPE: DType = DType::BF16;
-#[cfg(not(feature = "burn-flex"))]
+// F32 is used for the CPU spike regardless of backend; BF16 is slow on the
+// Flex CPU path and the NdArray backend does not implement BF16 at all.
 const MODEL_DTYPE: DType = DType::F32;
 
 use crate::config::ModelConfig;
 use crate::models::Model;
 
+use self::fused_ops::{
+    FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
+    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexAttnBackend,
+};
 use self::image::preprocess;
 use self::modules::Hydra;
 use self::weights::load_hydra;
@@ -41,7 +43,16 @@ pub struct HydraModel<B: Backend> {
     _phantom: std::marker::PhantomData<B>,
 }
 
-impl<B: Backend> HydraModel<B> {
+impl<
+        B: FusedGluBackend
+            + FusedMlpBackend
+            + FusedAttentionBackend
+            + FastLinearBackend
+            + FastRmsNormBackend
+            + FusedHydraMidBlockBackend
+            + FusedNaFlexAttnBackend,
+    > HydraModel<B>
+{
     pub fn load(config: &ModelConfig, device: B::Device) -> Result<Self> {
         let path = config.path.as_deref().context("hydra model missing path")?;
         let file = resolve_model_file(path)?;
@@ -74,7 +85,17 @@ impl<B: Backend> HydraModel<B> {
     }
 }
 
-impl<B: Backend + 'static> HydraModel<B> {
+impl<
+        B: FusedGluBackend
+            + FusedMlpBackend
+            + FusedAttentionBackend
+            + FastLinearBackend
+            + FastRmsNormBackend
+            + FusedHydraMidBlockBackend
+            + FusedNaFlexAttnBackend
+            + 'static,
+    > HydraModel<B>
+{
     /// Run the model and return raw logits (one score per label).
     pub fn infer_logits(&self, image_path: &Path) -> Result<Vec<f32>> {
         let t0 = Instant::now();
@@ -83,8 +104,7 @@ impl<B: Backend + 'static> HydraModel<B> {
             .with_context(|| format!("failed to preprocess image: {}", image_path.display()))?;
         let t_pre = t0.elapsed();
 
-        // Convert ndarray outputs to Burn tensors. F32 is used for the CPU spike
-        // because the NdArray backend does not support BF16 yet.
+        // Convert ndarray outputs to Burn tensors.
         let t1 = Instant::now();
         let patches = Tensor::<B, 1>::from_data(
             pre.patches.into_raw_vec_and_offset().0.as_slice(),
@@ -98,21 +118,30 @@ impl<B: Backend + 'static> HydraModel<B> {
         )
         .reshape([1, self.max_seq_len, 1152]);
 
-        // Candle does not support bool_from_data, so build the mask as an Int
-        // tensor and compare to 1.
-        let valid_raw: Vec<i32> = pre
-            .valid
-            .into_raw_vec_and_offset()
-            .0
-            .into_iter()
-            .map(|b| if b { 1i32 } else { 0i32 })
-            .collect();
-        let valid = Tensor::<B, 1, Int>::from_data(valid_raw.as_slice(), &device)
-            .reshape([1, 1, self.max_seq_len])
-            .equal_elem(1);
+        // Skip building the bool mask when every patch is valid; this lets
+        // Burn's attention take a faster no-mask path.
+        let all_valid = pre.valid.iter().all(|&b| b);
+        let mask: Option<Tensor<B, 2, Bool>> = if all_valid {
+            None
+        } else {
+            // Candle does not support bool_from_data, so build the mask as an Int
+            // tensor and compare to 1.
+            let valid_raw: Vec<i32> = pre
+                .valid
+                .into_raw_vec_and_offset()
+                .0
+                .into_iter()
+                .map(|b| if b { 1i32 } else { 0i32 })
+                .collect();
+            Some(
+                Tensor::<B, 1, Int>::from_data(valid_raw.as_slice(), &device)
+                    .reshape([1, self.max_seq_len])
+                    .equal_elem(1),
+            )
+        };
         let t_tensors = t1.elapsed();
 
-        let logits = self.model.forward(patches, pos_embed, valid);
+        let logits = self.model.forward(patches, pos_embed, mask);
         let t_forward = t1.elapsed();
 
         // Convert to f32 for post-processing.
@@ -134,7 +163,17 @@ impl<B: Backend + 'static> HydraModel<B> {
     }
 }
 
-impl<B: Backend + 'static> Model for HydraModel<B> {
+impl<
+        B: FusedGluBackend
+            + FusedMlpBackend
+            + FusedAttentionBackend
+            + FastLinearBackend
+            + FastRmsNormBackend
+            + FusedHydraMidBlockBackend
+            + FusedNaFlexAttnBackend
+            + 'static,
+    > Model for HydraModel<B>
+{
     fn infer(&self, image_path: &Path) -> Result<crate::models::ModelOutput> {
         let scores = self.infer_logits(image_path)?;
 
@@ -194,6 +233,7 @@ mod tests {
     #[test]
     #[ignore = "manual: requires Hydra-3.5 safetensors"]
     fn hydra_burn_runs() {
+        let _ = tracing_subscriber::fmt::try_init();
         let device = <crate::models::burn::BurnDevice as Default>::default();
         let cfg = ModelConfig {
             name: "hydra-3.5".into(),
