@@ -947,6 +947,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "bon"
+version = "3.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234655ec178edd82b891e262ea7cf71f6584bcd09eff94db786be23f1821825c"
+dependencies = [
+ "bon-macros",
+ "rustversion",
+]
+
+[[package]]
+name = "bon-macros"
+version = "3.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89ec27229c38ed0eb3c0feee3d2c1d6a4379ae44f418a29a658890e062d8f365"
+dependencies = [
+ "darling 0.20.11",
+ "ident_case",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -999,6 +1024,7 @@ dependencies = [
  "burn-std",
  "burn-store",
  "burn-tch",
+ "burn-vision",
  "burn-wgpu",
 ]
 
@@ -1177,6 +1203,7 @@ version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0098bf6555c151517b4c98ca0e8ed1ab6a976e40f5f4e967c117b00eee21e192"
 dependencies = [
+ "aligned-vec",
  "burn-backend",
  "burn-ir",
  "burn-std",
@@ -1184,7 +1211,9 @@ dependencies = [
  "gemm 0.19.0",
  "half",
  "libm",
+ "macerator",
  "num-traits",
+ "rayon",
 ]
 
 [[package]]
@@ -1349,6 +1378,28 @@ dependencies = [
  "colored",
  "derive-new",
  "num-traits",
+ "serde",
+]
+
+[[package]]
+name = "burn-vision"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b5a3e9096977462cd22bf713087f9777e427f7693508871f86f5b1e8347a70"
+dependencies = [
+ "aligned-vec",
+ "bon",
+ "burn-flex",
+ "burn-ir",
+ "burn-tensor",
+ "bytemuck",
+ "derive-new",
+ "half",
+ "image",
+ "macerator",
+ "ndarray 0.17.2",
+ "num-traits",
+ "paste",
  "serde",
 ]
 

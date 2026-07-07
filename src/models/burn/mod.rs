@@ -3,13 +3,16 @@
 //! This is a generic backend that runs models implemented directly in Burn.
 //! The first supported model is Hydra-3.5 (RedRocket/Hydra), loaded from its
 //! original `.safetensors` checkpoint.
+//!
+//! By default the Burn NdArray backend is used (pure Rust, F32 only). Enable
+//! the `burn-flex` feature to use Burn's Flex backend, which supports BF16/F16
+//! at runtime and can be extended to CUDA/Metal later.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use burn::backend::{ndarray::NdArrayDevice, NdArray};
 
 use crate::config::{ModelConfig, ModelKind};
 
@@ -17,8 +20,22 @@ use super::{Backend, Model};
 
 pub mod hydra;
 
-/// Burn backend selected at compile time.
-type BurnBackendType = NdArray;
+#[cfg(feature = "burn-flex")]
+mod backend {
+    // Flex implements Backend only for its default type parameters, but it
+    // supports BF16/F16 at runtime via explicit DType.
+    pub type BurnBackendType = burn::backend::flex::Flex;
+    pub type BurnDevice = burn::backend::flex::FlexDevice;
+}
+
+#[cfg(not(feature = "burn-flex"))]
+mod backend {
+    pub type BurnBackendType = burn::backend::NdArray;
+    pub type BurnDevice = burn::backend::ndarray::NdArrayDevice;
+}
+
+pub(crate) type BurnBackendType = backend::BurnBackendType;
+pub(crate) type BurnDevice = backend::BurnDevice;
 
 pub struct BurnBackend;
 
@@ -50,7 +67,7 @@ impl Backend for BurnBackend {
     }
 
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
-        let device = NdArrayDevice::default();
+        let device = <BurnDevice as Default>::default();
         let model = hydra::HydraModel::<BurnBackendType>::load(config, device)
             .context("failed to load Hydra-3.5 Burn model")?;
         Ok(Arc::new(model))

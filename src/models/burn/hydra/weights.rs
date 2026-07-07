@@ -176,15 +176,18 @@ fn load_layer_norm<B: Backend>(
 ) -> LayerNorm<B> {
     let [d] = weight.dims();
     let mut ln = LayerNormConfig::new(d).init(device);
-    ln.gamma = Param::from_tensor(weight.clone());
-    ln.beta = Some(Param::from_tensor(bias.clone()));
+    ln.gamma = Param::from_tensor(weight.clone().cast(super::MODEL_DTYPE));
+    ln.beta = Some(Param::from_tensor(bias.clone().cast(super::MODEL_DTYPE)));
     ln
 }
 
 fn load_layer_norm_no_affine<B: Backend>(d: usize, device: &B::Device) -> LayerNorm<B> {
     // Burn's LayerNorm always has a gamma scale. To emulate PyTorch's
-    // elementwise_affine=False we leave gamma as ones and omit beta.
-    LayerNormConfig::new(d).with_bias(false).init(device)
+    // elementwise_affine=False we leave gamma as ones and omit beta, but we
+    // must still match the runtime dtype (BF16 under burn-flex).
+    let mut ln = LayerNormConfig::new(d).with_bias(false).init(device);
+    ln.gamma = Param::from_tensor(ln.gamma.val().cast(super::MODEL_DTYPE));
+    ln
 }
 
 /// Decode a safetensors view into a flat Vec<f32>.

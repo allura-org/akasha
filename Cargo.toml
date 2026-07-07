@@ -13,6 +13,7 @@ mistralrs = ["dep:mistralrs", "dep:openssl"]
 remote = ["dep:reqwest", "dep:base64"]
 onnx = ["dep:ort", "dep:ndarray", "dep:csv", "dep:safetensors", "dep:kamadak-exif", "dep:qcms", "dep:half"]
 burn = ["dep:burn", "dep:safetensors", "dep:kamadak-exif", "dep:qcms", "dep:half"]
+burn-flex = ["burn", "burn/flex"]
 cuda = ["candle", "candle-core/cuda", "mistralrs?/cuda"]
 
 [dependencies]

@@ -13,8 +13,11 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use ndarray::Array4;
 
-// NdArray backend does not implement BF16. Use F32 for the CPU spike; switch
-// to BF16 once a GPU backend (wgpu/cuda/candle) is wired up.
+// NdArray backend does not implement BF16. Use F32 for the NdArray backend;
+// switch to BF16 when the Flex backend is enabled.
+#[cfg(feature = "burn-flex")]
+const MODEL_DTYPE: DType = DType::BF16;
+#[cfg(not(feature = "burn-flex"))]
 const MODEL_DTYPE: DType = DType::F32;
 
 use crate::config::ModelConfig;
@@ -161,12 +164,11 @@ fn resolve_model_file(path: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
 
     #[test]
     #[ignore = "manual: requires Hydra-3.5 safetensors"]
     fn hydra_burn_runs() {
-        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let device = <crate::models::burn::BurnDevice as Default>::default();
         let cfg = ModelConfig {
             name: "hydra-3.5".into(),
             kind: crate::config::ModelKind::Local,
@@ -183,7 +185,8 @@ mod tests {
             jtp3: None,
         };
 
-        let model = HydraModel::<NdArray>::load(&cfg, device).expect("load model");
+        let model = HydraModel::<crate::models::burn::BurnBackendType>::load(&cfg, device)
+            .expect("load model");
         let img_path = Path::new("/home/asriel/Projects/akasha/test_imgs/dagnpats.png");
 
         let logits = model.infer_logits(img_path).expect("infer");
