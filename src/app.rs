@@ -75,6 +75,10 @@ pub struct AkashaApp {
     properties_rx: tokio::sync::mpsc::UnboundedReceiver<(i64, crate::db::media::PropertiesData)>,
 
     pub toasts: Vec<Toast>,
+
+    pub fps_accum_time: f32,
+    pub fps_accum_frames: u32,
+    pub fps_current: f32,
 }
 
 impl AkashaApp {
@@ -285,6 +289,9 @@ impl AkashaApp {
             properties_tx,
             properties_rx,
             toasts: Vec::new(),
+            fps_accum_time: 0.0,
+            fps_accum_frames: 0,
+            fps_current: 0.0,
         };
 
         for (message, level) in startup_toasts {
@@ -1093,6 +1100,15 @@ impl eframe::App for AkashaApp {
         }
         self.browser.process_thumbnail_queue(&self.thumbnailer);
 
+        let dt = ctx.input(|i| i.stable_dt);
+        self.fps_accum_time += dt;
+        self.fps_accum_frames += 1;
+        if self.fps_accum_time >= 0.5 {
+            self.fps_current = self.fps_accum_frames as f32 / self.fps_accum_time;
+            self.fps_accum_time = 0.0;
+            self.fps_accum_frames = 0;
+        }
+
         if self.browser.is_scanning && self.last_refresh.elapsed() > std::time::Duration::from_secs(2) {
             self.last_refresh = std::time::Instant::now();
             self.refresh_folders_async();
@@ -1264,6 +1280,9 @@ impl eframe::App for AkashaApp {
                         let _ = value;
                         settings_changed = true;
                     }
+                    crate::ui::settings::SettingsAction::ShowFpsCounterChanged(_value) => {
+                        settings_changed = true;
+                    }
                 }
             }
             if settings_changed {
@@ -1329,6 +1348,28 @@ impl eframe::App for AkashaApp {
                 });
                 self.push_toast("Clearing pending jobs…".to_string(), ToastLevel::Info);
             }
+        }
+
+        if self.config.ui.show_fps_counter {
+            let fps = self.fps_current;
+            let screen = ctx.screen_rect();
+            egui::Area::new(egui::Id::new("fps_counter"))
+                .order(egui::Order::Foreground)
+                .pivot(egui::Align2::RIGHT_BOTTOM)
+                .fixed_pos(screen.max - egui::vec2(8.0, 8.0))
+                .show(ctx, |ui| {
+                    let frame = egui::Frame::new()
+                        .fill(egui::Color32::from_black_alpha(180))
+                        .corner_radius(4.0)
+                        .inner_margin(6.0);
+                    frame.show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:.0} FPS", fps))
+                                .monospace()
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
+                });
         }
 
         self.show_toasts(ctx);

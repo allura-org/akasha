@@ -9,6 +9,7 @@ pub enum SettingsAction {
     ScrollSpeedChanged(f32),
     ViewerDefaultScaleModeChanged,
     AdvancedMediaPropertiesChanged(bool),
+    ShowFpsCounterChanged(bool),
 }
 
 pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> Vec<SettingsAction> {
@@ -27,6 +28,12 @@ pub fn show(ctx: &egui::Context, open: &mut bool, config: &mut Config) -> Vec<Se
             if ui.checkbox(&mut dark, "Dark theme").changed() {
                 config.ui.theme = if dark { "dark".to_string() } else { "light".to_string() };
                 actions.push(SettingsAction::ThemeChanged(dark));
+            }
+
+            let mut show_fps = config.ui.show_fps_counter;
+            if ui.checkbox(&mut show_fps, "Show FPS counter").changed() {
+                config.ui.show_fps_counter = show_fps;
+                actions.push(SettingsAction::ShowFpsCounterChanged(show_fps));
             }
 
             ui.add_space(16.0);

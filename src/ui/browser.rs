@@ -83,6 +83,16 @@ pub struct BrowserPanel {
     last_sorted_order: SortOrder,
     last_sorted_len: usize,
 
+    // Cached folder indices. Rebuilt lazily when `folders` changes; keeps the
+    // folder tree rendering O(visible nodes) instead of O(N^2) in folder count.
+    folder_by_id: HashMap<i64, db::folder::Folder>,
+    children_by_parent: HashMap<Option<i64>, Vec<i64>>,
+    root_ids: Vec<i64>,
+    folder_display_names: HashMap<i64, String>,
+    folder_name_lower: HashMap<i64, String>,
+    last_folders_ptr: usize,
+    last_folders_len: usize,
+
     rt: Arc<Runtime>,
     thumbnail_tx: std::sync::mpsc::Sender<(String, u64, Result<egui::ColorImage, String>)>,
 }
@@ -132,6 +142,13 @@ impl BrowserPanel {
             last_sorted_key: sort_key,
             last_sorted_order: sort_order,
             last_sorted_len: 0,
+            folder_by_id: HashMap::new(),
+            children_by_parent: HashMap::new(),
+            root_ids: Vec::new(),
+            folder_display_names: HashMap::new(),
+            folder_name_lower: HashMap::new(),
+            last_folders_ptr: 0,
+            last_folders_len: 0,
             rt,
             thumbnail_tx,
         }
@@ -154,6 +171,56 @@ impl BrowserPanel {
 
     pub fn invalidate_sort(&mut self) {
         self.last_sorted_len = 0;
+    }
+
+    fn ensure_folder_indices(&mut self) {
+        let ptr = self.folders.as_ptr() as usize;
+        if ptr == self.last_folders_ptr && self.folders.len() == self.last_folders_len {
+            return;
+        }
+        self.rebuild_folder_indices();
+    }
+
+    fn rebuild_folder_indices(&mut self) {
+        self.folder_by_id.clear();
+        self.folder_display_names.clear();
+        self.folder_name_lower.clear();
+        self.children_by_parent.clear();
+        self.root_ids.clear();
+
+        for folder in &self.folders {
+            let display = self.folder_name(folder).to_string();
+            let lower = display.to_lowercase();
+            self.folder_display_names.insert(folder.id, display);
+            self.folder_name_lower.insert(folder.id, lower);
+            self.folder_by_id.insert(folder.id, folder.clone());
+        }
+
+        for folder in &self.folders {
+            self.children_by_parent
+                .entry(folder.parent_id)
+                .or_default()
+                .push(folder.id);
+        }
+
+        for children in self.children_by_parent.values_mut() {
+            children.sort_by_cached_key(|id| {
+                self.folder_name_lower
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default()
+            });
+        }
+
+        self.root_ids = self
+            .children_by_parent
+            .get(&None)
+            .cloned()
+            .unwrap_or_default();
+        // root_ids are already sorted above.
+
+        self.last_folders_ptr = self.folders.as_ptr() as usize;
+        self.last_folders_len = self.folders.len();
     }
 
     fn ensure_sorted(&mut self) {
@@ -345,27 +412,44 @@ impl BrowserPanel {
                     ui.label("No folders configured.");
                     ui.label("Add folders in config.toml");
                 } else {
+                    self.ensure_folder_indices();
                     ui.text_edit_singleline(&mut self.folder_filter);
                     ui.separator();
 
                     let visible = self.visible_folder_ids();
+                    let visible_nodes = self.flatten_visible_folders(&visible);
+                    let row_height = ui.spacing().interact_size.y.max(20.0);
                     let mut clicked_id = None;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        let mut roots: Vec<i64> = self.folders
-                            .iter()
-                            .filter(|f| f.parent_id.is_none() && visible.contains(&f.id))
-                            .map(|f| f.id)
-                            .collect();
-                        roots.sort_by_key(|id| {
-                            self.folders
-                                .iter()
-                                .find(|f| f.id == *id)
-                                .map(|f| self.folder_name(f).to_lowercase())
-                        });
-                        for root_id in roots {
-                            self.render_folder_tree(ui, root_id, 0, &mut clicked_id, &visible);
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .hscroll(false)
+                        .show_rows(
+                            ui,
+                            row_height,
+                            visible_nodes.len(),
+                            |ui, row_range| {
+                            // Clamp label width to the tree panel so the scrollbar stays
+                            // anchored to the right edge instead of shifting with long names.
+                            let prev_wrap = ui.style().wrap_mode;
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+
+                            // Render a small overscan so fractional row-height mismatches
+                            // don't leave an empty gap at the bottom of the viewport.
+                            let start = row_range.start.saturating_sub(2);
+                            let end = (row_range.end + 3).min(visible_nodes.len());
+                            for &(folder_id, depth) in &visible_nodes[start..end] {
+                                self.render_folder_tree(
+                                    ui,
+                                    folder_id,
+                                    depth,
+                                    &mut clicked_id,
+                                    &visible,
+                                );
+                            }
+
+                            ui.style_mut().wrap_mode = prev_wrap;
+                        },
+                    );
                     if let Some(id) = clicked_id {
                         actions.selected_folder = Some(id);
                     }
@@ -522,36 +606,83 @@ impl BrowserPanel {
 
     fn visible_folder_ids(&self) -> HashSet<i64> {
         if self.folder_filter.is_empty() {
-            return self.folders.iter().map(|f| f.id).collect();
+            return self.folder_by_id.keys().copied().collect();
         }
 
         let filter = self.folder_filter.to_lowercase();
         let mut visible: HashSet<i64> = self
-            .folders
+            .folder_name_lower
             .iter()
-            .filter(|f| {
-                let name = self.folder_name(f).to_lowercase();
-                name.contains(&filter)
-            })
-            .map(|f| f.id)
+            .filter(|(_, lower)| lower.contains(&filter))
+            .map(|(&id, _)| id)
             .collect();
 
         // Propagate visibility up to ancestors.
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for folder in &self.folders {
-                if visible.contains(&folder.id) {
-                    if let Some(parent_id) = folder.parent_id {
-                        if visible.insert(parent_id) {
-                            changed = true;
-                        }
+        let mut stack: Vec<i64> = visible.iter().copied().collect();
+        while let Some(id) = stack.pop() {
+            if let Some(folder) = self.folder_by_id.get(&id) {
+                if let Some(parent_id) = folder.parent_id {
+                    if visible.insert(parent_id) {
+                        stack.push(parent_id);
                     }
                 }
             }
         }
 
         visible
+    }
+
+    fn flatten_visible_folders(&self, visible: &HashSet<i64>) -> Vec<(i64, usize)> {
+        let mut result = Vec::new();
+        let filtering = !self.folder_filter.is_empty();
+        for &root_id in &self.root_ids {
+            if visible.contains(&root_id) {
+                self.flatten_folder(root_id, 0, filtering, visible, &mut result);
+            }
+        }
+        result
+    }
+
+    fn flatten_folder(
+        &self,
+        folder_id: i64,
+        depth: usize,
+        filtering: bool,
+        visible: &HashSet<i64>,
+        out: &mut Vec<(i64, usize)>,
+    ) {
+        out.push((folder_id, depth));
+
+        if filtering {
+            if let Some(children) = self.children_by_parent.get(&Some(folder_id)) {
+                for &child_id in children {
+                    if visible.contains(&child_id) {
+                        self.flatten_folder(child_id, depth + 1, true, visible, out);
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(folder) = self.folder_by_id.get(&folder_id) {
+            let is_root = folder.parent_id.is_none();
+            let flatten = is_root
+                && self
+                    .imports
+                    .iter()
+                    .any(|i| i.path == folder.path && i.flatten);
+            if flatten || !self.expanded_folders.contains(&folder_id) {
+                return;
+            }
+        }
+
+        if let Some(children) = self.children_by_parent.get(&Some(folder_id)) {
+            for &child_id in children {
+                if visible.contains(&child_id) {
+                    self.flatten_folder(child_id, depth + 1, false, visible, out);
+                }
+            }
+        }
     }
 
     fn render_folder_tree(
@@ -562,10 +693,9 @@ impl BrowserPanel {
         clicked_id: &mut Option<i64>,
         visible: &HashSet<i64>,
     ) {
-        let Some(folder) = self.folders.iter().find(|f| f.id == folder_id) else { return };
+        let Some(folder) = self.folder_by_id.get(&folder_id).cloned() else { return };
         let selected = self.selected_folder_id == Some(folder.id);
         let is_root = folder.parent_id.is_none();
-        let name = self.folder_name(folder).to_string();
         let filtering = !self.folder_filter.is_empty();
 
         // flatten is a purely visual setting read from config, not stored in the DB.
@@ -575,20 +705,18 @@ impl BrowserPanel {
                 .iter()
                 .any(|i| i.path == folder.path && i.flatten);
 
-        // Pre-compute visible children so the mutable closure below doesn't borrow `folder`.
-        let mut children: Vec<i64> = self
-            .folders
-            .iter()
-            .filter(|f| f.parent_id == Some(folder.id) && visible.contains(&f.id))
-            .map(|f| f.id)
-            .collect();
-        children.sort_by_key(|id| {
-            self.folders
-                .iter()
-                .find(|f| f.id == *id)
-                .map(|f| self.folder_name(f).to_lowercase())
-        });
-        let has_visible_children = !children.is_empty() && !flatten;
+        let has_visible_children = !flatten
+            && self
+                .children_by_parent
+                .get(&Some(folder_id))
+                .map(|children| children.iter().any(|id| visible.contains(id)))
+                .unwrap_or(false);
+
+        let name = self
+            .folder_display_names
+            .get(&folder.id)
+            .cloned()
+            .unwrap_or_else(|| self.folder_name(&folder).to_string());
 
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 16.0);
@@ -630,13 +758,6 @@ impl BrowserPanel {
                 }
             });
         });
-
-        let expand = filtering || self.expanded_folders.contains(&folder_id);
-        if expand && !flatten {
-            for child_id in children {
-                self.render_folder_tree(ui, child_id, depth + 1, clicked_id, visible);
-            }
-        }
     }
 
     fn queue_visible_thumbnails(&mut self, viewport_height: f32, cols: usize, first_visible_row: usize, last_visible_row: usize) {

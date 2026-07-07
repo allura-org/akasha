@@ -105,6 +105,8 @@ pub struct UiConfig {
     pub sort_order: SortOrder,
     #[serde(default)]
     pub show_advanced_media_properties: bool,
+    #[serde(default)]
+    pub show_fps_counter: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +372,7 @@ impl Default for UiConfig {
             sort_key: SortKey::Filename,
             sort_order: SortOrder::Ascending,
             show_advanced_media_properties: false,
+            show_fps_counter: false,
         }
     }
 }
