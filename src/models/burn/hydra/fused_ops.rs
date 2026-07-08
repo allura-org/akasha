@@ -2884,7 +2884,26 @@ fn fused_hydra_pool_tail_to_buffer(
             });
 
             // Output projection into post_ff.
-            {
+            if m <= 1024 {
+                // For moderate batch sizes the strided faer path loses to a
+                // contiguous copy + gemm because the latter has a fast pure-Rust
+                // implementation for these shapes.
+                let mut glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
+                for i in 0..m {
+                    let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
+                    let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
+                    dst.copy_from_slice(src);
+                }
+                gemm_row_major(
+                    m,
+                    hidden,
+                    glu_out_dim,
+                    &glu_contig,
+                    proj_out_w,
+                    &mut post_ff,
+                    gemm::Parallelism::Rayon(0),
+                );
+            } else {
                 let a =
                     MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
                 let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
