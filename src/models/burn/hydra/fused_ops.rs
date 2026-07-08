@@ -2076,9 +2076,17 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         use std::time::Instant;
         let t_mid0 = Instant::now();
 
+        // Three main buffers reused for the entire block. q_buf holds the q
+        // projection / norm, then the attention output, then the FF norm, and
+        // finally the FF output projection. post_attn holds the o-projection
+        // result fused with the first residual and is reused as the source for
+        // the second residual. glu_proj holds the GLU projection and activation.
+        let mut q_buf = vec![0.0f32; m * hidden];
+        let mut post_attn = vec![0.0f32; m * hidden];
+        let mut glu_proj = vec![0.0f32; m * glu_out2];
+
         // ---- 1. Q projection. ----
         let t_q_proj0 = Instant::now();
-        let mut q_buf = vec![0.0f32; m * hidden];
         best_row_major(m, hidden, hidden, x_slice, &q_proj_w, &mut q_buf);
         if let Some(ref b) = q_proj_b {
             q_buf.par_chunks_exact_mut(hidden).for_each(|row| {
@@ -2105,13 +2113,12 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         });
         let t_q_norm = t_q_norm0.elapsed();
 
-        // ---- 3. Cross-attention, writing merged output [m, hidden]. ----
+        // ---- 3. Cross-attention, writing merged output back into q_buf. ----
         // Use a tiled attention kernel: process queries in small tiles so the
         // per-tile scores matrix stays in cache and we never materialise the
         // full [seq_q, seq_kv] attention scores for every head at once.
         let t_attn0 = Instant::now();
-        let mut attn_out = vec![0.0f32; m * hidden];
-        let attn_out_addr = attn_out.as_mut_ptr() as usize;
+        let q_buf_addr = q_buf.as_mut_ptr() as usize;
 
         const QUERY_TILE: usize = 64;
         let max_n_valid = n_valids.iter().copied().max().unwrap_or(seq_kv);
@@ -2196,14 +2203,14 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                     );
 
                     unsafe {
-                        let attn_out_ptr = attn_out_addr as *mut f32;
+                        let q_buf_ptr = q_buf_addr as *mut f32;
                         for p in 0..tile_q {
                             let row = b_idx * seq_q + tile_start + p;
                             let out_base = row * hidden + h * head_dim;
                             let buf_base = p * head_dim;
                             std::ptr::copy_nonoverlapping(
                                 head_out.as_ptr().add(buf_base),
-                                attn_out_ptr.add(out_base),
+                                q_buf_ptr.add(out_base),
                                 head_dim,
                             );
                         }
@@ -2212,36 +2219,38 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             });
         let t_attn = t_attn0.elapsed();
 
-        // ---- 4. Output projection + first residual. ----
+        // ---- 4. Output projection + first residual, fused into one pass. ----
+        // post_attn = q_buf @ W_o + b_o + x
         let t_o_proj0 = Instant::now();
-        let mut post_attn = vec![0.0f32; m * hidden];
-        best_row_major(m, hidden, hidden, &attn_out, &o_proj_w, &mut post_attn);
+        best_row_major(m, hidden, hidden, &q_buf, &o_proj_w, &mut post_attn);
         if let Some(ref b) = o_proj_b {
-            post_attn.par_chunks_exact_mut(hidden).for_each(|row| {
-                for j in 0..hidden {
-                    row[j] += b[j];
-                }
-            });
+            post_attn
+                .par_chunks_exact_mut(hidden)
+                .zip(x_slice.par_chunks_exact(hidden))
+                .for_each(|(post_row, x_row)| {
+                    for j in 0..hidden {
+                        post_row[j] = post_row[j] + b[j] + x_row[j];
+                    }
+                });
+        } else {
+            post_attn
+                .par_chunks_exact_mut(hidden)
+                .zip(x_slice.par_chunks_exact(hidden))
+                .for_each(|(post_row, x_row)| {
+                    for j in 0..hidden {
+                        post_row[j] += x_row[j];
+                    }
+                });
         }
-        post_attn
-            .par_chunks_exact_mut(hidden)
-            .zip(x_slice.par_chunks_exact(hidden))
-            .for_each(|(post_row, x_row)| {
-                for j in 0..hidden {
-                    post_row[j] += x_row[j];
-                }
-            });
         let t_o_proj = t_o_proj0.elapsed();
 
-        // ---- 5. FF: norm + GLU + projection, + second residual. ----
+        // ---- 5. FF: norm + GLU + projection + second residual. ----
         let t_ff0 = Instant::now();
-        let mut ff_out = vec![0.0f32; m * hidden];
 
-        // Norm in-place into a temporary buffer.
-        let mut normed = vec![0.0f32; m * hidden];
+        // Norm post_attn into q_buf (overwriting the attention output).
         post_attn
             .par_chunks_exact(hidden)
-            .zip(normed.par_chunks_exact_mut(hidden))
+            .zip(q_buf.par_chunks_exact_mut(hidden))
             .for_each(|(row_x, row_n)| {
                 let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
                 let var = row_x
@@ -2259,8 +2268,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                 }
             });
 
-        let mut glu_proj = vec![0.0f32; m * glu_out2];
-        best_row_major(m, glu_out2, hidden, &normed, &glu_w, &mut glu_proj);
+        best_row_major(m, glu_out2, hidden, &q_buf, &glu_w, &mut glu_proj);
 
         // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
         // The activated values remain packed as [activated_gate, up], which the
@@ -2272,8 +2280,9 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             }
         });
 
-        // Output projection from the activated half of glu_proj. Row stride is
-        // 2*glu_out_dim because the gate/up pairs are packed in each row.
+        // Output projection from the activated half of glu_proj back into q_buf,
+        // then fuse the bias and second residual in one pass.
+        // q_buf = glu_proj(strided) @ W_out + b_out + post_attn
         {
             let a = MatRef::from_row_major_slice_with_stride(
                 &glu_proj,
@@ -2282,24 +2291,28 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
                 glu_out2,
             );
             let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut ff_out, m, hidden);
+            let mut c = MatMut::from_row_major_slice_mut(&mut q_buf, m, hidden);
             matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
         }
         if let Some(ref b) = proj_out_b {
-            ff_out.par_chunks_exact_mut(hidden).for_each(|row| {
-                for j in 0..hidden {
-                    row[j] += b[j];
-                }
-            });
+            q_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(post_attn.par_chunks_exact(hidden))
+                .for_each(|(out_row, post_row)| {
+                    for j in 0..hidden {
+                        out_row[j] = out_row[j] + b[j] + post_row[j];
+                    }
+                });
+        } else {
+            q_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(post_attn.par_chunks_exact(hidden))
+                .for_each(|(out_row, post_row)| {
+                    for j in 0..hidden {
+                        out_row[j] += post_row[j];
+                    }
+                });
         }
-        ff_out
-            .par_chunks_exact_mut(hidden)
-            .zip(post_attn.par_chunks_exact(hidden))
-            .for_each(|(out_row, post_row)| {
-                for j in 0..hidden {
-                    out_row[j] += post_row[j];
-                }
-            });
         let t_ff = t_ff0.elapsed();
 
         let t_mid = t_mid0.elapsed();
@@ -2314,7 +2327,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         );
 
         let device = x_t.device();
-        match Tensor::<Self, 1>::from_data(ff_out.as_slice(), (&device, DType::F32))
+        match Tensor::<Self, 1>::from_data(q_buf.as_slice(), (&device, DType::F32))
             .reshape([batch, seq_q, hidden])
             .into_primitive()
         {
