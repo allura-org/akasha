@@ -4,6 +4,7 @@ pub mod fused_ops;
 pub mod image;
 pub mod modules;
 pub mod ops;
+pub mod simd_ops;
 pub mod weights;
 
 use std::collections::HashMap;

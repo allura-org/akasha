@@ -15,6 +15,8 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::{AttentionModuleOptions, BoolTensor, FloatTensor, ModuleOps};
 use burn::tensor::{DType, TensorPrimitive};
 
+use super::simd_ops;
+
 #[cfg(feature = "burn-flex")]
 use burn::backend::flex::FlexDevice;
 
@@ -1918,24 +1920,7 @@ fn fused_na_flex_attn_buffer(
 
                 for i in 0..tile_q {
                     let row_start = i * seq_kv_eff;
-                    let row_end = row_start + seq_kv_eff;
-                    let mut max = f32::NEG_INFINITY;
-                    for j in row_start..row_end {
-                        let v = scores[j];
-                        if v > max {
-                            max = v;
-                        }
-                    }
-                    let mut sum = 0.0f32;
-                    for j in row_start..row_end {
-                        let e = (scores[j] - max).exp();
-                        scores[j] = e;
-                        sum += e;
-                    }
-                    let inv_sum = 1.0f32 / sum;
-                    for j in row_start..row_end {
-                        scores[j] *= inv_sum;
-                    }
+                    simd_ops::softmax_in_place(&mut scores[row_start..row_start + seq_kv_eff]);
                 }
 
                 let head_out = &mut head_out_tile[..tile_q * head_dim];
@@ -2156,31 +2141,15 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         x.par_chunks_exact(hidden)
             .zip(norm1_buf.par_chunks_exact_mut(hidden))
             .for_each(|(row_x, row_n)| {
-                let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
-                let var = row_x
-                    .iter()
-                    .map(|v| {
-                        let d = *v - mean;
-                        d * d
-                    })
-                    .sum::<f32>()
-                    / hidden as f32;
-                let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
-                for j in 0..hidden {
-                    row_n[j] = (row_x[j] - mean) * inv_std * norm1_gamma[j]
-                        + norm1_beta.map(|b| b[j]).unwrap_or(0.0f32);
-                }
+                simd_ops::layer_norm_row(row_x, norm1_gamma, norm1_beta, 1e-5f32, row_n);
             });
 
         // ---- 2. QKV projection. ----
         let mut qkv = resize_buf(&mut workspace.d, m * qkv_out);
         best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
         if let Some(ref b) = qkv_b {
-            qkv.par_chunks_exact_mut(qkv_out).for_each(|row| {
-                for j in 0..qkv_out {
-                    row[j] += b[j];
-                }
-            });
+            qkv.par_chunks_exact_mut(qkv_out)
+                .for_each(|row| simd_ops::add_bias_in_place(row, b));
         }
 
         // ---- 3. Attention from packed QKV, writing merged output into workspace.b. ----
@@ -2216,18 +2185,14 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 .par_chunks_exact_mut(hidden)
                 .zip(x.par_chunks_exact(hidden))
                 .for_each(|(out_row, x_row)| {
-                    for j in 0..hidden {
-                        out_row[j] = out_row[j] + b[j] + x_row[j];
-                    }
+                    simd_ops::add_bias_and_residual_in_place(out_row, b, x_row);
                 });
         } else {
             norm1_buf
                 .par_chunks_exact_mut(hidden)
                 .zip(x.par_chunks_exact(hidden))
                 .for_each(|(out_row, x_row)| {
-                    for j in 0..hidden {
-                        out_row[j] += x_row[j];
-                    }
+                    simd_ops::add_in_place(out_row, x_row);
                 });
         }
 
@@ -2238,20 +2203,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             .par_chunks_exact(hidden)
             .zip(attn_buf.par_chunks_exact_mut(hidden))
             .for_each(|(row_x, row_n)| {
-                let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
-                let var = row_x
-                    .iter()
-                    .map(|v| {
-                        let d = *v - mean;
-                        d * d
-                    })
-                    .sum::<f32>()
-                    / hidden as f32;
-                let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
-                for j in 0..hidden {
-                    row_n[j] = (row_x[j] - mean) * inv_std * norm2_gamma[j]
-                        + norm2_beta.map(|b| b[j]).unwrap_or(0.0f32);
-                }
+                simd_ops::layer_norm_row(row_x, norm2_gamma, norm2_beta, 1e-5f32, row_n);
             });
 
         // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual into `out`. ----
@@ -2259,15 +2211,9 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         if let Some(ref b) = fc1_b {
             mlp_hidden_buf
                 .par_chunks_exact_mut(fc1_hidden)
-                .for_each(|row| {
-                    for j in 0..fc1_hidden {
-                        row[j] += b[j];
-                    }
-                });
+                .for_each(|row| simd_ops::add_bias_in_place(row, b));
         }
-        mlp_hidden_buf.par_iter_mut().for_each(|v| {
-            *v = gelu_approx_tanh_f32(*v);
-        });
+        simd_ops::gelu_approx_tanh_in_place(&mut mlp_hidden_buf);
 
         // Write the fc2 output into `out` and fuse the bias and the residual
         // from norm1_buf in one pass.
@@ -2276,17 +2222,13 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             out.par_chunks_exact_mut(hidden)
                 .zip(norm1_buf.par_chunks_exact(hidden))
                 .for_each(|(out_row, post_row)| {
-                    for j in 0..hidden {
-                        out_row[j] = out_row[j] + b[j] + post_row[j];
-                    }
+                    simd_ops::add_bias_and_residual_in_place(out_row, b, post_row);
                 });
         } else {
             out.par_chunks_exact_mut(hidden)
                 .zip(norm1_buf.par_chunks_exact(hidden))
                 .for_each(|(out_row, post_row)| {
-                    for j in 0..hidden {
-                        out_row[j] += post_row[j];
-                    }
+                    simd_ops::add_in_place(out_row, post_row);
                 });
         }
 

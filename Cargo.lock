@@ -178,6 +178,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "burn",
+ "bytemuck",
  "candle-core 0.11.0",
  "candle-nn 0.11.0",
  "candle-transformers",
@@ -219,6 +220,7 @@ dependencies = [
  "url",
  "walkdir",
  "webp",
+ "wide",
 ]
 
 [[package]]

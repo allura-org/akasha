@@ -12,7 +12,7 @@ candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:to
 mistralrs = ["dep:mistralrs", "dep:openssl"]
 remote = ["dep:reqwest", "dep:base64"]
 onnx = ["dep:ort", "dep:ndarray", "dep:csv", "dep:safetensors", "dep:kamadak-exif", "dep:qcms", "dep:half"]
-burn = ["dep:burn", "dep:faer", "dep:gemm", "dep:rayon", "dep:safetensors", "dep:ndarray", "dep:kamadak-exif", "dep:qcms", "dep:half"]
+burn = ["dep:burn", "dep:faer", "dep:gemm", "dep:rayon", "dep:safetensors", "dep:ndarray", "dep:kamadak-exif", "dep:qcms", "dep:half", "dep:wide", "dep:bytemuck"]
 burn-flex = ["burn", "burn/flex"]
 burn-candle = ["burn", "burn/candle"]
 burn-openblas = ["burn", "burn/openblas"]
@@ -110,6 +110,8 @@ burn = { version = "0.21", default-features = false, features = ["std", "ndarray
 faer = { version = "0.24.4", optional = true }
 gemm = { version = "0.18", optional = true }
 rayon = { version = "1", optional = true }
+wide = { version = "0.7", optional = true }
+bytemuck = { version = "1", optional = true }
 
 # mistral.rs local inference (optional)
 mistralrs = { version = "0.8.1", optional = true }
