@@ -1722,3 +1722,290 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {}
 
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedAttentionBackend for burn::backend::NdArray {}
+
+#[cfg(all(test, feature = "burn-candle"))]
+#[allow(deprecated)]
+mod tests {
+    use super::*;
+    use burn::backend::candle::Candle;
+    use burn::tensor::Tensor;
+
+    fn approx_eq(a: &[f32], b: &[f32], eps: f32) {
+        assert_eq!(a.len(), b.len(), "length mismatch");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < eps, "{x} vs {y} (eps {eps})");
+        }
+    }
+
+    fn device() -> burn::backend::candle::CandleDevice {
+        <burn::backend::candle::CandleDevice as Default>::default()
+    }
+
+    fn tensor3(shape: [usize; 3], values: &[f32]) -> Tensor<Candle, 3> {
+        Tensor::<Candle, 1>::from_data(values, (&device(), DType::F32)).reshape(shape)
+    }
+
+    fn tensor4(shape: [usize; 4], values: &[f32]) -> Tensor<Candle, 4> {
+        Tensor::<Candle, 1>::from_data(values, (&device(), DType::F32)).reshape(shape)
+    }
+
+    fn tensor2(shape: [usize; 2], values: &[f32]) -> Tensor<Candle, 2> {
+        Tensor::<Candle, 1>::from_data(values, (&device(), DType::F32)).reshape(shape)
+    }
+
+    fn tensor1(values: &[f32]) -> Tensor<Candle, 1> {
+        Tensor::<Candle, 1>::from_data(values, (&device(), DType::F32))
+    }
+
+    fn to_float<const D: usize>(t: Tensor<Candle, D>) -> FloatTensor<Candle> {
+        match t.into_primitive() {
+            TensorPrimitive::Float(x) => x,
+            _ => unreachable!("expected float tensor"),
+        }
+    }
+
+    fn from_float<const D: usize>(t: FloatTensor<Candle>) -> Tensor<Candle, D> {
+        Tensor::<Candle, D>::from_primitive(TensorPrimitive::Float(t))
+    }
+
+    #[test]
+    fn fast_linear_matches_fallback() {
+        let x = tensor3([2, 3, 4], &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2,
+            -0.1, -0.2, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8, -0.9, -1.0, -1.1, -1.2,
+        ]);
+        let weight = tensor2([4, 3], &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2,
+        ]);
+        let bias = Some(tensor1(&[0.1, 0.2, 0.3]));
+
+        let fused = <Candle as FastLinearBackend>::fast_linear(
+            to_float(x.clone()),
+            to_float(weight.clone()),
+            bias.clone().map(to_float),
+        );
+        let fused_t = from_float::<3>(fused);
+        let fallback = fast_linear_fallback_tensor(x, weight, bias);
+
+        approx_eq(
+            fused_t.to_data().as_slice::<f32>().unwrap(),
+            fallback.to_data().as_slice::<f32>().unwrap(),
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn fast_linear_no_bias_matches_fallback() {
+        let x = tensor3([1, 2, 4], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let weight = tensor2([4, 3], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]);
+
+        let fused = <Candle as FastLinearBackend>::fast_linear(
+            to_float(x.clone()),
+            to_float(weight.clone()),
+            None,
+        );
+        let fused_t = from_float::<3>(fused);
+        let fallback = fast_linear_fallback_tensor(x, weight, None);
+
+        approx_eq(
+            fused_t.to_data().as_slice::<f32>().unwrap(),
+            fallback.to_data().as_slice::<f32>().unwrap(),
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn fused_glu_matches_fallback() {
+        let x = tensor3([1, 2, 4], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let weight = tensor2([4, 6], &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6,
+            0.7, 0.8, 0.9, 1.0, 1.1, 1.2,
+            1.3, 1.4, 1.5, 1.6, 1.7, 1.8,
+            1.9, 2.0, 2.1, 2.2, 2.3, 2.4,
+        ]);
+
+        let fused = <Candle as FusedGluBackend>::fused_linear_glu(
+            to_float(x.clone()),
+            to_float(weight.clone()),
+        );
+        let fused_t = from_float::<3>(fused);
+        let fallback = fused_linear_glu_fallback_tensor(x, weight);
+
+        approx_eq(
+            fused_t.to_data().as_slice::<f32>().unwrap(),
+            fallback.to_data().as_slice::<f32>().unwrap(),
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn fused_linear_glu_proj_matches_fallback() {
+        let x = tensor3([1, 2, 4], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+        let glu_weight = tensor2([4, 6], &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6,
+            0.7, 0.8, 0.9, 1.0, 1.1, 1.2,
+            1.3, 1.4, 1.5, 1.6, 1.7, 1.8,
+            1.9, 2.0, 2.1, 2.2, 2.3, 2.4,
+        ]);
+        let proj_weight = tensor2([3, 2], &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        let proj_bias = Some(tensor1(&[0.1, 0.2]));
+
+        let fused = <Candle as FusedGluBackend>::fused_linear_glu_proj(
+            to_float(x.clone()),
+            to_float(glu_weight.clone()),
+            to_float(proj_weight.clone()),
+            proj_bias.clone().map(to_float),
+        );
+        let fused_t = from_float::<3>(fused);
+        let fallback = fused_linear_glu_proj_fallback_tensor(x, glu_weight, proj_weight, proj_bias);
+
+        approx_eq(
+            fused_t.to_data().as_slice::<f32>().unwrap(),
+            fallback.to_data().as_slice::<f32>().unwrap(),
+            1e-4,
+        );
+    }
+
+    #[test]
+    fn fast_rms_norm_matches_fallback() {
+        let x = tensor4([1, 2, 3, 4], &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+            0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+            1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4,
+        ]);
+
+        let fused = <Candle as FastRmsNormBackend>::fast_rms_norm(to_float(x.clone()), 1e-5);
+        let fused_t = from_float::<4>(fused);
+
+        // Manual fallback: x / sqrt(mean(x^2) + eps).
+        let mut fallback_data: Vec<f32> = x.to_data().as_slice::<f32>().unwrap().to_vec();
+        let len = 4;
+        for row in fallback_data.chunks_exact_mut(len) {
+            let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / len as f32;
+            let scale = 1.0 / (mean_sq + 1e-5).sqrt();
+            for v in row.iter_mut() {
+                *v *= scale;
+            }
+        }
+        let fallback = Tensor::<Candle, 1>::from_data(fallback_data.as_slice(), (&device(), DType::F32))
+            .reshape([1, 2, 3, 4]);
+
+        approx_eq(
+            fused_t.to_data().as_slice::<f32>().unwrap(),
+            fallback.to_data().as_slice::<f32>().unwrap(),
+            1e-4,
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "burn-flex")]
+    fn fused_attention_matches_burn_fallback() {
+        let q = tensor4([1, 2, 3, 4], &[
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8,
+            0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+            1.7, 1.8, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4,
+        ]);
+        let k = tensor4([1, 2, 3, 4], &[
+            0.2, 0.1, 0.4, 0.3, 0.6, 0.5, 0.8, 0.7,
+            1.0, 0.9, 1.2, 1.1, 1.4, 1.3, 1.6, 1.5,
+            1.8, 1.7, 2.0, 1.9, 2.2, 2.1, 2.4, 2.3,
+        ]);
+        let v = tensor4([1, 2, 3, 4], &[
+            0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4,
+            0.5, -0.5, 0.6, -0.6, 0.7, -0.7, 0.8, -0.8,
+            0.9, -0.9, 1.0, -1.0, 1.1, -1.1, 1.2, -1.2,
+        ]);
+
+        let fused = <Candle as FusedAttentionBackend>::fused_attention(
+            to_float(q.clone()),
+            to_float(k.clone()),
+            to_float(v.clone()),
+            None,
+        );
+        let fused_t = from_float::<4>(fused);
+        let fallback = attention(q, k, v, None, None, AttentionModuleOptions::default());
+
+        approx_eq(
+            fused_t.to_data().as_slice::<f32>().unwrap(),
+            fallback.to_data().as_slice::<f32>().unwrap(),
+            1e-3,
+        );
+    }
+
+    #[test]
+    fn best_row_major_matches_naive() {
+        let m = 4;
+        let n = 3;
+        let k = 5;
+        let a: Vec<f32> = (1..=m * k).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (1..=k * n).map(|i| i as f32 * 0.05).collect();
+        let mut c = vec![0.0f32; m * n];
+
+        best_row_major(m, n, k, &a, &b, &mut c);
+
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for l in 0..k {
+                    sum += a[i * k + l] * b[l * n + j];
+                }
+                expected[i * n + j] = sum;
+            }
+        }
+
+        approx_eq(&c, &expected, 1e-4);
+    }
+
+    #[test]
+    fn gemm_a_bt_scaled_matches_naive() {
+        let m = 3;
+        let n = 4;
+        let k = 5;
+        let scale = 0.5f32;
+        let a: Vec<f32> = (1..=m * k).map(|i| i as f32 * 0.1).collect();
+        // b_t is row-major [n, k], i.e. the transpose of the desired B.
+        let b_t: Vec<f32> = (1..=n * k).map(|i| i as f32 * 0.05).collect();
+        let mut c = vec![0.0f32; m * n];
+
+        gemm_a_bt_scaled(m, n, k, &a, &b_t, &mut c, scale, gemm::Parallelism::None);
+
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for l in 0..k {
+                    sum += a[i * k + l] * b_t[j * k + l];
+                }
+                expected[i * n + j] = scale * sum;
+            }
+        }
+
+        approx_eq(&c, &expected, 1e-4);
+    }
+
+    #[test]
+    fn gemm_row_major_matches_naive() {
+        let m = 3;
+        let n = 4;
+        let k = 5;
+        let a: Vec<f32> = (1..=m * k).map(|i| i as f32 * 0.1).collect();
+        let b: Vec<f32> = (1..=k * n).map(|i| i as f32 * 0.05).collect();
+        let mut c = vec![0.0f32; m * n];
+
+        gemm_row_major(m, n, k, &a, &b, &mut c, gemm::Parallelism::None);
+
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for l in 0..k {
+                    sum += a[i * k + l] * b[l * n + j];
+                }
+                expected[i * n + j] = sum;
+            }
+        }
+
+        approx_eq(&c, &expected, 1e-4);
+    }
+}
