@@ -5,8 +5,9 @@ use burn::tensor::{DType, TensorPrimitive};
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, fused_attention, gemm_a_bt_scaled, gemm_row_major, gemm_row_major_accum,
-    resize_buf, BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
+    best_row_major, fused_attention, fused_attention_online_softmax,
+    fused_attention_two_gemm_fallback, gemm_a_bt_scaled, gemm_row_major, gemm_row_major_accum,
+    resize_buf, use_online_softmax, BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
 };
 #[cfg(feature = "burn-candle")]
 use super::hydra_mid::fused_hydra_mid_block_to_buffer;
@@ -593,6 +594,7 @@ fn fused_hydra_pool_cross_attn_to_buffer(
     let head_out_tile_all = resize_buf(head_out_buf, batch * heads * QUERY_TILE * head_dim);
 
     let out_buf_addr = out_buf.as_mut_ptr() as usize;
+    let online = use_online_softmax();
 
     (0..batch * heads)
         .into_par_iter()
@@ -614,34 +616,41 @@ fn fused_hydra_pool_cross_attn_to_buffer(
                 let tile_q = (tile_start + QUERY_TILE).min(n_classes) - tile_start;
 
                 let q_tile = &q_head[tile_start * head_dim..(tile_start + tile_q) * head_dim];
-                let scores = &mut scores_tile[..tile_q * seq_kv_eff];
                 let head_out = &mut head_out_tile[..tile_q * head_dim];
 
-                gemm_a_bt_scaled(
-                    tile_q,
-                    seq_kv_eff,
-                    head_dim,
-                    q_tile,
-                    k_head,
-                    scores,
-                    scale,
-                    gemm::Parallelism::None,
-                );
-
-                for i in 0..tile_q {
-                    let row_start = i * seq_kv_eff;
-                    simd_ops::softmax_in_place(&mut scores[row_start..row_start + seq_kv_eff]);
+                if online {
+                    fused_attention_online_softmax(
+                        q_tile,
+                        k_head,
+                        v_head,
+                        head_out,
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        seq_kv_eff,
+                        scale,
+                    );
+                } else {
+                    let scores = &mut scores_tile[..tile_q * seq_kv_eff];
+                    fused_attention_two_gemm_fallback(
+                        q_tile,
+                        k_head,
+                        v_head,
+                        head_out,
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        seq_kv_eff,
+                        scale,
+                        scores,
+                    );
                 }
-
-                gemm_row_major(
-                    tile_q,
-                    head_dim,
-                    seq_kv_eff,
-                    scores,
-                    v_head,
-                    head_out,
-                    gemm::Parallelism::None,
-                );
 
                 unsafe {
                     let out_ptr = out_buf_addr as *mut f32;

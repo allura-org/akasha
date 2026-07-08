@@ -5,8 +5,9 @@ use burn::tensor::{DType, TensorPrimitive};
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, best_row_major_accum, gemm_a_bt_scaled, gemm_f32_ex, gemm_row_major,
-    resize_buf, BlockWorkspace, QUERY_TILE,
+    best_row_major, best_row_major_accum, fused_attention_online_softmax,
+    fused_attention_two_gemm_fallback, gemm_a_bt_scaled, gemm_f32_ex, gemm_row_major, resize_buf,
+    use_online_softmax, BlockWorkspace, QUERY_TILE,
 };
 
 pub trait FusedNaFlexBlockBackend: Backend {
@@ -116,8 +117,9 @@ fn fused_na_flex_attn_buffer(
     debug_assert_eq!(head_out_tile_all.len(), batch * heads * QUERY_TILE * head_dim);
 
     // The raw output pointer is passed as an integer so the parallel closure
-    // can capture it; each head writes to disjoint regions.
+    // can capture it; each head writes to disjoint positions.
     let attn_addr = attn_out.as_mut_ptr() as usize;
+    let online = use_online_softmax();
 
     scores_tile_all
         .par_chunks_exact_mut(QUERY_TILE * max_n_valid)
@@ -153,49 +155,39 @@ fn fused_na_flex_attn_buffer(
                 let k_slice = &qkv[k_base..k_base + kv_len];
                 let v_slice = &qkv[v_base..v_base + kv_len];
 
-                let scores = &mut scores_tile[..tile_q * seq_kv_eff];
-
-                unsafe {
-                    gemm_f32_ex(
-                        tile_q,
-                        seq_kv_eff,
-                        head_dim,
-                        q_tile,
-                        qkv_out as isize,
-                        1,
-                        k_slice,
-                        1,
-                        qkv_out as isize,
-                        scores,
-                        seq_kv_eff as isize,
-                        1,
-                        scale,
-                        gemm::Parallelism::None,
-                    );
-                }
-
-                for i in 0..tile_q {
-                    let row_start = i * seq_kv_eff;
-                    simd_ops::softmax_in_place(&mut scores[row_start..row_start + seq_kv_eff]);
-                }
-
                 let head_out = &mut head_out_tile[..tile_q * head_dim];
-                unsafe {
-                    gemm_f32_ex(
+
+                if online {
+                    fused_attention_online_softmax(
+                        q_tile,
+                        k_slice,
+                        v_slice,
+                        head_out,
                         tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        qkv_out,
+                        qkv_out,
                         head_dim,
                         seq_kv_eff,
-                        scores,
-                        seq_kv_eff as isize,
-                        1,
+                        scale,
+                    );
+                } else {
+                    let scores = &mut scores_tile[..tile_q * seq_kv_eff];
+                    fused_attention_two_gemm_fallback(
+                        q_tile,
+                        k_slice,
                         v_slice,
-                        qkv_out as isize,
-                        1,
                         head_out,
-                        head_dim as isize,
-                        1,
-                        1.0,
-                        gemm::Parallelism::None,
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        qkv_out,
+                        qkv_out,
+                        head_dim,
+                        seq_kv_eff,
+                        scale,
+                        scores,
                     );
                 }
 

@@ -53,10 +53,15 @@ use burn::backend::flex::FlexDevice;
 // elementwise kernels, and reusable backend traits) stay in this module; the
 // NaFlex block, HydraMidBlock, and HydraPool kernels live in submodules so each
 // file stays focused and easier to navigate.
+mod attention;
 mod hydra_mid;
 mod hydra_pool;
 mod na_flex;
 
+pub use attention::{
+    USE_ONLINE_SOFTMAX_ATTENTION, fused_attention_online_softmax, fused_attention_two_gemm_fallback,
+    use_online_softmax,
+};
 pub use hydra_mid::FusedHydraMidBlockBackend;
 pub use hydra_pool::{
     FusedHydraPoolBackend, FusedHydraPoolTailBackend, fused_hydra_pool,
@@ -182,7 +187,7 @@ unsafe fn gemm_f32(
 /// this order: `dst = ab_scale * (A @ B) + dst_scale * dst` (with `read_dst`
 /// always false here, so `dst_scale` is ignored).
 #[inline]
-unsafe fn gemm_f32_ex(
+pub(super) unsafe fn gemm_f32_ex(
     m: usize,
     n: usize,
     k: usize,
@@ -2007,5 +2012,204 @@ mod tests {
         }
 
         approx_eq(&c, &expected, 1e-4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Online-softmax attention correctness tests
+    // -----------------------------------------------------------------------
+
+    fn make_attention_values(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * 17 + 31) % 101) as f32 * 0.03 - 1.5)
+            .collect()
+    }
+
+    #[test]
+    fn online_softmax_attention_matches_two_gemm_multi_head_batch() {
+        let batch = 2;
+        let heads = 4;
+        let seq_q = 32;
+        let seq_kv = 48;
+        let head_dim = 16;
+
+        let q = make_attention_values(batch * heads * seq_q * head_dim);
+        let k = make_attention_values(batch * heads * seq_kv * head_dim);
+        let v = make_attention_values(batch * heads * seq_kv * head_dim);
+
+        let mut out_online = vec![0.0f32; batch * heads * seq_q * head_dim];
+        let mut out_fallback = vec![0.0f32; batch * heads * seq_q * head_dim];
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        for b in 0..batch {
+            for h in 0..heads {
+                let off = (b * heads + h) * seq_q * head_dim;
+                let q_head = &q[off..off + seq_q * head_dim];
+                let kv_off = (b * heads + h) * seq_kv * head_dim;
+                let k_head = &k[kv_off..kv_off + seq_kv * head_dim];
+                let v_head = &v[kv_off..kv_off + seq_kv * head_dim];
+
+                let out_online_head = &mut out_online[off..off + seq_q * head_dim];
+                let out_fallback_head = &mut out_fallback[off..off + seq_q * head_dim];
+                let mut scores = vec![0.0f32; seq_q * seq_kv];
+
+                fused_attention_online_softmax(
+                    q_head, k_head, v_head, out_online_head, seq_q, seq_kv, head_dim, head_dim,
+                    head_dim, head_dim, seq_kv, scale,
+                );
+                fused_attention_two_gemm_fallback(
+                    q_head, k_head, v_head, out_fallback_head, seq_q, seq_kv, head_dim, head_dim,
+                    head_dim, head_dim, seq_kv, scale, &mut scores,
+                );
+            }
+        }
+
+        approx_eq(&out_online, &out_fallback, 1e-4);
+    }
+
+    #[test]
+    fn online_softmax_attention_matches_two_gemm_naflex_shape() {
+        // NaFlex-like: batch=1, heads=16, head_dim=72, seq=128 (scaled down
+        // from 1024 to keep unit-test runtime reasonable).
+        let batch = 1;
+        let heads = 16;
+        let seq = 128;
+        let head_dim = 72;
+
+        let q = make_attention_values(batch * heads * seq * head_dim);
+        let k = make_attention_values(batch * heads * seq * head_dim);
+        let v = make_attention_values(batch * heads * seq * head_dim);
+
+        let mut out_online = vec![0.0f32; batch * heads * seq * head_dim];
+        let mut out_fallback = vec![0.0f32; batch * heads * seq * head_dim];
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        for b in 0..batch {
+            for h in 0..heads {
+                let off = (b * heads + h) * seq * head_dim;
+                let q_head = &q[off..off + seq * head_dim];
+                let kv_off = (b * heads + h) * seq * head_dim;
+                let k_head = &k[kv_off..kv_off + seq * head_dim];
+                let v_head = &v[kv_off..kv_off + seq * head_dim];
+
+                let out_online_head = &mut out_online[off..off + seq * head_dim];
+                let out_fallback_head = &mut out_fallback[off..off + seq * head_dim];
+                let mut scores = vec![0.0f32; seq * seq];
+
+                fused_attention_online_softmax(
+                    q_head, k_head, v_head, out_online_head, seq, seq, head_dim, head_dim,
+                    head_dim, head_dim, seq, scale,
+                );
+                fused_attention_two_gemm_fallback(
+                    q_head, k_head, v_head, out_fallback_head, seq, seq, head_dim, head_dim,
+                    head_dim, head_dim, seq, scale, &mut scores,
+                );
+            }
+        }
+
+        approx_eq(&out_online, &out_fallback, 1e-4);
+    }
+
+    #[test]
+    fn online_softmax_attention_matches_two_gemm_pool_shape() {
+        // HydraPool cross-attention-like: batch=1, heads=32, n_classes=256
+        // (scaled down from 8886), seq_kv=128 (scaled down from 1024),
+        // head_dim=64.
+        let batch = 1;
+        let heads = 32;
+        let n_classes = 256;
+        let seq_kv = 128;
+        let head_dim = 64;
+
+        let q = make_attention_values(heads * n_classes * head_dim);
+        let k = make_attention_values(batch * heads * seq_kv * head_dim);
+        let v = make_attention_values(batch * heads * seq_kv * head_dim);
+
+        let mut out_online = vec![0.0f32; batch * n_classes * heads * head_dim];
+        let mut out_fallback = vec![0.0f32; batch * n_classes * heads * head_dim];
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        for b in 0..batch {
+            for h in 0..heads {
+                let q_head = &q[h * n_classes * head_dim..(h + 1) * n_classes * head_dim];
+                let kv_off = (b * heads + h) * seq_kv * head_dim;
+                let k_head = &k[kv_off..kv_off + seq_kv * head_dim];
+                let v_head = &v[kv_off..kv_off + seq_kv * head_dim];
+
+                for t in 0..n_classes {
+                    let out_off = (b * n_classes + t) * heads * head_dim + h * head_dim;
+                    let mut scores = vec![0.0f32; seq_kv];
+
+                    let mut online_val = [0.0f32; 64];
+                    let mut fallback_val = [0.0f32; 64];
+
+                    fused_attention_online_softmax(
+                        &q_head[t * head_dim..(t + 1) * head_dim],
+                        k_head,
+                        v_head,
+                        &mut online_val,
+                        1,
+                        seq_kv,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        seq_kv,
+                        scale,
+                    );
+                    fused_attention_two_gemm_fallback(
+                        &q_head[t * head_dim..(t + 1) * head_dim],
+                        k_head,
+                        v_head,
+                        &mut fallback_val,
+                        1,
+                        seq_kv,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        head_dim,
+                        seq_kv,
+                        scale,
+                        &mut scores,
+                    );
+
+                    out_online[out_off..out_off + head_dim].copy_from_slice(&online_val);
+                    out_fallback[out_off..out_off + head_dim].copy_from_slice(&fallback_val);
+                }
+            }
+        }
+
+        approx_eq(&out_online, &out_fallback, 1e-4);
+    }
+
+    #[test]
+    fn online_softmax_attention_matches_two_gemm_prefix_valid() {
+        let seq_q = 64;
+        let seq_kv = 128;
+        let n_valid = 77;
+        let head_dim = 64;
+
+        let q = make_attention_values(seq_q * head_dim);
+        let k = make_attention_values(seq_kv * head_dim);
+        let v = make_attention_values(seq_kv * head_dim);
+
+        let mut out_online = vec![0.0f32; seq_q * head_dim];
+        let mut out_fallback = vec![0.0f32; seq_q * head_dim];
+        let mut scores = vec![0.0f32; seq_q * n_valid];
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        fused_attention_online_softmax(
+            &q, &k, &v, &mut out_online, seq_q, seq_kv, head_dim, head_dim, head_dim, head_dim,
+            n_valid, scale,
+        );
+        fused_attention_two_gemm_fallback(
+            &q, &k, &v, &mut out_fallback, seq_q, seq_kv, head_dim, head_dim, head_dim, head_dim,
+            n_valid, scale, &mut scores,
+        );
+
+        approx_eq(&out_online, &out_fallback, 1e-4);
     }
 }
