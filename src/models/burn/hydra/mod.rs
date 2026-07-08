@@ -1,10 +1,15 @@
 //! Hydra-3.5 model implemented in Burn.
+//!
+//! The model graph in `modules.rs` is backend-agnostic. The `fused_ops` module
+//! provides optional CPU fast paths behind backend traits; `HydraModel<B>`
+//! requires those traits so it can call the fast paths when available. A new
+//! backend (e.g. GPU) only needs to implement the same traits to opt into fast
+//! inference, otherwise the generic Burn tensor ops are used.
 
 pub mod fused_ops;
 pub mod image;
 pub mod modules;
 pub mod ops;
-pub mod simd_ops;
 pub mod weights;
 
 use std::collections::HashMap;

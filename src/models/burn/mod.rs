@@ -21,6 +21,7 @@ use crate::config::{ModelConfig, ModelKind};
 use super::{Backend, Model};
 
 pub mod hydra;
+pub mod kernels;
 
 #[cfg(feature = "burn-candle")]
 mod backend {

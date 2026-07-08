@@ -1,10 +1,14 @@
-//! SIMD-accelerated elementwise kernels for the Hydra-3.5 Burn backend.
+//! Portable SIMD elementwise kernels for Burn-backed models.
 //!
-//! These routines are intentionally simple: they operate on contiguous `f32`
-//! slices, use the `wide` crate for portable 8-lane vector math, and fall back
-//! to scalar loops for tails. The `wide::f32x8` type maps to AVX/AVX2 when the
-//! binary is compiled with those target features and to two SSE2 `f32x4`s
-//! otherwise, so the same code is portable across x86_64 builds.
+//! These routines operate on contiguous `f32` slices, use the `wide` crate for
+//! portable 8-lane vector math, and fall back to scalar loops for tails. The
+//! `wide::f32x8` type maps to AVX/AVX2 when the binary is compiled with those
+//! target features and to two SSE2 `f32x4`s otherwise, so the same code is
+//! portable across x86_64 builds.
+//!
+//! These kernels are intentionally model-agnostic: any transformer-style model
+//! running on a Burn CPU backend can use softmax, layer/RMS norm, GELU, GLU,
+//! and bias/residual helpers from here.
 
 use wide::f32x8;
 
@@ -380,7 +384,7 @@ pub fn add_bias_in_place(out: &mut [f32], bias: &[f32]) {
     }
 }
 
-/// `out = a + b + c` (fused residual + bias)
+/// `out = a + b` (fused two-input add)
 pub fn add2_in_place(out: &mut [f32], a: &[f32], b: &[f32]) {
     let n = out.len();
     debug_assert_eq!(a.len(), n);
@@ -412,5 +416,99 @@ pub fn add_bias_and_residual_in_place(out: &mut [f32], bias: &[f32], residual: &
     }
     for j in i..n {
         out[j] = out[j] + bias[j] + residual[j];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(a: &[f32], b: &[f32], eps: f32) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < eps, "{} vs {} (eps {})", x, y, eps);
+        }
+    }
+
+    #[test]
+    fn softmax_matches_scalar() {
+        let mut a = vec![0.1f32, 0.5, -0.2, 1.0, -1.0, 0.0];
+        let mut b = a.clone();
+        softmax_in_place(&mut a);
+        scalar_softmax(&mut b);
+        approx_eq(&a, &b, 1e-5);
+    }
+
+    #[test]
+    fn layer_norm_matches_scalar() {
+        let x = vec![0.1f32, 0.5, -0.2, 1.0, -1.0, 0.0, 0.3, -0.4];
+        let gamma = vec![1.0f32; 8];
+        let beta = vec![0.1f32; 8];
+        let mut out = vec![0.0f32; 8];
+        let mut out_scalar = vec![0.0f32; 8];
+        layer_norm_row(&x, &gamma, Some(&beta), 1e-5, &mut out);
+        scalar_layer_norm_row(&x, &gamma, Some(&beta), 1e-5, &mut out_scalar);
+        approx_eq(&out, &out_scalar, 1e-4);
+    }
+
+    #[test]
+    fn rms_norm_matches_scalar() {
+        let x = vec![0.1f32, 0.5, -0.2, 1.0, -1.0, 0.0, 0.3, -0.4];
+        let gamma = vec![1.0f32; 8];
+        let mut out = vec![0.0f32; 8];
+        let mut out_scalar = vec![0.0f32; 8];
+        rms_norm_row(&x, &gamma, 1e-5, &mut out);
+        scalar_rms_norm_row(&x, &gamma, 1e-5, &mut out_scalar);
+        approx_eq(&out, &out_scalar, 1e-4);
+    }
+
+    #[test]
+    fn gelu_matches_scalar() {
+        let mut a = vec![0.1f32, 0.5, -0.2, 1.0, -1.0, 0.0, 0.3, -0.4];
+        let mut b = a.clone();
+        gelu_approx_tanh_in_place(&mut a);
+        for v in b.iter_mut() {
+            *v = scalar_gelu_approx_tanh_f32(*v);
+        }
+        approx_eq(&a, &b, 1e-4);
+    }
+
+    #[test]
+    fn glu_softplus_matches_scalar() {
+        let gate = vec![0.1f32, 0.5, -0.2, 1.0, -1.0, 0.0, 0.3, -0.4];
+        let up = vec![0.2f32, -0.1, 0.4, 0.5, -0.3, 0.6, -0.5, 0.7];
+        let mut out = vec![0.0f32; 8];
+        glu_softplus_in_place(&gate, &up, &mut out);
+        let expected: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(g, u)| scalar_softplus_f32(*g) * u)
+            .collect();
+        approx_eq(&out, &expected, 1e-4);
+    }
+
+    #[test]
+    fn add2_in_place_is_correct() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let b = vec![0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let mut out = vec![0.0f32; 8];
+        add2_in_place(&mut out, &a, &b);
+        let expected: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+        approx_eq(&out, &expected, 1e-5);
+    }
+
+    #[test]
+    fn add_bias_and_residual_is_correct() {
+        let original = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let bias = vec![0.1f32; 8];
+        let residual = vec![0.5f32; 8];
+        let mut out = original.clone();
+        add_bias_and_residual_in_place(&mut out, &bias, &residual);
+        let expected: Vec<f32> = original
+            .iter()
+            .zip(bias.iter().zip(residual.iter()))
+            .map(|(o, (b, r))| o + b + r)
+            .collect();
+        approx_eq(&out, &expected, 1e-5);
     }
 }
