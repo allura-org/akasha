@@ -6,8 +6,8 @@ use crate::models::burn::kernels as simd_ops;
 
 use super::{
     best_row_major, fused_attention, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, gemm_row_major_accum, resize_buf, use_online_softmax,
-    BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
+    fused_attention_two_gemm_fallback, fused_glu_custom, gemm_row_major_accum, resize_buf,
+    use_online_softmax, BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
 };
 #[cfg(feature = "burn-candle")]
 use super::hydra_mid::fused_hydra_mid_block_to_buffer;
@@ -125,58 +125,76 @@ fn fused_hydra_pool_tail_to_buffer(
                     simd_ops::layer_norm_row(row_x, ff_gamma, ff_beta, eps, row_n);
                 });
 
-            // GLU projection.
-            best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
-
-            // In-place GLU activation.
-            glu_proj
-                .par_chunks_exact_mut(glu_out2)
-                .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
-
-            // Initialise post_ff with the residual (+ bias) and accumulate the
-            // output projection, avoiding a separate elementwise pass.
-            if let Some(ref b) = proj_out_b {
-                post_ff
-                    .par_chunks_exact_mut(hidden)
-                    .zip(x_slice.par_chunks_exact(hidden))
-                    .for_each(|(out_row, x_row)| {
-                        simd_ops::add2_in_place(out_row, b, x_row);
-                    });
-            } else {
-                post_ff
-                    .par_chunks_exact_mut(hidden)
-                    .zip(x_slice.par_chunks_exact(hidden))
-                    .for_each(|(out_row, x_row)| {
-                        out_row.copy_from_slice(x_row);
-                    });
-            }
-
-            // Output projection into post_ff.
-            if m <= 1024 {
-                // For moderate batch sizes the strided faer path loses to a
-                // contiguous copy + gemm because the latter has a fast pure-Rust
-                // implementation for these shapes.
-                let glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
-                for i in 0..m {
-                    let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
-                    let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
-                    dst.copy_from_slice(src);
-                }
-                gemm_row_major_accum(
+            // Try the custom fused GLU kernel first.
+            let used_custom_glu = if let Some(packed) = pool.ff.glu_w_packed.as_ref() {
+                fused_glu_custom(
+                    &normed,
+                    &mut post_ff,
                     m,
                     hidden,
                     glu_out_dim,
-                    &glu_contig,
-                    proj_out_w,
-                    &mut post_ff,
-                    gemm::Parallelism::Rayon(0),
-                );
+                    hidden,
+                    packed,
+                    Some(x_slice),
+                )
             } else {
-                let a =
-                    MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
-                let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-                let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
-                matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+                false
+            };
+
+            if !used_custom_glu {
+                // GLU projection.
+                best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
+
+                // In-place GLU activation.
+                glu_proj
+                    .par_chunks_exact_mut(glu_out2)
+                    .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
+
+                // Initialise post_ff with the residual (+ bias) and accumulate the
+                // output projection, avoiding a separate elementwise pass.
+                if let Some(ref b) = proj_out_b {
+                    post_ff
+                        .par_chunks_exact_mut(hidden)
+                        .zip(x_slice.par_chunks_exact(hidden))
+                        .for_each(|(out_row, x_row)| {
+                            simd_ops::add2_in_place(out_row, b, x_row);
+                        });
+                } else {
+                    post_ff
+                        .par_chunks_exact_mut(hidden)
+                        .zip(x_slice.par_chunks_exact(hidden))
+                        .for_each(|(out_row, x_row)| {
+                            out_row.copy_from_slice(x_row);
+                        });
+                }
+
+                // Output projection into post_ff.
+                if m <= 1024 {
+                    // For moderate batch sizes the strided faer path loses to a
+                    // contiguous copy + gemm because the latter has a fast pure-Rust
+                    // implementation for these shapes.
+                    let glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
+                    for i in 0..m {
+                        let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
+                        let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
+                        dst.copy_from_slice(src);
+                    }
+                    gemm_row_major_accum(
+                        m,
+                        hidden,
+                        glu_out_dim,
+                        &glu_contig,
+                        proj_out_w,
+                        &mut post_ff,
+                        gemm::Parallelism::Rayon(0),
+                    );
+                } else {
+                    let a =
+                        MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
+                    let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
+                    let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
+                    matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+                }
             }
         }
         std::mem::take(&mut workspace.a)

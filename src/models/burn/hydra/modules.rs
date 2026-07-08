@@ -320,6 +320,10 @@ pub struct NaFlexMlp<B: Backend> {
     pub fc2_w_cache: Vec<f32>,
     #[module(skip)]
     pub fc2_b_cache: Option<Vec<f32>>,
+
+    /// Pre-packed weights for the custom fused MLP/GLU kernel.
+    #[module(skip)]
+    pub fc1_w_packed: Option<crate::models::burn::hydra::fused_ops::PackedMlpWeights>,
 }
 
 impl<B: FusedMlpBackend + Backend> NaFlexMlp<B> {
@@ -494,6 +498,10 @@ pub struct HydraFeedForward<B: Backend> {
     pub proj_out_w_cache: Vec<f32>,
     #[module(skip)]
     pub proj_out_b_cache: Option<Vec<f32>>,
+
+    /// Pre-packed weights for the custom fused GLU kernel.
+    #[module(skip)]
+    pub glu_w_packed: Option<crate::models::burn::hydra::fused_ops::PackedGluWeights>,
 }
 
 impl<B: FusedGluBackend + FastLinearBackend> HydraFeedForward<B> {

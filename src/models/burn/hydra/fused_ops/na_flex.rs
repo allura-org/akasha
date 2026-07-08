@@ -6,8 +6,8 @@ use crate::models::burn::kernels as simd_ops;
 
 use super::{
     best_row_major, best_row_major_accum, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, gemm_a_bt_scaled, gemm_row_major, resize_buf,
-    use_online_softmax, BlockWorkspace, QUERY_TILE,
+    fused_attention_two_gemm_fallback, fused_mlp_custom, gemm_a_bt_scaled, gemm_row_major,
+    resize_buf, use_online_softmax, BlockWorkspace, QUERY_TILE,
 };
 
 pub trait FusedNaFlexBlockBackend: Backend {
@@ -460,35 +460,45 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             });
 
         // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual into `out`. ----
-        // Initialise the MLP hidden buffer with the fc1 bias and accumulate the
-        // fc1 projection, saving a separate bias-add pass.
-        if let Some(ref b) = fc1_b {
-            mlp_hidden_buf
-                .par_chunks_exact_mut(fc1_hidden)
-                .for_each(|row| row.copy_from_slice(b));
-            best_row_major_accum(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+        // Try the custom fused kernel first; if it is disabled or unavailable,
+        // fall back to the two-GEMM + SIMD activation path.
+        let used_custom_mlp = if let Some(packed) = block.mlp.fc1_w_packed.as_ref() {
+            fused_mlp_custom(&attn_buf, out, m, hidden, fc1_hidden, hidden, packed, Some(&norm1_buf))
         } else {
-            best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
-        }
-        simd_ops::gelu_approx_tanh_in_place(&mut mlp_hidden_buf);
+            false
+        };
 
-        // Write the fc2 output into `out` and fuse the bias and the residual
-        // from norm1_buf by initialising `out` with the residual (+ bias) and
-        // accumulating the fc2 projection.
-        if let Some(ref b) = fc2_b {
-            out.par_chunks_exact_mut(hidden)
-                .zip(norm1_buf.par_chunks_exact(hidden))
-                .for_each(|(out_row, post_row)| {
-                    simd_ops::add2_in_place(out_row, b, post_row);
-                });
-        } else {
-            out.par_chunks_exact_mut(hidden)
-                .zip(norm1_buf.par_chunks_exact(hidden))
-                .for_each(|(out_row, post_row)| {
-                    out_row.copy_from_slice(post_row);
-                });
+        if !used_custom_mlp {
+            // Initialise the MLP hidden buffer with the fc1 bias and accumulate the
+            // fc1 projection, saving a separate bias-add pass.
+            if let Some(ref b) = fc1_b {
+                mlp_hidden_buf
+                    .par_chunks_exact_mut(fc1_hidden)
+                    .for_each(|row| row.copy_from_slice(b));
+                best_row_major_accum(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+            } else {
+                best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+            }
+            simd_ops::gelu_approx_tanh_in_place(&mut mlp_hidden_buf);
+
+            // Write the fc2 output into `out` and fuse the bias and the residual
+            // from norm1_buf by initialising `out` with the residual (+ bias) and
+            // accumulating the fc2 projection.
+            if let Some(ref b) = fc2_b {
+                out.par_chunks_exact_mut(hidden)
+                    .zip(norm1_buf.par_chunks_exact(hidden))
+                    .for_each(|(out_row, post_row)| {
+                        simd_ops::add2_in_place(out_row, b, post_row);
+                    });
+            } else {
+                out.par_chunks_exact_mut(hidden)
+                    .zip(norm1_buf.par_chunks_exact(hidden))
+                    .for_each(|(out_row, post_row)| {
+                        out_row.copy_from_slice(post_row);
+                    });
+            }
+            best_row_major_accum(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, out);
         }
-        best_row_major_accum(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, out);
 
         tracing::debug!(
             "fused_na_flex_block_to_buffer total={:.3}s",

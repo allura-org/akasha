@@ -56,6 +56,7 @@ use burn::backend::flex::FlexDevice;
 mod attention;
 mod hydra_mid;
 mod hydra_pool;
+mod mlp_glu;
 mod na_flex;
 
 pub use attention::{
@@ -64,6 +65,10 @@ pub use attention::{
 pub use hydra_mid::FusedHydraMidBlockBackend;
 pub use hydra_pool::{
     FusedHydraPoolBackend, FusedHydraPoolTailBackend, fused_hydra_pool,
+};
+pub use mlp_glu::{
+    fused_glu_custom, fused_mlp_custom, pack_glu_w, pack_mlp_fc1_w, pack_mlp_fc2_w, pack_proj_w,
+    PackedGluWeights, PackedMlpWeights,
 };
 pub use na_flex::{FusedNaFlexAttnBackend, FusedNaFlexBlockBackend, fused_na_flex_block};
 

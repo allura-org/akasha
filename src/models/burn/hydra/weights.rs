@@ -13,6 +13,7 @@ use super::fused_ops::{
     FusedHydraMidBlockBackend, FusedHydraPoolBackend, FusedHydraPoolTailBackend, FusedMlpBackend,
     FusedNaFlexBlockBackend,
 };
+use super::fused_ops::{pack_glu_w, pack_mlp_fc1_w, pack_mlp_fc2_w, pack_proj_w};
 use super::modules::{
     Hydra, HydraEmbeds, HydraFeedForward, HydraMidBlock, HydraPool, HydraRmsNorm, LinearHead,
     NaFlexAttn, NaFlexBlock, NaFlexMlp,
@@ -113,6 +114,13 @@ pub fn load_hydra<
                     Some(&get_1d(&format!("blocks.{i}.mlp.fc2.bias"))?),
                     device,
                 );
+                let [k, fc1_hidden] = fc1.weight.val().dims();
+                let [fc1_hidden2, n] = fc2.weight.val().dims();
+                assert_eq!(fc1_hidden, fc1_hidden2);
+                let fc1_w_packed = pack_mlp_fc1_w(&fc1_w_cache, k, fc1_hidden);
+                let fc2_w_packed = pack_mlp_fc2_w(&fc2_w_cache, fc1_hidden, n);
+                let fc1_b_packed = fc1_b_cache.clone();
+                let fc2_b_packed = fc2_b_cache.clone();
                 NaFlexMlp {
                     fc1,
                     fc2,
@@ -120,6 +128,15 @@ pub fn load_hydra<
                     fc1_b_cache,
                     fc2_w_cache,
                     fc2_b_cache,
+                    fc1_w_packed: Some(crate::models::burn::hydra::fused_ops::PackedMlpWeights {
+                        fc1_w: fc1_w_packed,
+                        fc1_b: fc1_b_packed,
+                        fc2_w: fc2_w_packed,
+                        fc2_b: fc2_b_packed,
+                        k,
+                        hidden: fc1_hidden,
+                        n,
+                    }),
                 }
             },
         });
@@ -136,6 +153,16 @@ pub fn load_hydra<
     };
     let (pool_ff_proj_out, pool_ff_proj_out_w_cache, pool_ff_proj_out_b_cache) =
         load_linear_cached(&get("attn_pool.ff.proj_out.weight")?, None, device);
+    let pool_ff_hidden = pool_ff_glu_out2 / 2;
+    let pool_ff_n = pool_ff_proj_out_w_cache.len() / pool_ff_hidden;
+    let pool_ff_glu_packed = crate::models::burn::hydra::fused_ops::PackedGluWeights {
+        glu_w: pack_glu_w(&pool_ff_glu_w_cache, pool_ff_glu_in, pool_ff_glu_out2),
+        proj_w: pack_proj_w(&pool_ff_proj_out_w_cache, pool_ff_hidden, pool_ff_n),
+        proj_b: pool_ff_proj_out_b_cache.clone(),
+        k: pool_ff_glu_in,
+        hidden: pool_ff_hidden,
+        n: pool_ff_n,
+    };
 
     let (mid_q_proj, mid_q_proj_w_cache, mid_q_proj_b_cache) =
         load_linear_cached(&get("attn_pool.mid_blocks.0.q_proj.weight")?, None, device);
@@ -155,6 +182,16 @@ pub fn load_hydra<
         None,
         device,
     );
+    let mid_ff_hidden = mid_ff_glu_out2 / 2;
+    let mid_ff_n = mid_ff_proj_out_w_cache.len() / mid_ff_hidden;
+    let mid_ff_glu_packed = crate::models::burn::hydra::fused_ops::PackedGluWeights {
+        glu_w: pack_glu_w(&mid_ff_glu_w_cache, mid_ff_glu_in, mid_ff_glu_out2),
+        proj_w: pack_proj_w(&mid_ff_proj_out_w_cache, mid_ff_hidden, mid_ff_n),
+        proj_b: mid_ff_proj_out_b_cache.clone(),
+        k: mid_ff_glu_in,
+        hidden: mid_ff_hidden,
+        n: mid_ff_n,
+    };
 
     let (kv, kv_w_cache, kv_b_cache) =
         load_linear_cached(&get("attn_pool.kv.weight")?, None, device);
@@ -170,6 +207,7 @@ pub fn load_hydra<
             glu_w_cache: pool_ff_glu_w_cache,
             proj_out_w_cache: pool_ff_proj_out_w_cache,
             proj_out_b_cache: pool_ff_proj_out_b_cache,
+            glu_w_packed: Some(pool_ff_glu_packed),
         },
         mid_blocks: vec![HydraMidBlock {
             q_proj: mid_q_proj,
@@ -182,6 +220,7 @@ pub fn load_hydra<
                 glu_w_cache: mid_ff_glu_w_cache,
                 proj_out_w_cache: mid_ff_proj_out_w_cache,
                 proj_out_b_cache: mid_ff_proj_out_b_cache,
+                glu_w_packed: Some(mid_ff_glu_packed),
             },
             q_proj_w_cache: mid_q_proj_w_cache,
             q_proj_b_cache: mid_q_proj_b_cache,

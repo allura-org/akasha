@@ -6,8 +6,8 @@ use crate::models::burn::kernels as simd_ops;
 
 use super::{
     best_row_major, best_row_major_accum, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, gemm_row_major_accum, resize_buf, use_online_softmax,
-    BlockWorkspace,
+    fused_attention_two_gemm_fallback, fused_glu_custom, gemm_row_major_accum, resize_buf,
+    use_online_softmax, BlockWorkspace,
 };
 
 pub trait FusedHydraMidBlockBackend: Backend {
@@ -254,58 +254,82 @@ pub(crate) fn fused_hydra_mid_block_to_buffer(
             simd_ops::layer_norm_row(row_x, ff_gamma, ff_beta, 1e-5f32, row_n);
         });
 
-    best_row_major(m, glu_out2, hidden, &out_buf, glu_w, &mut glu_proj);
-
-    // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
-    // The activated values remain packed as [activated_gate, up], which the
-    // strided faer matmul below reads directly without a separate copy.
-    glu_proj
-        .par_chunks_exact_mut(glu_out2)
-        .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
-
-    // Output projection from the activated half of glu_proj back into out_buf.
-    // Initialise out_buf with the residual (+ bias) and accumulate the
-    // strided projection, avoiding a separate elementwise pass.
-    // out_buf = glu_proj(strided) @ W_out + b_out + post_attn
-    if let Some(ref b) = proj_out_b {
-        out_buf
-            .par_chunks_exact_mut(hidden)
-            .zip(post_attn.par_chunks_exact(hidden))
-            .for_each(|(out_row, post_row)| {
-                simd_ops::add2_in_place(out_row, b, post_row);
-            });
-    } else {
-        out_buf
-            .par_chunks_exact_mut(hidden)
-            .zip(post_attn.par_chunks_exact(hidden))
-            .for_each(|(out_row, post_row)| {
-                out_row.copy_from_slice(post_row);
-            });
-    }
-    if m <= 64 {
-        // For tiny batch sizes the strided faer path has high threading overhead.
-        // Copy the activated gate half to a contiguous buffer and use gemm with
-        // no parallelism.
-        let glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
-        for i in 0..m {
-            let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
-            let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
-            dst.copy_from_slice(src);
+    // Try the custom fused GLU kernel first.  The kernel copies each input
+    // row before overwriting the corresponding output row, so in-place
+    // input/output aliasing is sound.
+    let used_custom_glu = if let Some(packed) = block.ff.glu_w_packed.as_ref() {
+        let len = out_buf.len();
+        let ptr = out_buf.as_mut_ptr();
+        unsafe {
+            fused_glu_custom(
+                std::slice::from_raw_parts(ptr, len),
+                std::slice::from_raw_parts_mut(ptr, len),
+                m,
+                hidden,
+                glu_out_dim,
+                hidden,
+                packed,
+                Some(&post_attn),
+            )
         }
-        gemm_row_major_accum(
-            m,
-            hidden,
-            glu_out_dim,
-            &glu_contig,
-            proj_out_w,
-            out_buf,
-            gemm::Parallelism::None,
-        );
     } else {
-        let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
-        let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-        let mut c = MatMut::from_row_major_slice_mut(out_buf, m, hidden);
-        matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+        false
+    };
+
+    if !used_custom_glu {
+        best_row_major(m, glu_out2, hidden, &out_buf, glu_w, &mut glu_proj);
+
+        // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
+        // The activated values remain packed as [activated_gate, up], which the
+        // strided faer matmul below reads directly without a separate copy.
+        glu_proj
+            .par_chunks_exact_mut(glu_out2)
+            .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
+
+        // Output projection from the activated half of glu_proj back into out_buf.
+        // Initialise out_buf with the residual (+ bias) and accumulate the
+        // strided projection, avoiding a separate elementwise pass.
+        // out_buf = glu_proj(strided) @ W_out + b_out + post_attn
+        if let Some(ref b) = proj_out_b {
+            out_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(post_attn.par_chunks_exact(hidden))
+                .for_each(|(out_row, post_row)| {
+                    simd_ops::add2_in_place(out_row, b, post_row);
+                });
+        } else {
+            out_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(post_attn.par_chunks_exact(hidden))
+                .for_each(|(out_row, post_row)| {
+                    out_row.copy_from_slice(post_row);
+                });
+        }
+        if m <= 64 {
+            // For tiny batch sizes the strided faer path has high threading overhead.
+            // Copy the activated gate half to a contiguous buffer and use gemm with
+            // no parallelism.
+            let glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
+            for i in 0..m {
+                let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
+                let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
+                dst.copy_from_slice(src);
+            }
+            gemm_row_major_accum(
+                m,
+                hidden,
+                glu_out_dim,
+                &glu_contig,
+                proj_out_w,
+                out_buf,
+                gemm::Parallelism::None,
+            );
+        } else {
+            let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
+            let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
+            let mut c = MatMut::from_row_major_slice_mut(out_buf, m, hidden);
+            matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+        }
     }
     let t_ff = t_ff0.elapsed();
 
