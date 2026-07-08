@@ -8,9 +8,10 @@ use burn::prelude::*;
 use burn::tensor::TensorPrimitive;
 
 use super::fused_ops::{
-    fused_attention, fused_linear_glu_proj, fused_mlp, fused_norm_linear_glu_proj,
-    fused_norm_mlp, FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
-    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexAttnBackend, FusedNaFlexBlockBackend,
+    FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
+    FusedHydraMidBlockBackend, FusedHydraPoolTailBackend, FusedMlpBackend, FusedNaFlexAttnBackend,
+    FusedNaFlexBlockBackend, fused_attention, fused_hydra_pool_tail, fused_linear_glu_proj,
+    fused_mlp, fused_norm_linear_glu_proj, fused_norm_mlp,
 };
 use super::ops::{merge_heads, rms_norm, split_qkv, vecdot};
 
@@ -29,11 +30,16 @@ fn fast_linear<B: FastLinearBackend>(x: Tensor<B, 3>, linear: &Linear<B>) -> Ten
         TensorPrimitive::Float(t) => t,
         _ => unreachable!("fast_linear weight is a float tensor"),
     };
-    let b_prim = linear.bias.as_ref().map(|b| match b.val().into_primitive() {
-        TensorPrimitive::Float(t) => t,
-        _ => unreachable!("fast_linear bias is a float tensor"),
-    });
-    Tensor::from_primitive(TensorPrimitive::Float(B::fast_linear(x_prim, w_prim, b_prim)))
+    let b_prim = linear
+        .bias
+        .as_ref()
+        .map(|b| match b.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fast_linear bias is a float tensor"),
+        });
+    Tensor::from_primitive(TensorPrimitive::Float(B::fast_linear(
+        x_prim, w_prim, b_prim,
+    )))
 }
 
 /// Full Hydra-3.5 model.
@@ -47,14 +53,15 @@ pub struct Hydra<B: Backend> {
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedMlpBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend
-            + FusedNaFlexBlockBackend,
-    > Hydra<B>
+    B: FusedGluBackend
+        + FusedMlpBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedHydraPoolTailBackend
+        + FusedNaFlexBlockBackend,
+> Hydra<B>
 {
     pub fn forward(
         &self,
@@ -161,11 +168,7 @@ pub struct NaFlexBlock<B: Backend> {
 }
 
 impl<B: FusedNaFlexBlockBackend> NaFlexBlock<B> {
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
         self.forward_fused(x, mask)
     }
 }
@@ -191,11 +194,7 @@ impl<B: FusedNaFlexAttnBackend> NaFlexBlock<B> {
 impl<B: FusedNaFlexBlockBackend> NaFlexBlock<B> {
     /// Backend-fused block path. Falls back to the high-level module forward
     /// for unsupported backends (via the trait default for those backends).
-    pub fn forward_fused(
-        &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+    pub fn forward_fused(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
         let prim = match x.into_primitive() {
             TensorPrimitive::Float(t) => t,
             _ => unreachable!("NaFlexBlock input is a float tensor"),
@@ -227,11 +226,7 @@ pub struct NaFlexAttn<B: Backend> {
 }
 
 impl<B: FastLinearBackend + FusedAttentionBackend> NaFlexAttn<B> {
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
         let t0 = Instant::now();
         let qkv = fast_linear(x, &self.qkv);
         let t_qkv = t0.elapsed();
@@ -284,10 +279,7 @@ impl<B: FusedMlpBackend + Backend> NaFlexMlp<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let t0 = Instant::now();
         let out = fused_mlp(x, self);
-        tracing::debug!(
-            "NaFlexMlp fused_mlp={:.3}s",
-            t0.elapsed().as_secs_f64()
-        );
+        tracing::debug!("NaFlexMlp fused_mlp={:.3}s", t0.elapsed().as_secs_f64());
         out
     }
 
@@ -317,18 +309,15 @@ pub struct HydraPool<B: Backend> {
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend,
-    > HydraPool<B>
+    B: FusedGluBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedHydraPoolTailBackend,
+> HydraPool<B>
 {
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        mask: Option<Tensor<B, 4, Bool>>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
         let t0 = Instant::now();
         let batch = x.dims()[0];
         let (k, v) = self.forward_kv(x);
@@ -353,23 +342,16 @@ impl<
         let t_merge = t3.elapsed();
 
         let t4 = Instant::now();
-        out = out.clone() + self.ff.forward(out);
-        let t_ff = t4.elapsed();
-
-        let t5 = Instant::now();
-        for block in &self.mid_blocks {
-            out = block.forward_fused(out, &k, &v, mask.clone());
-        }
-        let t_mid = t5.elapsed();
+        out = fused_hydra_pool_tail(out, self, k, v, mask);
+        let t_tail = t4.elapsed();
 
         tracing::debug!(
-            "HydraPool kv={:.3}s q={:.3}s attn={:.3}s merge={:.3}s ff={:.3}s mid_blocks={:.3}s",
+            "HydraPool kv={:.3}s q={:.3}s attn={:.3}s merge={:.3}s tail={:.3}s",
             t_kv.as_secs_f64(),
             t_q.as_secs_f64(),
             t_attn.as_secs_f64(),
             t_merge.as_secs_f64(),
-            t_ff.as_secs_f64(),
-            t_mid.as_secs_f64()
+            t_tail.as_secs_f64()
         );
 
         out
@@ -410,7 +392,9 @@ pub struct HydraMidBlock<B: Backend> {
     pub o_proj_b_cache: Option<Vec<f32>>,
 }
 
-impl<B: FusedGluBackend + FusedAttentionBackend + FastLinearBackend + FastRmsNormBackend> HydraMidBlock<B> {
+impl<B: FusedGluBackend + FusedAttentionBackend + FastLinearBackend + FastRmsNormBackend>
+    HydraMidBlock<B>
+{
     pub fn forward(
         &self,
         x: Tensor<B, 3>,

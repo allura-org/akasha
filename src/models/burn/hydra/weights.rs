@@ -10,7 +10,7 @@ use burn::prelude::*;
 use super::MODEL_DTYPE;
 use super::fused_ops::{
     FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
-    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexBlockBackend,
+    FusedHydraMidBlockBackend, FusedHydraPoolTailBackend, FusedMlpBackend, FusedNaFlexBlockBackend,
 };
 use super::modules::{
     Hydra, HydraEmbeds, HydraFeedForward, HydraMidBlock, HydraPool, HydraRmsNorm, LinearHead,
@@ -25,6 +25,7 @@ pub fn load_hydra<
         + FastLinearBackend
         + FastRmsNormBackend
         + FusedHydraMidBlockBackend
+        + FusedHydraPoolTailBackend
         + FusedNaFlexBlockBackend,
 >(
     path: &Path,
