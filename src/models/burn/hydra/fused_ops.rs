@@ -230,6 +230,28 @@ fn gemm_a_bt_scaled(
     }
 }
 
+/// `C = A @ B` where A is row-major with arbitrary leading row stride `rsa`.
+///
+/// Useful for reading only the first `k` columns of a wider matrix without a
+/// separate copy.
+#[inline]
+fn gemm_a_strided(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    rsa: isize,
+    b: &[f32],
+    c: &mut [f32],
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm_f32(
+            m, n, k, a, rsa, 1, b, n as isize, 1, c, n as isize, 1, par,
+        );
+    }
+}
+
 /// Dispatch to the fastest pure-Rust GEMM for the given shape.
 ///
 /// Benchmarks showed `faer` wins on very large square-ish matmuls while `gemm`
@@ -2376,7 +2398,18 @@ fn fused_hydra_mid_block_to_buffer(
     // Output projection from the activated half of glu_proj back into out_buf,
     // then fuse the bias and second residual in one pass.
     // out_buf = glu_proj(strided) @ W_out + b_out + post_attn
-    {
+    if m <= 64 {
+        // For tiny batch sizes the strided faer path has high threading overhead.
+        // Copy the activated gate half to a contiguous buffer and use gemm with
+        // no parallelism.
+        let mut glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
+        for i in 0..m {
+            let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
+            let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
+            dst.copy_from_slice(src);
+        }
+        gemm_row_major(m, hidden, glu_out_dim, &glu_contig, proj_out_w, out_buf, gemm::Parallelism::None);
+    } else {
         let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
         let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
         let mut c = MatMut::from_row_major_slice_mut(out_buf, m, hidden);
