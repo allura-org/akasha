@@ -57,13 +57,53 @@ fn bench_faer_seq(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> f64 {
     start.elapsed().as_secs_f64() / runs as f64
 }
 
+fn bench_gemm(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> f64 {
+    let mut c = vec![0.0f32; m * n];
+    for _ in 0..2 {
+        gemm_row_major(m, n, k, a, b, &mut c);
+    }
+    let runs = 5;
+    let start = Instant::now();
+    for _ in 0..runs {
+        gemm_row_major(m, n, k, a, b, &mut c);
+    }
+    start.elapsed().as_secs_f64() / runs as f64
+}
+
+fn gemm_row_major(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            1,
+            n as isize,
+            false,
+            a.as_ptr(),
+            1,
+            k as isize,
+            b.as_ptr(),
+            1,
+            n as isize,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            gemm::Parallelism::Rayon(0),
+        );
+    }
+}
+
 fn bench_shape(name: &str, m: usize, k: usize, n: usize) {
     let a = rand_vec(m * k);
     let b = rand_vec(k * n);
     let t_candle = bench_candle(&a, &b, m, k, n);
     let t_faer = bench_faer(&a, &b, m, k, n);
     let t_faer_seq = bench_faer_seq(&a, &b, m, k, n);
-    println!("{name:30} ({m:5}x{k:5}) @ ({k:5}x{n:5})  candle={t_candle:.3}s  faer_ray={t_faer:.3}s  faer_seq={t_faer_seq:.3}s",);
+    let t_gemm = bench_gemm(&a, &b, m, k, n);
+    println!("{name:30} ({m:5}x{k:5}) @ ({k:5}x{n:5})  candle={t_candle:.3}s  faer_ray={t_faer:.3}s  faer_seq={t_faer_seq:.3}s  gemm={t_gemm:.3}s");
 }
 
 #[test]

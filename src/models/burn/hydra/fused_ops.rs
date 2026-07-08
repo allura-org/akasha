@@ -1696,20 +1696,9 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
 
                     for i in 0..tile_q {
                         let row_start = i * seq_kv_eff;
-                        let mut max = f32::NEG_INFINITY;
-                        for j in 0..seq_kv_eff {
-                            max = max.max(scores[row_start + j]);
-                        }
-                        let mut sum = 0.0f32;
-                        for j in 0..seq_kv_eff {
-                            let e = (scores[row_start + j] - max).exp();
-                            scores[row_start + j] = e;
-                            sum += e;
-                        }
-                        let inv_sum = 1.0f32 / sum;
-                        for j in 0..seq_kv_eff {
-                            scores[row_start + j] *= inv_sum;
-                        }
+                        simd_ops::softmax_in_place(
+                            &mut scores[row_start..row_start + seq_kv_eff],
+                        );
                     }
 
                     gemm_row_major(
@@ -2358,11 +2347,9 @@ fn fused_hydra_mid_block_to_buffer(
     let t_q_proj0 = Instant::now();
     best_row_major(m, hidden, hidden, x_slice, q_proj_w, out_buf);
     if let Some(ref b) = q_proj_b {
-        out_buf.par_chunks_exact_mut(hidden).for_each(|row| {
-            for j in 0..hidden {
-                row[j] += b[j];
-            }
-        });
+        out_buf
+            .par_chunks_exact_mut(hidden)
+            .for_each(|row| simd_ops::add_bias_in_place(row, b));
     }
     let t_q_proj = t_q_proj0.elapsed();
 
@@ -2449,20 +2436,9 @@ fn fused_hydra_mid_block_to_buffer(
 
                     for i in 0..tile_q {
                         let row_start = i * seq_kv_eff;
-                        let mut max = f32::NEG_INFINITY;
-                        for j in 0..seq_kv_eff {
-                            max = max.max(scores[row_start + j]);
-                        }
-                        let mut sum = 0.0f32;
-                        for j in 0..seq_kv_eff {
-                            let e = (scores[row_start + j] - max).exp();
-                            scores[row_start + j] = e;
-                            sum += e;
-                        }
-                        let inv_sum = 1.0f32 / sum;
-                        for j in 0..seq_kv_eff {
-                            scores[row_start + j] *= inv_sum;
-                        }
+                        simd_ops::softmax_in_place(
+                            &mut scores[row_start..row_start + seq_kv_eff],
+                        );
                     }
 
                     gemm_row_major(
@@ -2506,18 +2482,14 @@ fn fused_hydra_mid_block_to_buffer(
             .par_chunks_exact_mut(hidden)
             .zip(x_slice.par_chunks_exact(hidden))
             .for_each(|(post_row, x_row)| {
-                for j in 0..hidden {
-                    post_row[j] = post_row[j] + b[j] + x_row[j];
-                }
+                simd_ops::add_bias_and_residual_in_place(post_row, b, x_row);
             });
     } else {
         post_attn
             .par_chunks_exact_mut(hidden)
             .zip(x_slice.par_chunks_exact(hidden))
             .for_each(|(post_row, x_row)| {
-                for j in 0..hidden {
-                    post_row[j] += x_row[j];
-                }
+                simd_ops::add_in_place(post_row, x_row);
             });
     }
     let t_o_proj = t_o_proj0.elapsed();
@@ -2530,20 +2502,7 @@ fn fused_hydra_mid_block_to_buffer(
         .par_chunks_exact(hidden)
         .zip(out_buf.par_chunks_exact_mut(hidden))
         .for_each(|(row_x, row_n)| {
-            let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
-            let var = row_x
-                .iter()
-                .map(|v| {
-                    let d = *v - mean;
-                    d * d
-                })
-                .sum::<f32>()
-                / hidden as f32;
-            let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
-            for j in 0..hidden {
-                row_n[j] = (row_x[j] - mean) * inv_std * ff_gamma[j]
-                    + ff_beta.map(|b| b[j]).unwrap_or(0.0f32);
-            }
+            simd_ops::layer_norm_row(row_x, ff_gamma, ff_beta, 1e-5f32, row_n);
         });
 
     best_row_major(m, glu_out2, hidden, &out_buf, glu_w, &mut glu_proj);
@@ -2551,12 +2510,9 @@ fn fused_hydra_mid_block_to_buffer(
     // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
     // The activated values remain packed as [activated_gate, up], which the
     // strided faer matmul below reads directly without a separate copy.
-    glu_proj.par_chunks_exact_mut(glu_out2).for_each(|row| {
-        for j in 0..glu_out_dim {
-            let gate = softplus_f32(row[j]);
-            row[j] = gate * row[glu_out_dim + j];
-        }
-    });
+    glu_proj
+        .par_chunks_exact_mut(glu_out2)
+        .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
 
     // Output projection from the activated half of glu_proj back into out_buf,
     // then fuse the bias and second residual in one pass.
@@ -2591,18 +2547,14 @@ fn fused_hydra_mid_block_to_buffer(
             .par_chunks_exact_mut(hidden)
             .zip(post_attn.par_chunks_exact(hidden))
             .for_each(|(out_row, post_row)| {
-                for j in 0..hidden {
-                    out_row[j] = out_row[j] + b[j] + post_row[j];
-                }
+                simd_ops::add_bias_and_residual_in_place(out_row, b, post_row);
             });
     } else {
         out_buf
             .par_chunks_exact_mut(hidden)
             .zip(post_attn.par_chunks_exact(hidden))
             .for_each(|(out_row, post_row)| {
-                for j in 0..hidden {
-                    out_row[j] += post_row[j];
-                }
+                simd_ops::add_in_place(out_row, post_row);
             });
     }
     let t_ff = t_ff0.elapsed();
@@ -2942,32 +2894,16 @@ fn fused_hydra_pool_tail_to_buffer(
                 .par_chunks_exact(hidden)
                 .zip(normed.par_chunks_exact_mut(hidden))
                 .for_each(|(row_x, row_n)| {
-                    let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
-                    let var = row_x
-                        .iter()
-                        .map(|v| {
-                            let d = *v - mean;
-                            d * d
-                        })
-                        .sum::<f32>()
-                        / hidden as f32;
-                    let inv_std = 1.0f32 / (var + eps).sqrt();
-                    for j in 0..hidden {
-                        row_n[j] = (row_x[j] - mean) * inv_std * ff_gamma[j]
-                            + ff_beta.map(|b| b[j]).unwrap_or(0.0f32);
-                    }
+                    simd_ops::layer_norm_row(row_x, ff_gamma, ff_beta, eps, row_n);
                 });
 
             // GLU projection.
             best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
 
             // In-place GLU activation.
-            glu_proj.par_chunks_exact_mut(glu_out2).for_each(|row| {
-                for j in 0..glu_out_dim {
-                    let gate = softplus_f32(row[j]);
-                    row[j] = gate * row[glu_out_dim + j];
-                }
-            });
+            glu_proj
+                .par_chunks_exact_mut(glu_out2)
+                .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
 
             // Output projection into post_ff.
             if m <= 1024 {
@@ -3003,18 +2939,14 @@ fn fused_hydra_pool_tail_to_buffer(
                     .par_chunks_exact_mut(hidden)
                     .zip(x_slice.par_chunks_exact(hidden))
                     .for_each(|(out_row, x_row)| {
-                        for j in 0..hidden {
-                            out_row[j] = out_row[j] + b[j] + x_row[j];
-                        }
+                        simd_ops::add_bias_and_residual_in_place(out_row, b, x_row);
                     });
             } else {
                 post_ff
                     .par_chunks_exact_mut(hidden)
                     .zip(x_slice.par_chunks_exact(hidden))
                     .for_each(|(out_row, x_row)| {
-                        for j in 0..hidden {
-                            out_row[j] += x_row[j];
-                        }
+                        simd_ops::add_in_place(out_row, x_row);
                     });
             }
         }
@@ -3472,20 +3404,7 @@ fn fused_hydra_pool_cross_attn_to_buffer(
 
                 for i in 0..tile_q {
                     let row_start = i * seq_kv_eff;
-                    let mut max = f32::NEG_INFINITY;
-                    for j in 0..seq_kv_eff {
-                        max = max.max(scores[row_start + j]);
-                    }
-                    let mut sum = 0.0f32;
-                    for j in 0..seq_kv_eff {
-                        let e = (scores[row_start + j] - max).exp();
-                        scores[row_start + j] = e;
-                        sum += e;
-                    }
-                    let inv_sum = 1.0f32 / sum;
-                    for j in 0..seq_kv_eff {
-                        scores[row_start + j] *= inv_sum;
-                    }
+                    simd_ops::softmax_in_place(&mut scores[row_start..row_start + seq_kv_eff]);
                 }
 
                 gemm_row_major(

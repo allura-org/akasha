@@ -314,6 +314,36 @@ pub fn glu_softplus_in_place(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// In-place GLU softplus activation on an interleaved `[gate..., up...]` buffer.
+/// Overwrites the first `glu_out_dim` elements with `softplus(gate) * up`.
+pub fn glu_softplus_in_place_interleaved(buf: &mut [f32], glu_out_dim: usize) {
+    debug_assert_eq!(buf.len(), 2 * glu_out_dim);
+
+    if glu_out_dim < 2 * LANES {
+        for j in 0..glu_out_dim {
+            buf[j] = scalar_softplus_f32(buf[j]) * buf[glu_out_dim + j];
+        }
+        return;
+    }
+
+    let zero = f32x8::splat(0.0f32);
+    let one = f32x8::splat(1.0f32);
+
+    let mut i = 0;
+    while i + LANES <= glu_out_dim {
+        let g = unsafe { load_f32x8(buf.as_ptr().add(i)) };
+        let u = unsafe { load_f32x8(buf.as_ptr().add(glu_out_dim + i)) };
+        let abs_g = g.abs();
+        let z = (-abs_g).exp();
+        let sp = g.max(zero) + (one + z).ln();
+        unsafe { store_f32x8(buf.as_mut_ptr().add(i), sp * u) };
+        i += LANES;
+    }
+    for j in i..glu_out_dim {
+        buf[j] = scalar_softplus_f32(buf[j]) * buf[glu_out_dim + j];
+    }
+}
+
 fn scalar_softplus_f32(x: f32) -> f32 {
     x.exp().ln_1p()
 }
