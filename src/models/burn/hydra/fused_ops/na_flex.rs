@@ -6,7 +6,7 @@ use crate::models::burn::kernels as simd_ops;
 
 use super::{
     best_row_major, best_row_major_accum, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, gemm_a_bt_scaled, gemm_f32_ex, gemm_row_major, resize_buf,
+    fused_attention_two_gemm_fallback, gemm_a_bt_scaled, gemm_row_major, resize_buf,
     use_online_softmax, BlockWorkspace, QUERY_TILE,
 };
 

@@ -59,8 +59,7 @@ mod hydra_pool;
 mod na_flex;
 
 pub use attention::{
-    USE_ONLINE_SOFTMAX_ATTENTION, fused_attention_online_softmax, fused_attention_two_gemm_fallback,
-    use_online_softmax,
+    fused_attention_online_softmax, fused_attention_two_gemm_fallback, use_online_softmax,
 };
 pub use hydra_mid::FusedHydraMidBlockBackend;
 pub use hydra_pool::{

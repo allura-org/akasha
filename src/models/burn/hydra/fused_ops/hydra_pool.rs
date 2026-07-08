@@ -6,8 +6,8 @@ use crate::models::burn::kernels as simd_ops;
 
 use super::{
     best_row_major, fused_attention, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, gemm_a_bt_scaled, gemm_row_major, gemm_row_major_accum,
-    resize_buf, use_online_softmax, BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
+    fused_attention_two_gemm_fallback, gemm_row_major_accum, resize_buf, use_online_softmax,
+    BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
 };
 #[cfg(feature = "burn-candle")]
 use super::hydra_mid::fused_hydra_mid_block_to_buffer;
