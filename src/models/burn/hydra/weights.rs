@@ -10,7 +10,8 @@ use burn::prelude::*;
 use super::MODEL_DTYPE;
 use super::fused_ops::{
     FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
-    FusedHydraMidBlockBackend, FusedHydraPoolTailBackend, FusedMlpBackend, FusedNaFlexBlockBackend,
+    FusedHydraMidBlockBackend, FusedHydraPoolBackend, FusedHydraPoolTailBackend, FusedMlpBackend,
+    FusedNaFlexBlockBackend,
 };
 use super::modules::{
     Hydra, HydraEmbeds, HydraFeedForward, HydraMidBlock, HydraPool, HydraRmsNorm, LinearHead,
@@ -26,6 +27,7 @@ pub fn load_hydra<
         + FastRmsNormBackend
         + FusedHydraMidBlockBackend
         + FusedHydraPoolTailBackend
+        + FusedHydraPoolBackend
         + FusedNaFlexBlockBackend,
 >(
     path: &Path,
@@ -154,8 +156,11 @@ pub fn load_hydra<
         device,
     );
 
+    let (kv, kv_w_cache, kv_b_cache) =
+        load_linear_cached(&get("attn_pool.kv.weight")?, None, device);
+
     let attn_pool = HydraPool {
-        kv: load_linear(&get("attn_pool.kv.weight")?, None, device),
+        kv,
         q: Param::from_tensor(get_3d("attn_pool.q")?),
         qk_norm: HydraRmsNorm { eps: 1e-5 },
         ff: HydraFeedForward {
@@ -183,6 +188,8 @@ pub fn load_hydra<
             o_proj_w_cache: mid_o_proj_w_cache,
             o_proj_b_cache: mid_o_proj_b_cache,
         }],
+        kv_w_cache,
+        kv_b_cache,
     };
 
     let model = Hydra {

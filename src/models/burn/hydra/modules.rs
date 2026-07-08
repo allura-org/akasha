@@ -8,10 +8,10 @@ use burn::prelude::*;
 use burn::tensor::TensorPrimitive;
 
 use super::fused_ops::{
-    fused_attention, fused_hydra_pool_tail, fused_linear_glu_proj, fused_mlp, fused_na_flex_block,
-    fused_norm_linear_glu_proj, fused_norm_mlp, BlockWorkspace, FastLinearBackend,
-    FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend, FusedHydraMidBlockBackend,
-    FusedHydraPoolTailBackend, FusedMlpBackend, FusedNaFlexAttnBackend, FusedNaFlexBlockBackend,
+    BlockWorkspace, FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
+    FusedHydraMidBlockBackend, FusedHydraPoolBackend, FusedHydraPoolTailBackend, FusedMlpBackend,
+    FusedNaFlexAttnBackend, FusedNaFlexBlockBackend, fused_attention, fused_hydra_pool, fused_mlp,
+    fused_na_flex_block, fused_norm_linear_glu_proj, fused_norm_mlp,
 };
 use super::ops::{merge_heads, rms_norm, split_qkv, vecdot};
 
@@ -53,15 +53,16 @@ pub struct Hydra<B: Backend> {
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedMlpBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend
-            + FusedHydraPoolTailBackend
-            + FusedNaFlexBlockBackend,
-    > Hydra<B>
+    B: FusedGluBackend
+        + FusedMlpBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedHydraPoolTailBackend
+        + FusedHydraPoolBackend
+        + FusedNaFlexBlockBackend,
+> Hydra<B>
 {
     pub fn forward(
         &self,
@@ -310,16 +311,25 @@ pub struct HydraPool<B: Backend> {
     pub qk_norm: HydraRmsNorm,
     pub ff: HydraFeedForward<B>,
     pub mid_blocks: Vec<HydraMidBlock<B>>,
+
+    /// Cached contiguous F32 weight/bias slices for the fused pool kernel.
+    /// The kv projection is fused into the kernel, so we keep a transposed
+    /// row-major [hidden, 2*hidden] weight cache here.
+    #[module(skip)]
+    pub kv_w_cache: Vec<f32>,
+    #[module(skip)]
+    pub kv_b_cache: Option<Vec<f32>>,
 }
 
 impl<
-        B: FusedGluBackend
-            + FusedAttentionBackend
-            + FastLinearBackend
-            + FastRmsNormBackend
-            + FusedHydraMidBlockBackend
-            + FusedHydraPoolTailBackend,
-    > HydraPool<B>
+    B: FusedGluBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedHydraPoolTailBackend
+        + FusedHydraPoolBackend,
+> HydraPool<B>
 {
     pub fn forward(
         &self,
@@ -327,59 +337,7 @@ impl<
         mask: Option<Tensor<B, 4, Bool>>,
         workspace: &mut BlockWorkspace,
     ) -> Tensor<B, 3> {
-        let t0 = Instant::now();
-        let batch = x.dims()[0];
-        let (k, v) = self.forward_kv(x);
-        let t_kv = t0.elapsed();
-
-        let [heads, n_classes, head_dim] = self.q.dims();
-        // q: [heads, n_classes, head_dim] -> [batch, heads, n_classes, head_dim]
-        let t1 = Instant::now();
-        let q = self
-            .q
-            .val()
-            .reshape([1, heads, n_classes, head_dim])
-            .expand([batch, heads, n_classes, head_dim]);
-        let t_q = t1.elapsed();
-
-        let t2 = Instant::now();
-        let out = fused_attention(q, k.clone(), v.clone(), mask.clone());
-        let t_attn = t2.elapsed();
-
-        let t3 = Instant::now();
-        let mut out = merge_heads_pool(out); // [batch, n_classes, attn_dim]
-        let t_merge = t3.elapsed();
-
-        let t4 = Instant::now();
-        out = fused_hydra_pool_tail(out, self, k, v, mask, workspace);
-        let t_tail = t4.elapsed();
-
-        tracing::debug!(
-            "HydraPool kv={:.3}s q={:.3}s attn={:.3}s merge={:.3}s tail={:.3}s",
-            t_kv.as_secs_f64(),
-            t_q.as_secs_f64(),
-            t_attn.as_secs_f64(),
-            t_merge.as_secs_f64(),
-            t_tail.as_secs_f64()
-        );
-
-        out
-    }
-
-    fn forward_kv(&self, x: Tensor<B, 3>) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        let [batch, seq, _] = x.dims();
-        let kv = fast_linear(x, &self.kv); // [batch, seq, attn_dim*2]
-                                           // reshape to [batch, seq, 2, heads, head_dim]
-        let kv = kv.reshape([batch, seq, 2, HYDRA_HEADS, HYDRA_HEAD_DIM]);
-        // permute to [2, batch, heads, seq, head_dim]
-        let kv = kv.permute([2, 0, 3, 1, 4]);
-        // split on the leading singleton dimension, then reshape explicitly so
-        // batch=1 doesn't squeeze away the batch dimension.
-        let mut chunks: Vec<Tensor<B, 5>> = kv.split_with_sizes(vec![1, 1], 0);
-        let reshape = |t: Tensor<B, 5>| t.reshape([batch, HYDRA_HEADS, seq, HYDRA_HEAD_DIM]);
-        let v = reshape(chunks.swap_remove(1));
-        let k = self.qk_norm.forward_fast(reshape(chunks.swap_remove(0)));
-        (k, v)
+        fused_hydra_pool(x, self, mask, workspace)
     }
 }
 
