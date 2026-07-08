@@ -1712,6 +1712,43 @@ pub trait FusedNaFlexBlockBackend: Backend {
         mask: Option<BoolTensor<Self>>,
         workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self>;
+
+    /// Compute one NaFlexBlock forward pass directly on F32 buffers.
+    ///
+    /// `x` is a contiguous `[batch, seq, hidden]` F32 buffer and `out` is the
+    /// same-shaped buffer to write the result into. The default implementation
+    /// reconstructs a tensor from `x`, calls `fused_na_flex_block`, and copies
+    /// the result back into `out`. Backends that can operate on buffers
+    /// directly should override this to avoid the per-call tensor round-trip.
+    fn fused_na_flex_block_to_buffer(
+        x: &[f32],
+        out: &mut [f32],
+        block: &super::modules::NaFlexBlock<Self>,
+        mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+    ) {
+        let device = block.norm1.gamma.val().device();
+        let x_t =
+            Tensor::<Self, 1>::from_data(x, (&device, DType::F32)).reshape([batch, seq, hidden]);
+        let out_t = Self::fused_na_flex_block(
+            match x_t.into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("fused_na_flex_block_to_buffer input is a float tensor"),
+            },
+            block,
+            mask,
+            workspace,
+        );
+        let out_data = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(out_t)).to_data();
+        out.copy_from_slice(
+            out_data
+                .as_slice::<f32>()
+                .expect("fused_na_flex_block_to_buffer output is contiguous F32"),
+        );
+    }
 }
 
 /// Tensor-level entry point for the fused NaFlex block path.
@@ -1742,21 +1779,12 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         mask: Option<BoolTensor<Self>>,
         workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
-        use rayon::prelude::*;
-        use std::time::Instant;
-
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
-
         let [batch, seq, hidden] = x_t.dims();
-        let m = batch * seq;
-        let heads = super::modules::NAFLEX_HEADS;
-        let head_dim = super::modules::NAFLEX_HEAD_DIM;
-        debug_assert_eq!(hidden, heads * head_dim);
 
-        // The fast path requires F32 and a prefix-valid mask (Burn uses `true`
-        // to mean "mask out", so the valid prefix is the leading run of falses).
-        // Anything else falls back to the high-level module implementation.
-        let n_valids: Vec<usize> = if x_t.dtype() != DType::F32 {
+        // Fast path only supports F32; fall back to the high-level module for
+        // other dtypes.
+        if x_t.dtype() != DType::F32 {
             let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
             let x_clone = x_t.clone();
             let attn_out = block.attn.forward(block.norm1.forward(x_t), mask_t);
@@ -1768,20 +1796,70 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 TensorPrimitive::Float(tensor) => tensor,
                 _ => unreachable!("NaFlexBlock returns a float tensor"),
             };
-        } else if let Some(mask) = mask {
+        }
+
+        let x_data = x_t.to_data();
+        let x_slice = x_data
+            .as_slice::<f32>()
+            .expect("NaFlexBlock input is contiguous F32");
+        let mut out = vec![0.0f32; batch * seq * hidden];
+        Self::fused_na_flex_block_to_buffer(
+            x_slice, &mut out, block, mask, workspace, batch, seq, hidden,
+        );
+
+        let device = x_t.device();
+        match Tensor::<Self, 1>::from_data(out.as_slice(), (&device, DType::F32))
+            .reshape([batch, seq, hidden])
+            .into_primitive()
+        {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("fused_na_flex_block returns a float tensor"),
+        }
+    }
+
+    fn fused_na_flex_block_to_buffer(
+        x: &[f32],
+        out: &mut [f32],
+        block: &super::modules::NaFlexBlock<Self>,
+        mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
+        batch: usize,
+        seq: usize,
+        hidden: usize,
+    ) {
+        use rayon::prelude::*;
+        use std::time::Instant;
+
+        let m = batch * seq;
+        let heads = super::modules::NAFLEX_HEADS;
+        let head_dim = super::modules::NAFLEX_HEAD_DIM;
+        debug_assert_eq!(hidden, heads * head_dim);
+
+        // Validate mask shape and prefix-validity (Burn uses `true` to mean
+        // "mask out", so the valid prefix is the leading run of falses).
+        // Anything else falls back to the high-level module implementation
+        // reconstructed from the input buffer.
+        let n_valids: Vec<usize> = if let Some(mask) = mask {
             let mask_t = Tensor::<Self, 4, Bool>::from_primitive(mask);
             let [mb, mh, mw, ms] = mask_t.dims();
             if mb != batch || mh != 1 || mw != 1 || ms != seq {
+                let device = block.norm1.gamma.val().device();
+                let x_t = Tensor::<Self, 1>::from_data(x, (&device, DType::F32))
+                    .reshape([batch, seq, hidden]);
                 let x_clone = x_t.clone();
                 let attn_out = block.attn.forward(block.norm1.forward(x_t), Some(mask_t));
                 let post_attn = attn_out.clone() + x_clone;
-                let out = block
-                    .mlp
-                    .forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
-                return match out.into_primitive() {
-                    TensorPrimitive::Float(tensor) => tensor,
-                    _ => unreachable!("NaFlexBlock returns a float tensor"),
-                };
+                let out_t =
+                    block
+                        .mlp
+                        .forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
+                out.copy_from_slice(
+                    out_t
+                        .to_data()
+                        .as_slice::<f32>()
+                        .expect("NaFlexBlock fallback output is contiguous F32"),
+                );
+                return;
             }
             let mask_data = mask_t.to_data();
             let mask_slice = mask_data
@@ -1799,16 +1877,23 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 }
             }
             if !is_prefix || n_valids.iter().any(|&v| v == 0) {
+                let device = block.norm1.gamma.val().device();
+                let x_t = Tensor::<Self, 1>::from_data(x, (&device, DType::F32))
+                    .reshape([batch, seq, hidden]);
                 let x_clone = x_t.clone();
                 let attn_out = block.attn.forward(block.norm1.forward(x_t), Some(mask_t));
                 let post_attn = attn_out.clone() + x_clone;
-                let out = block
-                    .mlp
-                    .forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
-                return match out.into_primitive() {
-                    TensorPrimitive::Float(tensor) => tensor,
-                    _ => unreachable!("NaFlexBlock returns a float tensor"),
-                };
+                let out_t =
+                    block
+                        .mlp
+                        .forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
+                out.copy_from_slice(
+                    out_t
+                        .to_data()
+                        .as_slice::<f32>()
+                        .expect("NaFlexBlock fallback output is contiguous F32"),
+                );
+                return;
             }
             n_valids
         } else {
@@ -1816,12 +1901,6 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         };
 
         let t0 = Instant::now();
-
-        // ---- Convert inputs and weights to contiguous F32 slices. ----
-        let x_data = x_t.to_data();
-        let x_slice = x_data
-            .as_slice::<f32>()
-            .expect("NaFlexBlock input is contiguous F32");
 
         // Use cached contiguous weight/bias slices instead of copying every call.
         let qkv_w = block.attn.qkv_w_cache.as_slice();
@@ -1863,16 +1942,16 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         });
 
         // Reusable main buffers from the shared workspace. `norm1_buf` holds
-        // norm1, then the attention projection fused with the first residual,
-        // then the final output. `attn_buf` holds the attention output and later
-        // norm2 input. `mlp_hidden_buf` holds the MLP hidden activation.
+        // norm1, then the attention projection fused with the first residual.
+        // `attn_buf` holds the attention output and later norm2 input.
+        // `mlp_hidden_buf` holds the MLP hidden activation. The final output is
+        // written directly into the caller-supplied `out` buffer.
         let mut norm1_buf = resize_buf(&mut workspace.a, m * hidden);
         let mut attn_buf = resize_buf(&mut workspace.b, m * hidden);
         let mut mlp_hidden_buf = resize_buf(&mut workspace.c, m * fc1_hidden);
 
         // ---- 1. LayerNorm1 into norm1_buf. ----
-        x_slice
-            .par_chunks_exact(hidden)
+        x.par_chunks_exact(hidden)
             .zip(norm1_buf.par_chunks_exact_mut(hidden))
             .for_each(|(row_x, row_n)| {
                 let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
@@ -1993,7 +2072,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         if let Some(ref b) = proj_b {
             norm1_buf
                 .par_chunks_exact_mut(hidden)
-                .zip(x_slice.par_chunks_exact(hidden))
+                .zip(x.par_chunks_exact(hidden))
                 .for_each(|(out_row, x_row)| {
                     for j in 0..hidden {
                         out_row[j] = out_row[j] + b[j] + x_row[j];
@@ -2002,7 +2081,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         } else {
             norm1_buf
                 .par_chunks_exact_mut(hidden)
-                .zip(x_slice.par_chunks_exact(hidden))
+                .zip(x.par_chunks_exact(hidden))
                 .for_each(|(out_row, x_row)| {
                     for j in 0..hidden {
                         out_row[j] += x_row[j];
@@ -2031,7 +2110,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 }
             });
 
-        // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual into attn_buf. ----
+        // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual into `out`. ----
         best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
         if let Some(ref b) = fc1_b {
             mlp_hidden_buf
@@ -2046,12 +2125,11 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             *v = gelu_approx_tanh_f32(*v);
         });
 
-        // Write the fc2 output into attn_buf (overwriting the norm2 input) and
-        // fuse the bias and the residual from norm1_buf in one pass.
-        best_row_major(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, &mut attn_buf);
+        // Write the fc2 output into `out` and fuse the bias and the residual
+        // from norm1_buf in one pass.
+        best_row_major(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, out);
         if let Some(ref b) = fc2_b {
-            attn_buf
-                .par_chunks_exact_mut(hidden)
+            out.par_chunks_exact_mut(hidden)
                 .zip(norm1_buf.par_chunks_exact(hidden))
                 .for_each(|(out_row, post_row)| {
                     for j in 0..hidden {
@@ -2059,8 +2137,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                     }
                 });
         } else {
-            attn_buf
-                .par_chunks_exact_mut(hidden)
+            out.par_chunks_exact_mut(hidden)
                 .zip(norm1_buf.par_chunks_exact(hidden))
                 .for_each(|(out_row, post_row)| {
                     for j in 0..hidden {
@@ -2070,19 +2147,9 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         }
 
         tracing::debug!(
-            "fused_na_flex_block total={:.3}s",
+            "fused_na_flex_block_to_buffer total={:.3}s",
             t0.elapsed().as_secs_f64()
         );
-
-        // ---- 7. Reconstruct tensor. ----
-        let device = x_t.device();
-        match Tensor::<Self, 1>::from_data(&*attn_buf, (&device, DType::F32))
-            .reshape([batch, seq, hidden])
-            .into_primitive()
-        {
-            TensorPrimitive::Float(tensor) => tensor,
-            _ => unreachable!("fused_na_flex_block returns a float tensor"),
-        }
     }
 }
 

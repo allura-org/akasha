@@ -5,7 +5,7 @@ use std::time::Instant;
 use burn::module::Param;
 use burn::nn::{LayerNorm, Linear};
 use burn::prelude::*;
-use burn::tensor::TensorPrimitive;
+use burn::tensor::{DType, TensorPrimitive};
 
 use super::fused_ops::{
     BlockWorkspace, FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
@@ -97,8 +97,50 @@ impl<
         let mut workspace = BlockWorkspace::new();
 
         let t1 = Instant::now();
-        for block in &self.blocks {
-            x = block.forward(x, attn_mask.clone(), &mut workspace);
+        // For F32 backends that support it, run all NaFlex blocks directly on
+        // buffers to avoid the per-block Burn tensor from_data/to_data round-trip.
+        if x.dtype() == DType::F32 {
+            let x_device = x.device();
+            let [_, _, hidden] = x.dims();
+            let x_data = x.to_data();
+            let x_slice = x_data
+                .as_slice::<f32>()
+                .expect("Hydra block input is contiguous F32");
+            let mut buf_a = vec![0.0f32; batch * seq * hidden];
+            let mut buf_b = vec![0.0f32; batch * seq * hidden];
+            buf_a.copy_from_slice(x_slice);
+
+            let attn_mask_prim = attn_mask.map(|m| m.into_primitive());
+
+            for (i, block) in self.blocks.iter().enumerate() {
+                let (inp, out) = if i % 2 == 0 {
+                    (&buf_a[..], &mut buf_b[..])
+                } else {
+                    (&buf_b[..], &mut buf_a[..])
+                };
+                B::fused_na_flex_block_to_buffer(
+                    inp,
+                    out,
+                    block,
+                    attn_mask_prim.clone(),
+                    &mut workspace,
+                    batch,
+                    seq,
+                    hidden,
+                );
+            }
+
+            let final_buf = if self.blocks.len() % 2 == 0 {
+                &buf_a
+            } else {
+                &buf_b
+            };
+            x = Tensor::<B, 1>::from_data(final_buf.as_slice(), (&x_device, DType::F32))
+                .reshape([batch, seq, hidden]);
+        } else {
+            for block in &self.blocks {
+                x = block.forward(x, attn_mask.clone(), &mut workspace);
+            }
         }
         let t_blocks = t1.elapsed();
 
