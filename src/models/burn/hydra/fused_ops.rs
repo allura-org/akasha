@@ -108,6 +108,9 @@ impl Default for BlockWorkspace {
     }
 }
 
+/// Tile size for query rows in the fused NaFlex attention kernel.
+const QUERY_TILE: usize = 64;
+
 /// Resize a single workspace buffer and return a mutable slice of the requested
 /// length. Using the raw `Vec` field allows the borrow checker to see that
 /// distinct workspace slots are borrowed independently.
@@ -161,6 +164,53 @@ unsafe fn gemm_f32(
             rsb,
             0.0,
             1.0,
+            false,
+            false,
+            false,
+            par,
+        );
+    }
+}
+
+/// General GEMM with arbitrary strides and an `A @ B` scale factor.
+///
+/// The `gemm` crate names its scalar arguments as `(dst_scale, ab_scale)` in
+/// this order: `dst = ab_scale * (A @ B) + dst_scale * dst` (with `read_dst`
+/// always false here, so `dst_scale` is ignored).
+#[inline]
+unsafe fn gemm_f32_ex(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    rsa: isize,
+    csa: isize,
+    b: &[f32],
+    rsb: isize,
+    csb: isize,
+    c: &mut [f32],
+    rsc: isize,
+    csc: isize,
+    ab_scale: f32,
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            csc,
+            rsc,
+            false,
+            a.as_ptr(),
+            csa,
+            rsa,
+            b.as_ptr(),
+            csb,
+            rsb,
+            0.0,
+            ab_scale,
             false,
             false,
             false,
@@ -1771,6 +1821,159 @@ pub fn fused_na_flex_block<B: FusedNaFlexBlockBackend>(
     )))
 }
 
+/// Fused multi-head self-attention for NaFlex blocks, operating directly on the
+/// packed QKV buffer produced by the block's QKV linear projection.
+///
+/// Reads `qkv` as `[batch, seq, 3 * hidden]` with Q/K/V interleaved per head:
+///   Q offset = h * head_dim, K offset = hidden + h * head_dim,
+///   V offset = 2 * hidden + h * head_dim, row stride = 3 * hidden.
+///
+/// Writes the merged attention output into `attn_out` (`[batch, seq, hidden]`).
+/// `scores_tile_all` and `head_out_tile_all` must be large enough for
+/// `batch * heads * QUERY_TILE * max_n_valid` and
+/// `batch * heads * QUERY_TILE * head_dim` elements respectively. This avoids
+/// the per-head Q/K/V copies that the previous implementation performed.
+fn fused_na_flex_attn_buffer(
+    qkv: &[f32],
+    n_valids: &[usize],
+    attn_out: &mut [f32],
+    scores_tile_all: &mut [f32],
+    head_out_tile_all: &mut [f32],
+    batch: usize,
+    seq: usize,
+    hidden: usize,
+    heads: usize,
+    head_dim: usize,
+) {
+    use rayon::prelude::*;
+
+    let m = batch * seq;
+    let qkv_out = 3 * hidden;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let max_n_valid = n_valids.iter().copied().max().unwrap_or(seq);
+
+    debug_assert_eq!(attn_out.len(), m * hidden);
+    debug_assert_eq!(scores_tile_all.len(), batch * heads * QUERY_TILE * max_n_valid);
+    debug_assert_eq!(head_out_tile_all.len(), batch * heads * QUERY_TILE * head_dim);
+
+    let qkv_ptr = qkv.as_ptr();
+    // The raw output pointer is passed as an integer so the parallel closure
+    // can capture it; each head writes to disjoint regions.
+    let attn_addr = attn_out.as_mut_ptr() as usize;
+
+    scores_tile_all
+        .par_chunks_exact_mut(QUERY_TILE * max_n_valid)
+        .zip(head_out_tile_all.par_chunks_exact_mut(QUERY_TILE * head_dim))
+        .enumerate()
+        .for_each(|(flat, (scores_tile, head_out_tile))| {
+            let b = flat / heads;
+            let h = flat % heads;
+            let seq_kv_eff = n_valids[b];
+
+            let q_base = b * seq * qkv_out + h * head_dim;
+            let k_base = q_base + hidden;
+            let v_base = q_base + 2 * hidden;
+
+            let n_tiles = (seq + QUERY_TILE - 1) / QUERY_TILE;
+            for t in 0..n_tiles {
+                let tile_start = t * QUERY_TILE;
+                let tile_q = (tile_start + QUERY_TILE).min(seq) - tile_start;
+
+                let q_tile_off = q_base + tile_start * qkv_out;
+                let q_tile_len = if tile_q > 0 {
+                    (tile_q - 1) * qkv_out + head_dim
+                } else {
+                    0
+                };
+                let q_tile = &qkv[q_tile_off..q_tile_off + q_tile_len];
+
+                let kv_len = if seq_kv_eff > 0 {
+                    (seq_kv_eff - 1) * qkv_out + head_dim
+                } else {
+                    0
+                };
+                let k_slice = &qkv[k_base..k_base + kv_len];
+                let v_slice = &qkv[v_base..v_base + kv_len];
+
+                let scores = &mut scores_tile[..tile_q * seq_kv_eff];
+
+                unsafe {
+                    gemm_f32_ex(
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        q_tile,
+                        qkv_out as isize,
+                        1,
+                        k_slice,
+                        1,
+                        qkv_out as isize,
+                        scores,
+                        seq_kv_eff as isize,
+                        1,
+                        scale,
+                        gemm::Parallelism::None,
+                    );
+                }
+
+                for i in 0..tile_q {
+                    let row_start = i * seq_kv_eff;
+                    let row_end = row_start + seq_kv_eff;
+                    let mut max = f32::NEG_INFINITY;
+                    for j in row_start..row_end {
+                        let v = scores[j];
+                        if v > max {
+                            max = v;
+                        }
+                    }
+                    let mut sum = 0.0f32;
+                    for j in row_start..row_end {
+                        let e = (scores[j] - max).exp();
+                        scores[j] = e;
+                        sum += e;
+                    }
+                    let inv_sum = 1.0f32 / sum;
+                    for j in row_start..row_end {
+                        scores[j] *= inv_sum;
+                    }
+                }
+
+                let head_out = &mut head_out_tile[..tile_q * head_dim];
+                unsafe {
+                    gemm_f32_ex(
+                        tile_q,
+                        head_dim,
+                        seq_kv_eff,
+                        scores,
+                        seq_kv_eff as isize,
+                        1,
+                        v_slice,
+                        qkv_out as isize,
+                        1,
+                        head_out,
+                        head_dim as isize,
+                        1,
+                        1.0,
+                        gemm::Parallelism::None,
+                    );
+                }
+
+                unsafe {
+                    let attn_ptr = attn_addr as *mut f32;
+                    for p in 0..tile_q {
+                        let out_offset =
+                            ((b * seq + tile_start + p) * hidden + h * head_dim) as usize;
+                        std::ptr::copy_nonoverlapping(
+                            head_out.as_ptr().add(p * head_dim),
+                            attn_ptr.add(out_offset),
+                            head_dim,
+                        );
+                    }
+                }
+            }
+        });
+}
+
 #[cfg(feature = "burn-candle")]
 impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
     fn fused_na_flex_block(
@@ -1943,11 +2146,10 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
 
         // Reusable main buffers from the shared workspace. `norm1_buf` holds
         // norm1, then the attention projection fused with the first residual.
-        // `attn_buf` holds the attention output and later norm2 input.
-        // `mlp_hidden_buf` holds the MLP hidden activation. The final output is
-        // written directly into the caller-supplied `out` buffer.
+        // `mlp_hidden_buf` holds the MLP hidden activation. The attention output
+        // is written into `workspace.b` and returned by the fused attention
+        // kernel. The final output is written directly into `out`.
         let mut norm1_buf = resize_buf(&mut workspace.a, m * hidden);
-        let mut attn_buf = resize_buf(&mut workspace.b, m * hidden);
         let mut mlp_hidden_buf = resize_buf(&mut workspace.c, m * fc1_hidden);
 
         // ---- 1. LayerNorm1 into norm1_buf. ----
@@ -1981,90 +2183,30 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             });
         }
 
-        // ---- 3. Attention from packed QKV, writing merged output into attn_buf. ----
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let attn_buf_addr = attn_buf.as_mut_ptr() as usize;
-        (0..batch * heads).into_par_iter().for_each(|flat| {
-            let b_idx = flat / heads;
-            let h = flat % heads;
-            let seq_kv_eff = n_valids[b_idx];
-
-            let mut q_buf = vec![0.0f32; seq * head_dim];
-            let mut k_buf = vec![0.0f32; seq_kv_eff * head_dim];
-            let mut v_buf = vec![0.0f32; seq_kv_eff * head_dim];
-
-            for p in 0..seq {
-                let row = b_idx * seq + p;
-                let qkv_base = row * qkv_out;
-                let q_off = qkv_base + h * head_dim;
-                let buf_base = p * head_dim;
-                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
-            }
-            for p in 0..seq_kv_eff {
-                let row = b_idx * seq + p;
-                let qkv_base = row * qkv_out;
-                let k_off = qkv_base + hidden + h * head_dim;
-                let v_off = qkv_base + 2 * hidden + h * head_dim;
-                let buf_base = p * head_dim;
-                k_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[k_off..k_off + head_dim]);
-                v_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[v_off..v_off + head_dim]);
-            }
-
-            let mut scores = vec![0.0f32; seq * seq_kv_eff];
-            gemm_a_bt_scaled(
-                seq,
-                seq_kv_eff,
-                head_dim,
-                &q_buf,
-                &k_buf,
-                &mut scores,
-                scale,
-                gemm::Parallelism::None,
-            );
-
-            for i in 0..seq {
-                let row_start = i * seq_kv_eff;
-                let mut max = f32::NEG_INFINITY;
-                for j in 0..seq_kv_eff {
-                    max = max.max(scores[row_start + j]);
-                }
-                let mut sum = 0.0f32;
-                for j in 0..seq_kv_eff {
-                    let e = (scores[row_start + j] - max).exp();
-                    scores[row_start + j] = e;
-                    sum += e;
-                }
-                let inv_sum = 1.0f32 / sum;
-                for j in 0..seq_kv_eff {
-                    scores[row_start + j] *= inv_sum;
-                }
-            }
-
-            let mut head_out = vec![0.0f32; seq * head_dim];
-            gemm_row_major(
-                seq,
-                head_dim,
-                seq_kv_eff,
-                &scores,
-                &v_buf,
-                &mut head_out,
-                gemm::Parallelism::None,
-            );
-
-            unsafe {
-                let attn_ptr = attn_buf_addr as *mut f32;
-                for p in 0..seq {
-                    let row = b_idx * seq + p;
-                    let out_base = row * hidden + h * head_dim;
-                    let buf_base = p * head_dim;
-                    std::ptr::copy_nonoverlapping(
-                        head_out.as_ptr().add(buf_base),
-                        attn_ptr.add(out_base),
-                        head_dim,
-                    );
-                }
-            }
-        });
+        // ---- 3. Attention from packed QKV, writing merged output into workspace.b. ----
+        // Reborrow QKV immutably so the workspace score/output tiles can be
+        // borrowed independently.
+        let qkv_ref = &*qkv;
+        let max_n_valid = n_valids.iter().copied().max().unwrap_or(seq);
+        let mut attn_buf = resize_buf(&mut workspace.b, m * hidden);
+        let scores_tile_all = resize_buf(
+            &mut workspace.f,
+            batch * heads * QUERY_TILE * max_n_valid,
+        );
+        let head_out_tile_all =
+            resize_buf(&mut workspace.g, batch * heads * QUERY_TILE * head_dim);
+        fused_na_flex_attn_buffer(
+            qkv_ref,
+            &n_valids,
+            &mut attn_buf,
+            scores_tile_all,
+            head_out_tile_all,
+            batch,
+            seq,
+            hidden,
+            heads,
+            head_dim,
+        );
 
         // ---- 4. Output projection + first residual into norm1_buf. ----
         // norm1_buf = attn_buf @ W_proj + b_proj + x
@@ -2089,7 +2231,9 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 });
         }
 
-        // ---- 5. LayerNorm2 into attn_buf. ----
+        // ---- 5. LayerNorm2 into workspace.b. ----
+        drop(attn_buf);
+        let mut attn_buf = resize_buf(&mut workspace.b, m * hidden);
         norm1_buf
             .par_chunks_exact(hidden)
             .zip(attn_buf.par_chunks_exact_mut(hidden))
