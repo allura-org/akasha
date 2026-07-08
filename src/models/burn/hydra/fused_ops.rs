@@ -19,6 +19,95 @@ use burn::tensor::{DType, TensorPrimitive};
 use burn::backend::flex::FlexDevice;
 
 // ---------------------------------------------------------------------------
+// Reusable workspace buffers for the fused Hydra kernels
+// ---------------------------------------------------------------------------
+
+/// Reusable scratch buffers for the fused Hydra kernels.
+///
+/// A single `BlockWorkspace` is created per forward pass and shared across all
+/// NaFlex blocks and the pool tail, eliminating per-block `Vec` allocations.
+pub struct BlockWorkspace {
+    a: Vec<f32>,
+    b: Vec<f32>,
+    c: Vec<f32>,
+    d: Vec<f32>,
+    e: Vec<f32>,
+    f: Vec<f32>,
+}
+
+impl BlockWorkspace {
+    pub fn new() -> Self {
+        Self {
+            a: Vec::new(),
+            b: Vec::new(),
+            c: Vec::new(),
+            d: Vec::new(),
+            e: Vec::new(),
+            f: Vec::new(),
+        }
+    }
+
+    pub fn get_a(&mut self, len: usize) -> &mut [f32] {
+        if self.a.len() < len {
+            self.a.resize(len, 0.0);
+        }
+        &mut self.a[..len]
+    }
+
+    pub fn get_b(&mut self, len: usize) -> &mut [f32] {
+        if self.b.len() < len {
+            self.b.resize(len, 0.0);
+        }
+        &mut self.b[..len]
+    }
+
+    pub fn get_c(&mut self, len: usize) -> &mut [f32] {
+        if self.c.len() < len {
+            self.c.resize(len, 0.0);
+        }
+        &mut self.c[..len]
+    }
+
+    pub fn get_d(&mut self, len: usize) -> &mut [f32] {
+        if self.d.len() < len {
+            self.d.resize(len, 0.0);
+        }
+        &mut self.d[..len]
+    }
+
+    pub fn get_e(&mut self, len: usize) -> &mut [f32] {
+        if self.e.len() < len {
+            self.e.resize(len, 0.0);
+        }
+        &mut self.e[..len]
+    }
+
+    pub fn get_f(&mut self, len: usize) -> &mut [f32] {
+        if self.f.len() < len {
+            self.f.resize(len, 0.0);
+        }
+        &mut self.f[..len]
+    }
+}
+
+impl Default for BlockWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resize a single workspace buffer and return a mutable slice of the requested
+/// length. Using the raw `Vec` field allows the borrow checker to see that
+/// distinct workspace slots are borrowed independently.
+#[inline]
+fn resize_buf(buf: &mut Vec<f32>, len: usize) -> &mut [f32] {
+    if buf.len() < len {
+        buf.resize(len, 0.0);
+    }
+    &mut buf[..len]
+}
+
+// ---------------------------------------------------------------------------
 // Low-level GEMM helper (pure Rust, no C/C++)
 // ---------------------------------------------------------------------------
 
@@ -1589,7 +1678,28 @@ pub trait FusedNaFlexBlockBackend: Backend {
         x: FloatTensor<Self>,
         block: &super::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self>;
+}
+
+/// Tensor-level entry point for the fused NaFlex block path.
+pub fn fused_na_flex_block<B: FusedNaFlexBlockBackend>(
+    x: Tensor<B, 3>,
+    block: &super::modules::NaFlexBlock<B>,
+    mask: Option<Tensor<B, 4, Bool>>,
+    workspace: &mut BlockWorkspace,
+) -> Tensor<B, 3> {
+    let prim = match x.into_primitive() {
+        TensorPrimitive::Float(t) => t,
+        _ => unreachable!("fused_na_flex_block input is a float tensor"),
+    };
+
+    Tensor::from_primitive(TensorPrimitive::Float(B::fused_na_flex_block(
+        prim,
+        block,
+        mask.map(|m| m.into_primitive()),
+        workspace,
+    )))
 }
 
 #[cfg(feature = "burn-candle")]
@@ -1598,6 +1708,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         x: FloatTensor<Self>,
         block: &super::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
         use rayon::prelude::*;
         use std::time::Instant;
@@ -1719,13 +1830,13 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 .expect("NaFlexBlock norm2 beta is contiguous F32")
         });
 
-        // Reusable main buffers. `norm1_buf` holds norm1, then the attention
-        // projection fused with the first residual, then the final output.
-        // `attn_buf` holds the attention output and later norm2 input.
-        // `mlp_hidden_buf` holds the MLP hidden activation.
-        let mut norm1_buf = vec![0.0f32; m * hidden];
-        let mut attn_buf = vec![0.0f32; m * hidden];
-        let mut mlp_hidden_buf = vec![0.0f32; m * fc1_hidden];
+        // Reusable main buffers from the shared workspace. `norm1_buf` holds
+        // norm1, then the attention projection fused with the first residual,
+        // then the final output. `attn_buf` holds the attention output and later
+        // norm2 input. `mlp_hidden_buf` holds the MLP hidden activation.
+        let mut norm1_buf = resize_buf(&mut workspace.a, m * hidden);
+        let mut attn_buf = resize_buf(&mut workspace.b, m * hidden);
+        let mut mlp_hidden_buf = resize_buf(&mut workspace.c, m * fc1_hidden);
 
         // ---- 1. LayerNorm1 into norm1_buf. ----
         x_slice
@@ -1749,7 +1860,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             });
 
         // ---- 2. QKV projection. ----
-        let mut qkv = vec![0.0f32; m * qkv_out];
+        let mut qkv = resize_buf(&mut workspace.d, m * qkv_out);
         best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
         if let Some(ref b) = qkv_b {
             qkv.par_chunks_exact_mut(qkv_out).for_each(|row| {
@@ -1933,7 +2044,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
 
         // ---- 7. Reconstruct tensor. ----
         let device = x_t.device();
-        match Tensor::<Self, 1>::from_data(attn_buf.as_slice(), (&device, DType::F32))
+        match Tensor::<Self, 1>::from_data(&*attn_buf, (&device, DType::F32))
             .reshape([batch, seq, hidden])
             .into_primitive()
         {
@@ -1949,10 +2060,12 @@ impl FusedNaFlexBlockBackend for burn::backend::flex::Flex {
         x: FloatTensor<Self>,
         block: &super::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
         let out = block.forward(
             Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
             mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+            workspace,
         );
         match out.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
@@ -1967,10 +2080,12 @@ impl FusedNaFlexBlockBackend for burn::backend::NdArray {
         x: FloatTensor<Self>,
         block: &super::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
         let out = block.forward(
             Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
             mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+            workspace,
         );
         match out.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
@@ -2014,6 +2129,7 @@ fn fused_hydra_mid_block_to_buffer(
     heads: usize,
     head_dim: usize,
     seq_kv: usize,
+    workspace: &mut BlockWorkspace,
 ) {
     use faer::linalg::matmul::matmul;
     use faer::{Accum, MatMut, MatRef, Par};
@@ -2053,9 +2169,6 @@ fn fused_hydra_mid_block_to_buffer(
 
     let t_mid0 = Instant::now();
 
-    let mut post_attn = vec![0.0f32; m * hidden];
-    let mut glu_proj = vec![0.0f32; m * glu_out2];
-
     // ---- 1. Q projection. ----
     let t_q_proj0 = Instant::now();
     best_row_major(m, hidden, hidden, x_slice, q_proj_w, out_buf);
@@ -2094,101 +2207,110 @@ fn fused_hydra_mid_block_to_buffer(
     const QUERY_TILE: usize = 64;
     let max_n_valid = n_valids.iter().copied().max().unwrap_or(seq_kv);
 
-    // Pre-allocate per-head working buffers. Each head gets a contiguous
-    // q slice plus small reusable tile buffers for scores and output.
-    let mut q_head_all = vec![0.0f32; batch * heads * seq_q * head_dim];
-    let mut scores_tile_all = vec![0.0f32; batch * heads * QUERY_TILE * max_n_valid];
-    let mut head_out_tile_all = vec![0.0f32; batch * heads * QUERY_TILE * head_dim];
+    // Pull per-head working buffers from the shared workspace. `q_head_all`,
+    // `scores_tile_all`, and `head_out_tile_all` are only needed during the
+    // attention loop; `post_attn` and `glu_proj` are allocated afterwards by
+    // reusing the same slots.
+    {
+        let q_head_all = resize_buf(&mut workspace.c, batch * heads * seq_q * head_dim);
+        let scores_tile_all =
+            resize_buf(&mut workspace.d, batch * heads * QUERY_TILE * max_n_valid);
+        let head_out_tile_all = resize_buf(&mut workspace.e, batch * heads * QUERY_TILE * head_dim);
 
-    q_head_all
-        .par_chunks_exact_mut(seq_q * head_dim)
-        .zip(scores_tile_all.par_chunks_exact_mut(QUERY_TILE * max_n_valid))
-        .zip(head_out_tile_all.par_chunks_exact_mut(QUERY_TILE * head_dim))
-        .enumerate()
-        .for_each(|(flat, ((q_head, scores_tile), head_out_tile))| {
-            let b_idx = flat / heads;
-            let h = flat % heads;
-            let seq_kv_eff = n_valids[b_idx];
+        q_head_all
+            .par_chunks_exact_mut(seq_q * head_dim)
+            .zip(scores_tile_all.par_chunks_exact_mut(QUERY_TILE * max_n_valid))
+            .zip(head_out_tile_all.par_chunks_exact_mut(QUERY_TILE * head_dim))
+            .enumerate()
+            .for_each(|(flat, ((q_head, scores_tile), head_out_tile))| {
+                let b_idx = flat / heads;
+                let h = flat % heads;
+                let seq_kv_eff = n_valids[b_idx];
 
-            // Gather contiguous q for this head.
-            for p in 0..seq_q {
-                let row = b_idx * seq_q + p;
-                let src_off = row * hidden + h * head_dim;
-                let dst_off = p * head_dim;
-                q_head[dst_off..dst_off + head_dim]
-                    .copy_from_slice(&out_buf[src_off..src_off + head_dim]);
-            }
-
-            let kv_stride_head = seq_kv * head_dim;
-            let kv_off = (b_idx * heads + h) * kv_stride_head;
-            let k_head = &k_slice[kv_off..kv_off + seq_kv_eff * head_dim];
-            let v_head = &v_slice[kv_off..kv_off + seq_kv_eff * head_dim];
-
-            // Process queries in tiles to keep working set cache-resident.
-            let n_tiles = (seq_q + QUERY_TILE - 1) / QUERY_TILE;
-            for t in 0..n_tiles {
-                let tile_start = t * QUERY_TILE;
-                let tile_q = (tile_start + QUERY_TILE).min(seq_q) - tile_start;
-
-                let q_tile = &q_head[tile_start * head_dim..(tile_start + tile_q) * head_dim];
-                let scores = &mut scores_tile[..tile_q * seq_kv_eff];
-                let head_out = &mut head_out_tile[..tile_q * head_dim];
-
-                gemm_a_bt_scaled(
-                    tile_q,
-                    seq_kv_eff,
-                    head_dim,
-                    q_tile,
-                    k_head,
-                    scores,
-                    scale,
-                    gemm::Parallelism::None,
-                );
-
-                for i in 0..tile_q {
-                    let row_start = i * seq_kv_eff;
-                    let mut max = f32::NEG_INFINITY;
-                    for j in 0..seq_kv_eff {
-                        max = max.max(scores[row_start + j]);
-                    }
-                    let mut sum = 0.0f32;
-                    for j in 0..seq_kv_eff {
-                        let e = (scores[row_start + j] - max).exp();
-                        scores[row_start + j] = e;
-                        sum += e;
-                    }
-                    let inv_sum = 1.0f32 / sum;
-                    for j in 0..seq_kv_eff {
-                        scores[row_start + j] *= inv_sum;
-                    }
+                // Gather contiguous q for this head.
+                for p in 0..seq_q {
+                    let row = b_idx * seq_q + p;
+                    let src_off = row * hidden + h * head_dim;
+                    let dst_off = p * head_dim;
+                    q_head[dst_off..dst_off + head_dim]
+                        .copy_from_slice(&out_buf[src_off..src_off + head_dim]);
                 }
 
-                gemm_row_major(
-                    tile_q,
-                    head_dim,
-                    seq_kv_eff,
-                    scores,
-                    v_head,
-                    head_out,
-                    gemm::Parallelism::None,
-                );
+                let kv_stride_head = seq_kv * head_dim;
+                let kv_off = (b_idx * heads + h) * kv_stride_head;
+                let k_head = &k_slice[kv_off..kv_off + seq_kv_eff * head_dim];
+                let v_head = &v_slice[kv_off..kv_off + seq_kv_eff * head_dim];
 
-                unsafe {
-                    let out_buf_ptr = out_buf_addr as *mut f32;
-                    for p in 0..tile_q {
-                        let row = b_idx * seq_q + tile_start + p;
-                        let out_base = row * hidden + h * head_dim;
-                        let buf_base = p * head_dim;
-                        std::ptr::copy_nonoverlapping(
-                            head_out.as_ptr().add(buf_base),
-                            out_buf_ptr.add(out_base),
-                            head_dim,
-                        );
+                // Process queries in tiles to keep working set cache-resident.
+                let n_tiles = (seq_q + QUERY_TILE - 1) / QUERY_TILE;
+                for t in 0..n_tiles {
+                    let tile_start = t * QUERY_TILE;
+                    let tile_q = (tile_start + QUERY_TILE).min(seq_q) - tile_start;
+
+                    let q_tile = &q_head[tile_start * head_dim..(tile_start + tile_q) * head_dim];
+                    let scores = &mut scores_tile[..tile_q * seq_kv_eff];
+                    let head_out = &mut head_out_tile[..tile_q * head_dim];
+
+                    gemm_a_bt_scaled(
+                        tile_q,
+                        seq_kv_eff,
+                        head_dim,
+                        q_tile,
+                        k_head,
+                        scores,
+                        scale,
+                        gemm::Parallelism::None,
+                    );
+
+                    for i in 0..tile_q {
+                        let row_start = i * seq_kv_eff;
+                        let mut max = f32::NEG_INFINITY;
+                        for j in 0..seq_kv_eff {
+                            max = max.max(scores[row_start + j]);
+                        }
+                        let mut sum = 0.0f32;
+                        for j in 0..seq_kv_eff {
+                            let e = (scores[row_start + j] - max).exp();
+                            scores[row_start + j] = e;
+                            sum += e;
+                        }
+                        let inv_sum = 1.0f32 / sum;
+                        for j in 0..seq_kv_eff {
+                            scores[row_start + j] *= inv_sum;
+                        }
+                    }
+
+                    gemm_row_major(
+                        tile_q,
+                        head_dim,
+                        seq_kv_eff,
+                        scores,
+                        v_head,
+                        head_out,
+                        gemm::Parallelism::None,
+                    );
+
+                    unsafe {
+                        let out_buf_ptr = out_buf_addr as *mut f32;
+                        for p in 0..tile_q {
+                            let row = b_idx * seq_q + tile_start + p;
+                            let out_base = row * hidden + h * head_dim;
+                            let buf_base = p * head_dim;
+                            std::ptr::copy_nonoverlapping(
+                                head_out.as_ptr().add(buf_base),
+                                out_buf_ptr.add(out_base),
+                                head_dim,
+                            );
+                        }
                     }
                 }
-            }
-        });
+            });
+    }
     let t_attn = t_attn0.elapsed();
+
+    // Reuse the attention workspace slots for post_attn and the FF glu_proj.
+    let mut post_attn = resize_buf(&mut workspace.f, m * hidden);
+    let mut glu_proj = resize_buf(&mut workspace.c, m * glu_out2);
 
     // ---- 4. Output projection + first residual, fused into one pass. ----
     // post_attn = out_buf @ W_o + b_o + x
@@ -2428,6 +2550,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             .as_slice::<f32>()
             .expect("HydraMidBlock input is contiguous F32");
         let mut out_buf = vec![0.0f32; batch * seq_q * hidden];
+        let mut workspace = BlockWorkspace::new();
 
         fused_hydra_mid_block_to_buffer(
             x_slice,
@@ -2442,6 +2565,7 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             heads,
             head_dim,
             seq_kv,
+            &mut workspace,
         );
 
         let device = x_t.device();
@@ -2520,6 +2644,7 @@ pub trait FusedHydraPoolTailBackend: Backend {
         k: FloatTensor<Self>,
         v: FloatTensor<Self>,
         mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self>;
 }
 
@@ -2530,6 +2655,7 @@ pub fn fused_hydra_pool_tail<B: FusedHydraPoolTailBackend>(
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
     mask: Option<Tensor<B, 4, Bool>>,
+    workspace: &mut BlockWorkspace,
 ) -> Tensor<B, 3> {
     Tensor::from_primitive(TensorPrimitive::Float(B::fused_hydra_pool_tail(
         match x.into_primitive() {
@@ -2546,6 +2672,7 @@ pub fn fused_hydra_pool_tail<B: FusedHydraPoolTailBackend>(
             _ => unreachable!("fused_hydra_pool_tail v is a float tensor"),
         },
         mask.map(|m| m.into_primitive()),
+        workspace,
     )))
 }
 
@@ -2557,6 +2684,7 @@ impl FusedHydraPoolTailBackend for burn::backend::candle::Candle {
         k: FloatTensor<Self>,
         v: FloatTensor<Self>,
         mask: Option<BoolTensor<Self>>,
+        workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
         use faer::linalg::matmul::matmul;
         use faer::{Accum, MatMut, MatRef, Par};
@@ -2685,83 +2813,96 @@ impl FusedHydraPoolTailBackend for burn::backend::candle::Candle {
             .as_slice::<f32>()
             .expect("HydraPool tail input is contiguous F32");
 
-        let mut post_ff = vec![0.0f32; m * hidden];
-        let mut normed = vec![0.0f32; m * hidden];
-        let mut glu_proj = vec![0.0f32; m * glu_out2];
+        // Reusable workspace buffers. The pool FF writes into workspace.a,
+        // uses workspace.c for the FF norm input and workspace.d for the GLU
+        // projection. The mid-block helper reuses c/d/e/f for its internal
+        // buffers and workspace.b as the scratch buffer for the mid-block loop.
+        let mut current = {
+            {
+                let mut post_ff = resize_buf(&mut workspace.a, m * hidden);
+                let normed = resize_buf(&mut workspace.c, m * hidden);
+                let mut glu_proj = resize_buf(&mut workspace.d, m * glu_out2);
 
-        // Layer norm.
-        x_slice
-            .par_chunks_exact(hidden)
-            .zip(normed.par_chunks_exact_mut(hidden))
-            .for_each(|(row_x, row_n)| {
-                let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
-                let var = row_x
-                    .iter()
-                    .map(|v| {
-                        let d = *v - mean;
-                        d * d
-                    })
-                    .sum::<f32>()
-                    / hidden as f32;
-                let inv_std = 1.0f32 / (var + eps).sqrt();
-                for j in 0..hidden {
-                    row_n[j] = (row_x[j] - mean) * inv_std * ff_gamma[j]
-                        + ff_beta.map(|b| b[j]).unwrap_or(0.0f32);
+                // Layer norm.
+                x_slice
+                    .par_chunks_exact(hidden)
+                    .zip(normed.par_chunks_exact_mut(hidden))
+                    .for_each(|(row_x, row_n)| {
+                        let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
+                        let var = row_x
+                            .iter()
+                            .map(|v| {
+                                let d = *v - mean;
+                                d * d
+                            })
+                            .sum::<f32>()
+                            / hidden as f32;
+                        let inv_std = 1.0f32 / (var + eps).sqrt();
+                        for j in 0..hidden {
+                            row_n[j] = (row_x[j] - mean) * inv_std * ff_gamma[j]
+                                + ff_beta.map(|b| b[j]).unwrap_or(0.0f32);
+                        }
+                    });
+
+                // GLU projection.
+                best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
+
+                // In-place GLU activation.
+                glu_proj.par_chunks_exact_mut(glu_out2).for_each(|row| {
+                    for j in 0..glu_out_dim {
+                        let gate = softplus_f32(row[j]);
+                        row[j] = gate * row[glu_out_dim + j];
+                    }
+                });
+
+                // Output projection into post_ff.
+                {
+                    let a = MatRef::from_row_major_slice_with_stride(
+                        &glu_proj,
+                        m,
+                        glu_out_dim,
+                        glu_out2,
+                    );
+                    let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
+                    let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
+                    matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
                 }
-            });
 
-        // GLU projection.
-        best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
-
-        // In-place GLU activation.
-        glu_proj.par_chunks_exact_mut(glu_out2).for_each(|row| {
-            for j in 0..glu_out_dim {
-                let gate = softplus_f32(row[j]);
-                row[j] = gate * row[glu_out_dim + j];
+                // Add bias and residual in one pass.
+                if let Some(ref b) = proj_out_b {
+                    post_ff
+                        .par_chunks_exact_mut(hidden)
+                        .zip(x_slice.par_chunks_exact(hidden))
+                        .for_each(|(out_row, x_row)| {
+                            for j in 0..hidden {
+                                out_row[j] = out_row[j] + b[j] + x_row[j];
+                            }
+                        });
+                } else {
+                    post_ff
+                        .par_chunks_exact_mut(hidden)
+                        .zip(x_slice.par_chunks_exact(hidden))
+                        .for_each(|(out_row, x_row)| {
+                            for j in 0..hidden {
+                                out_row[j] += x_row[j];
+                            }
+                        });
+                }
             }
-        });
-
-        // Output projection into post_ff.
-        {
-            let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
-            let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
-            matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-        }
-
-        // Add bias and residual in one pass.
-        if let Some(ref b) = proj_out_b {
-            post_ff
-                .par_chunks_exact_mut(hidden)
-                .zip(x_slice.par_chunks_exact(hidden))
-                .for_each(|(out_row, x_row)| {
-                    for j in 0..hidden {
-                        out_row[j] = out_row[j] + b[j] + x_row[j];
-                    }
-                });
-        } else {
-            post_ff
-                .par_chunks_exact_mut(hidden)
-                .zip(x_slice.par_chunks_exact(hidden))
-                .for_each(|(out_row, x_row)| {
-                    for j in 0..hidden {
-                        out_row[j] += x_row[j];
-                    }
-                });
-        }
+            std::mem::take(&mut workspace.a)
+        };
+        let mut next = std::mem::take(&mut workspace.b);
+        next.resize(m * hidden, 0.0);
 
         let t_ff = t_ff0.elapsed();
 
         // ---- 2. Mid blocks. ----
         let t_mid0 = Instant::now();
 
-        let mut current = post_ff;
-        let mut next = vec![0.0f32; m * hidden];
-
         for block in &pool.mid_blocks {
             fused_hydra_mid_block_to_buffer(
                 &current, &mut next, block, k_slice, v_slice, &n_valids, batch, seq_q, hidden,
-                heads, head_dim, seq_kv,
+                heads, head_dim, seq_kv, workspace,
             );
             std::mem::swap(&mut current, &mut next);
         }
@@ -2777,7 +2918,7 @@ impl FusedHydraPoolTailBackend for burn::backend::candle::Candle {
         );
 
         let device = x_t.device();
-        match Tensor::<Self, 1>::from_data(current.as_slice(), (&device, DType::F32))
+        match Tensor::<Self, 1>::from_data(&*current, (&device, DType::F32))
             .reshape([batch, seq_q, hidden])
             .into_primitive()
         {
@@ -2795,6 +2936,7 @@ impl FusedHydraPoolTailBackend for burn::backend::flex::Flex {
         k: FloatTensor<Self>,
         v: FloatTensor<Self>,
         mask: Option<BoolTensor<Self>>,
+        _workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
@@ -2819,6 +2961,7 @@ impl FusedHydraPoolTailBackend for burn::backend::NdArray {
         k: FloatTensor<Self>,
         v: FloatTensor<Self>,
         mask: Option<BoolTensor<Self>>,
+        _workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
