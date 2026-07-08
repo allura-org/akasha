@@ -24,7 +24,7 @@ use crate::models::Model;
 
 use self::fused_ops::{
     FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
-    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexAttnBackend,
+    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexBlockBackend,
 };
 use self::image::preprocess;
 use self::modules::Hydra;
@@ -50,7 +50,7 @@ impl<
         + FastLinearBackend
         + FastRmsNormBackend
         + FusedHydraMidBlockBackend
-        + FusedNaFlexAttnBackend,
+        + FusedNaFlexBlockBackend,
 > HydraModel<B>
 {
     pub fn load(config: &ModelConfig, device: B::Device) -> Result<Self> {
@@ -92,7 +92,7 @@ impl<
         + FastLinearBackend
         + FastRmsNormBackend
         + FusedHydraMidBlockBackend
-        + FusedNaFlexAttnBackend
+        + FusedNaFlexBlockBackend
         + 'static,
 > HydraModel<B>
 {
@@ -175,7 +175,7 @@ impl<
         + FastLinearBackend
         + FastRmsNormBackend
         + FusedHydraMidBlockBackend
-        + FusedNaFlexAttnBackend
+        + FusedNaFlexBlockBackend
         + 'static,
 > Model for HydraModel<B>
 {

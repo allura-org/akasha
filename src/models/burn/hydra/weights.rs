@@ -7,15 +7,15 @@ use burn::module::Param;
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::prelude::*;
 
+use super::MODEL_DTYPE;
 use super::fused_ops::{
     FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
-    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexAttnBackend,
+    FusedHydraMidBlockBackend, FusedMlpBackend, FusedNaFlexBlockBackend,
 };
 use super::modules::{
     Hydra, HydraEmbeds, HydraFeedForward, HydraMidBlock, HydraPool, HydraRmsNorm, LinearHead,
     NaFlexAttn, NaFlexBlock, NaFlexMlp,
 };
-use super::MODEL_DTYPE;
 
 /// Load Hydra-3.5 from a safetensors checkpoint.
 pub fn load_hydra<
@@ -25,8 +25,11 @@ pub fn load_hydra<
         + FastLinearBackend
         + FastRmsNormBackend
         + FusedHydraMidBlockBackend
-        + FusedNaFlexAttnBackend,
->(path: &Path, device: &B::Device) -> Result<Hydra<B>> {
+        + FusedNaFlexBlockBackend,
+>(
+    path: &Path,
+    device: &B::Device,
+) -> Result<Hydra<B>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read model file: {}", path.display()))?;
     let tensors = safetensors::SafeTensors::deserialize(&bytes)
@@ -38,11 +41,8 @@ pub fn load_hydra<
             .with_context(|| format!("missing 3D tensor: {name}"))?;
         let shape: Vec<usize> = view.shape().iter().map(|&d| d as usize).collect();
         let data = tensor_data(&view)?;
-        let tensor = Tensor::<B, 1>::from_data(
-            data.as_slice(),
-            (&device.clone(), MODEL_DTYPE),
-        )
-        .reshape([shape[0], shape[1], shape[2]]);
+        let tensor = Tensor::<B, 1>::from_data(data.as_slice(), (&device.clone(), MODEL_DTYPE))
+            .reshape([shape[0], shape[1], shape[2]]);
         Ok(tensor)
     };
 
@@ -52,11 +52,8 @@ pub fn load_hydra<
             .with_context(|| format!("missing tensor: {name}"))?;
         let shape: Vec<usize> = view.shape().iter().map(|&d| d as usize).collect();
         let data = tensor_data(&view)?;
-        let tensor = Tensor::<B, 1>::from_data(
-            data.as_slice(),
-            (&device.clone(), MODEL_DTYPE),
-        )
-        .reshape([shape[0], shape[1]]);
+        let tensor = Tensor::<B, 1>::from_data(data.as_slice(), (&device.clone(), MODEL_DTYPE))
+            .reshape([shape[0], shape[1]]);
         Ok(tensor)
     };
 
@@ -66,11 +63,8 @@ pub fn load_hydra<
             .with_context(|| format!("missing 1D tensor: {name}"))?;
         let shape: Vec<usize> = view.shape().iter().map(|&d| d as usize).collect();
         let data = tensor_data(&view)?;
-        let tensor = Tensor::<B, 1>::from_data(
-            data.as_slice(),
-            (&device.clone(), MODEL_DTYPE),
-        )
-        .reshape([shape[0]]);
+        let tensor = Tensor::<B, 1>::from_data(data.as_slice(), (&device.clone(), MODEL_DTYPE))
+            .reshape([shape[0]]);
         Ok(tensor)
     };
 
@@ -132,31 +126,32 @@ pub fn load_hydra<
     let [pool_ff_glu_out2, pool_ff_glu_in] = pool_ff_glu_w.dims();
     let pool_ff_glu_w_cache = {
         let data = pool_ff_glu_w.to_data();
-        let slice = data.as_slice::<f32>().expect("pool ff glu weight is contiguous F32");
+        let slice = data
+            .as_slice::<f32>()
+            .expect("pool ff glu weight is contiguous F32");
         transpose_row_major(slice, pool_ff_glu_out2, pool_ff_glu_in)
     };
     let (pool_ff_proj_out, pool_ff_proj_out_w_cache, pool_ff_proj_out_b_cache) =
         load_linear_cached(&get("attn_pool.ff.proj_out.weight")?, None, device);
 
-    let (mid_q_proj, mid_q_proj_w_cache, mid_q_proj_b_cache) = load_linear_cached(
-        &get("attn_pool.mid_blocks.0.q_proj.weight")?,
-        None,
-        device,
-    );
-    let (mid_o_proj, mid_o_proj_w_cache, mid_o_proj_b_cache) = load_linear_cached(
-        &get("attn_pool.mid_blocks.0.o_proj.weight")?,
-        None,
-        device,
-    );
+    let (mid_q_proj, mid_q_proj_w_cache, mid_q_proj_b_cache) =
+        load_linear_cached(&get("attn_pool.mid_blocks.0.q_proj.weight")?, None, device);
+    let (mid_o_proj, mid_o_proj_w_cache, mid_o_proj_b_cache) =
+        load_linear_cached(&get("attn_pool.mid_blocks.0.o_proj.weight")?, None, device);
     let mid_ff_glu_w = get("attn_pool.mid_blocks.0.ff.proj_in.weight")?;
     let [mid_ff_glu_out2, mid_ff_glu_in] = mid_ff_glu_w.dims();
     let mid_ff_glu_w_cache = {
         let data = mid_ff_glu_w.to_data();
-        let slice = data.as_slice::<f32>().expect("mid ff glu weight is contiguous F32");
+        let slice = data
+            .as_slice::<f32>()
+            .expect("mid ff glu weight is contiguous F32");
         transpose_row_major(slice, mid_ff_glu_out2, mid_ff_glu_in)
     };
-    let (mid_ff_proj_out, mid_ff_proj_out_w_cache, mid_ff_proj_out_b_cache) =
-        load_linear_cached(&get("attn_pool.mid_blocks.0.ff.proj_out.weight")?, None, device);
+    let (mid_ff_proj_out, mid_ff_proj_out_w_cache, mid_ff_proj_out_b_cache) = load_linear_cached(
+        &get("attn_pool.mid_blocks.0.ff.proj_out.weight")?,
+        None,
+        device,
+    );
 
     let attn_pool = HydraPool {
         kv: load_linear(&get("attn_pool.kv.weight")?, None, device),

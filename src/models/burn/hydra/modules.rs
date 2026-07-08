@@ -53,7 +53,7 @@ impl<
             + FastLinearBackend
             + FastRmsNormBackend
             + FusedHydraMidBlockBackend
-            + FusedNaFlexAttnBackend,
+            + FusedNaFlexBlockBackend,
     > Hydra<B>
 {
     pub fn forward(
@@ -160,14 +160,13 @@ pub struct NaFlexBlock<B: Backend> {
     pub mlp: NaFlexMlp<B>,
 }
 
-impl<B: FusedMlpBackend + FastLinearBackend + FusedAttentionBackend + FusedNaFlexAttnBackend> NaFlexBlock<B> {
+impl<B: FusedNaFlexBlockBackend> NaFlexBlock<B> {
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
         mask: Option<Tensor<B, 4, Bool>>,
     ) -> Tensor<B, 3> {
-        let x = self.forward_fused_attn(x, mask);
-        self.mlp.forward_fused_norm(x.clone(), x, &self.norm2)
+        self.forward_fused(x, mask)
     }
 }
 

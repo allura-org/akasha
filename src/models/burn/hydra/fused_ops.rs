@@ -43,27 +43,29 @@ unsafe fn gemm_f32(
     csc: isize,
     par: gemm::Parallelism,
 ) {
-    gemm::gemm(
-        m,
-        n,
-        k,
-        c.as_mut_ptr(),
-        csc,
-        rsc,
-        false,
-        a.as_ptr(),
-        csa,
-        rsa,
-        b.as_ptr(),
-        csb,
-        rsb,
-        0.0,
-        1.0,
-        false,
-        false,
-        false,
-        par,
-    );
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            csc,
+            rsc,
+            false,
+            a.as_ptr(),
+            csa,
+            rsa,
+            b.as_ptr(),
+            csb,
+            rsb,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            par,
+        );
+    }
 }
 
 /// `C = A @ B` with row-major A, B, C.
@@ -138,6 +140,7 @@ fn gemm_a_bt_scaled(
         *v *= scale;
     }
 }
+
 
 /// Dispatch to the fastest pure-Rust GEMM for the given shape.
 ///
@@ -1598,21 +1601,9 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
         use rayon::prelude::*;
+        use std::time::Instant;
 
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
-
-        // The fast path is for the all-valid F32 case; otherwise delegate back
-        // to the standard module implementation.
-        if mask.is_some() || x_t.dtype() != DType::F32 {
-            let out = block.forward(
-                x_t,
-                mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
-            );
-            return match out.into_primitive() {
-                TensorPrimitive::Float(tensor) => tensor,
-                _ => unreachable!("NaFlexBlock returns a float tensor"),
-            };
-        }
 
         let [batch, seq, hidden] = x_t.dims();
         let m = batch * seq;
@@ -1620,128 +1611,182 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         let head_dim = super::modules::NAFLEX_HEAD_DIM;
         debug_assert_eq!(hidden, heads * head_dim);
 
+        // The fast path requires F32 and a prefix-valid mask (Burn uses `true`
+        // to mean "mask out", so the valid prefix is the leading run of falses).
+        // Anything else falls back to the high-level module implementation.
+        let n_valids: Vec<usize> = if x_t.dtype() != DType::F32 {
+            let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+            let x_clone = x_t.clone();
+            let attn_out = block.attn.forward(block.norm1.forward(x_t), mask_t);
+            let post_attn = attn_out.clone() + x_clone;
+            let out = block.mlp.forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
+            return match out.into_primitive() {
+                TensorPrimitive::Float(tensor) => tensor,
+                _ => unreachable!("NaFlexBlock returns a float tensor"),
+            };
+        } else if let Some(mask) = mask {
+            let mask_t = Tensor::<Self, 4, Bool>::from_primitive(mask);
+            let [mb, mh, mw, ms] = mask_t.dims();
+            if mb != batch || mh != 1 || mw != 1 || ms != seq {
+                let x_clone = x_t.clone();
+                let attn_out = block.attn.forward(block.norm1.forward(x_t), Some(mask_t));
+                let post_attn = attn_out.clone() + x_clone;
+                let out = block.mlp.forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
+                return match out.into_primitive() {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("NaFlexBlock returns a float tensor"),
+                };
+            }
+            let mask_data = mask_t.to_data();
+            let mask_slice = mask_data
+                .as_slice::<bool>()
+                .expect("mask is contiguous bool");
+            let mut n_valids = vec![seq; batch];
+            let mut is_prefix = true;
+            for b in 0..batch {
+                let row = &mask_slice[b * seq..(b + 1) * seq];
+                let first_true = row.iter().position(|&v| v).unwrap_or(seq);
+                n_valids[b] = first_true;
+                if row[first_true..].iter().any(|&v| !v) {
+                    is_prefix = false;
+                    break;
+                }
+            }
+            if !is_prefix || n_valids.iter().any(|&v| v == 0) {
+                let x_clone = x_t.clone();
+                let attn_out = block.attn.forward(block.norm1.forward(x_t), Some(mask_t));
+                let post_attn = attn_out.clone() + x_clone;
+                let out = block.mlp.forward_fused_norm(post_attn.clone(), post_attn, &block.norm2);
+                return match out.into_primitive() {
+                    TensorPrimitive::Float(tensor) => tensor,
+                    _ => unreachable!("NaFlexBlock returns a float tensor"),
+                };
+            }
+            n_valids
+        } else {
+            vec![seq; batch]
+        };
+
+        let t0 = Instant::now();
+
         // ---- Convert inputs and weights to contiguous F32 slices. ----
         let x_data = x_t.to_data();
         let x_slice = x_data
             .as_slice::<f32>()
             .expect("NaFlexBlock input is contiguous F32");
 
-        let get_2d = |t: &burn::module::Param<Tensor<Self, 2>>| {
-            let data = t.val().to_data();
-            let [in_f, out_f] = t.val().dims();
-            let slice = data
-                .as_slice::<f32>()
-                .expect("NaFlexBlock 2D weight is contiguous F32");
-            (slice.to_vec(), in_f, out_f)
-        };
-        let get_1d_opt = |t: &Option<burn::module::Param<Tensor<Self, 1>>>| {
-            t.as_ref().map(|p| {
-                let data = p.val().to_data();
-                let slice = data
-                    .as_slice::<f32>()
-                    .expect("NaFlexBlock 1D weight is contiguous F32");
-                slice.to_vec()
-            })
-        };
+        // Use cached contiguous weight/bias slices instead of copying every call.
+        let qkv_w = block.attn.qkv_w_cache.as_slice();
+        let qkv_b = block.attn.qkv_b_cache.as_deref();
+        let qkv_out = 3 * hidden;
+        debug_assert_eq!(qkv_w.len(), hidden * qkv_out);
 
-        let (qkv_w, qkv_in, qkv_out) = get_2d(&block.attn.qkv.weight);
-        debug_assert_eq!(qkv_in, hidden);
-        debug_assert_eq!(qkv_out, 3 * hidden);
-        let qkv_b = get_1d_opt(&block.attn.qkv.bias);
+        let proj_w = block.attn.proj_w_cache.as_slice();
+        let proj_b = block.attn.proj_b_cache.as_deref();
+        debug_assert_eq!(proj_w.len(), hidden * hidden);
 
-        let (proj_w, proj_in, proj_out) = get_2d(&block.attn.proj.weight);
-        debug_assert_eq!(proj_in, hidden);
-        debug_assert_eq!(proj_out, hidden);
-        let proj_b = get_1d_opt(&block.attn.proj.bias);
+        let fc1_w = block.mlp.fc1_w_cache.as_slice();
+        let fc1_b = block.mlp.fc1_b_cache.as_deref();
+        let fc1_hidden = block.mlp.fc1_w_cache.len() / hidden;
+        debug_assert_eq!(block.mlp.fc1_w_cache.len(), hidden * fc1_hidden);
 
-        let (fc1_w, fc1_in, fc1_hidden) = get_2d(&block.mlp.fc1.weight);
-        debug_assert_eq!(fc1_in, hidden);
-        let fc1_b = get_1d_opt(&block.mlp.fc1.bias);
+        let fc2_w = block.mlp.fc2_w_cache.as_slice();
+        let fc2_b = block.mlp.fc2_b_cache.as_deref();
+        debug_assert_eq!(block.mlp.fc2_w_cache.len(), fc1_hidden * hidden);
 
-        let (fc2_w, fc2_in, fc2_out) = get_2d(&block.mlp.fc2.weight);
-        debug_assert_eq!(fc2_in, fc1_hidden);
-        debug_assert_eq!(fc2_out, hidden);
-        let fc2_b = get_1d_opt(&block.mlp.fc2.bias);
+        let norm1_gamma_data = block.norm1.gamma.val().to_data();
+        let norm1_gamma = norm1_gamma_data
+            .as_slice::<f32>()
+            .expect("NaFlexBlock norm1 gamma is contiguous F32");
+        let norm1_beta_data = block.norm1.beta.as_ref().map(|b| b.val().to_data());
+        let norm1_beta = norm1_beta_data.as_ref().map(|d| {
+            d.as_slice::<f32>()
+                .expect("NaFlexBlock norm1 beta is contiguous F32")
+        });
 
-        let get_norm = |ln: &burn::nn::LayerNorm<Self>| {
-            let gamma_data = ln.gamma.val().to_data();
-            let gamma = gamma_data
-                .as_slice::<f32>()
-                .expect("NaFlexBlock norm gamma is contiguous F32")
-                .to_vec();
-            let beta = ln.beta.as_ref().map(|b| {
-                let data = b.val().to_data();
-                data.as_slice::<f32>()
-                    .expect("NaFlexBlock norm beta is contiguous F32")
-                    .to_vec()
+        let norm2_gamma_data = block.norm2.gamma.val().to_data();
+        let norm2_gamma = norm2_gamma_data
+            .as_slice::<f32>()
+            .expect("NaFlexBlock norm2 gamma is contiguous F32");
+        let norm2_beta_data = block.norm2.beta.as_ref().map(|b| b.val().to_data());
+        let norm2_beta = norm2_beta_data.as_ref().map(|d| {
+            d.as_slice::<f32>()
+                .expect("NaFlexBlock norm2 beta is contiguous F32")
+        });
+
+        // Reusable main buffers. `norm1_buf` holds norm1, then the attention
+        // projection fused with the first residual, then the final output.
+        // `attn_buf` holds the attention output and later norm2 input.
+        // `mlp_hidden_buf` holds the MLP hidden activation.
+        let mut norm1_buf = vec![0.0f32; m * hidden];
+        let mut attn_buf = vec![0.0f32; m * hidden];
+        let mut mlp_hidden_buf = vec![0.0f32; m * fc1_hidden];
+
+        // ---- 1. LayerNorm1 into norm1_buf. ----
+        x_slice
+            .par_chunks_exact(hidden)
+            .zip(norm1_buf.par_chunks_exact_mut(hidden))
+            .for_each(|(row_x, row_n)| {
+                let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
+                let var = row_x
+                    .iter()
+                    .map(|v| {
+                        let d = *v - mean;
+                        d * d
+                    })
+                    .sum::<f32>()
+                    / hidden as f32;
+                let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
+                for j in 0..hidden {
+                    row_n[j] = (row_x[j] - mean) * inv_std * norm1_gamma[j]
+                        + norm1_beta.map(|b| b[j]).unwrap_or(0.0f32);
+                }
             });
-            (gamma, beta)
-        };
-        let (norm1_gamma, norm1_beta) = get_norm(&block.norm1);
-        let (norm2_gamma, norm2_beta) = get_norm(&block.norm2);
-
-        // ---- 1. LayerNorm1 and keep a residual copy of x. ----
-        let mut norm1 = x_slice.to_vec();
-        for i in 0..m {
-            let row = &mut norm1[i * hidden..(i + 1) * hidden];
-            let mean = row.iter().copied().sum::<f32>() / hidden as f32;
-            let var = row
-                .iter()
-                .map(|v| {
-                    let d = *v - mean;
-                    d * d
-                })
-                .sum::<f32>()
-                / hidden as f32;
-            let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
-            for j in 0..hidden {
-                row[j] = (row[j] - mean) * inv_std * norm1_gamma[j]
-                    + norm1_beta.as_ref().map(|b| b[j]).unwrap_or(0.0f32);
-            }
-        }
 
         // ---- 2. QKV projection. ----
         let mut qkv = vec![0.0f32; m * qkv_out];
-        best_row_major(m, qkv_out, hidden, &norm1, &qkv_w, &mut qkv);
+        best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
         if let Some(ref b) = qkv_b {
-            for i in 0..m {
-                let base = i * qkv_out;
+            qkv.par_chunks_exact_mut(qkv_out).for_each(|row| {
                 for j in 0..qkv_out {
-                    qkv[base + j] += b[j];
+                    row[j] += b[j];
                 }
-            }
+            });
         }
 
-        // ---- 3. Attention from packed QKV, writing merged output. ----
-        let mut attn_out = vec![0.0f32; m * hidden];
+        // ---- 3. Attention from packed QKV, writing merged output into attn_buf. ----
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-        // For each head, gather contiguous q/k/v, compute attention, and scatter
-        // the merged result back. Parallelize over (batch, head) pairs.
-        let attn_out_addr = attn_out.as_mut_ptr() as usize;
+        let attn_buf_addr = attn_buf.as_mut_ptr() as usize;
         (0..batch * heads).into_par_iter().for_each(|flat| {
             let b_idx = flat / heads;
             let h = flat % heads;
+            let seq_kv_eff = n_valids[b_idx];
+
             let mut q_buf = vec![0.0f32; seq * head_dim];
-            let mut k_buf = vec![0.0f32; seq * head_dim];
-            let mut v_buf = vec![0.0f32; seq * head_dim];
+            let mut k_buf = vec![0.0f32; seq_kv_eff * head_dim];
+            let mut v_buf = vec![0.0f32; seq_kv_eff * head_dim];
 
             for p in 0..seq {
                 let row = b_idx * seq + p;
                 let qkv_base = row * qkv_out;
                 let q_off = qkv_base + h * head_dim;
+                let buf_base = p * head_dim;
+                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
+            }
+            for p in 0..seq_kv_eff {
+                let row = b_idx * seq + p;
+                let qkv_base = row * qkv_out;
                 let k_off = qkv_base + hidden + h * head_dim;
                 let v_off = qkv_base + 2 * hidden + h * head_dim;
                 let buf_base = p * head_dim;
-                q_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[q_off..q_off + head_dim]);
                 k_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[k_off..k_off + head_dim]);
                 v_buf[buf_base..buf_base + head_dim].copy_from_slice(&qkv[v_off..v_off + head_dim]);
             }
 
-            let mut scores = vec![0.0f32; seq * seq];
+            let mut scores = vec![0.0f32; seq * seq_kv_eff];
             gemm_a_bt_scaled(
                 seq,
-                seq,
+                seq_kv_eff,
                 head_dim,
                 &q_buf,
                 &k_buf,
@@ -1750,21 +1795,20 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                 gemm::Parallelism::None,
             );
 
-            // Softmax rows over seq_kv.
             for i in 0..seq {
-                let row_start = i * seq;
+                let row_start = i * seq_kv_eff;
                 let mut max = f32::NEG_INFINITY;
-                for j in 0..seq {
+                for j in 0..seq_kv_eff {
                     max = max.max(scores[row_start + j]);
                 }
                 let mut sum = 0.0f32;
-                for j in 0..seq {
+                for j in 0..seq_kv_eff {
                     let e = (scores[row_start + j] - max).exp();
                     scores[row_start + j] = e;
                     sum += e;
                 }
                 let inv_sum = 1.0f32 / sum;
-                for j in 0..seq {
+                for j in 0..seq_kv_eff {
                     scores[row_start + j] *= inv_sum;
                 }
             }
@@ -1773,111 +1817,116 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             gemm_row_major(
                 seq,
                 head_dim,
-                seq,
+                seq_kv_eff,
                 &scores,
                 &v_buf,
                 &mut head_out,
                 gemm::Parallelism::None,
             );
 
-            for p in 0..seq {
-                let row = b_idx * seq + p;
-                let out_base = row * hidden + h * head_dim;
-                let buf_base = p * head_dim;
-                unsafe {
-                    let attn_out_ptr = attn_out_addr as *mut f32;
+            unsafe {
+                let attn_ptr = attn_buf_addr as *mut f32;
+                for p in 0..seq {
+                    let row = b_idx * seq + p;
+                    let out_base = row * hidden + h * head_dim;
+                    let buf_base = p * head_dim;
                     std::ptr::copy_nonoverlapping(
                         head_out.as_ptr().add(buf_base),
-                        attn_out_ptr.add(out_base),
+                        attn_ptr.add(out_base),
                         head_dim,
                     );
                 }
             }
         });
 
-        // ---- 4. Output projection + first residual. ----
-        let mut post_attn = vec![0.0f32; m * hidden];
-        best_row_major(m, hidden, hidden, &attn_out, &proj_w, &mut post_attn);
+        // ---- 4. Output projection + first residual into norm1_buf. ----
+        // norm1_buf = attn_buf @ W_proj + b_proj + x
+        best_row_major(m, hidden, hidden, &attn_buf, proj_w, &mut norm1_buf);
         if let Some(ref b) = proj_b {
-            for i in 0..m {
-                let base = i * hidden;
+            norm1_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(x_slice.par_chunks_exact(hidden))
+                .for_each(|(out_row, x_row)| {
+                    for j in 0..hidden {
+                        out_row[j] = out_row[j] + b[j] + x_row[j];
+                    }
+                });
+        } else {
+            norm1_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(x_slice.par_chunks_exact(hidden))
+                .for_each(|(out_row, x_row)| {
+                    for j in 0..hidden {
+                        out_row[j] += x_row[j];
+                    }
+                });
+        }
+
+        // ---- 5. LayerNorm2 into attn_buf. ----
+        norm1_buf
+            .par_chunks_exact(hidden)
+            .zip(attn_buf.par_chunks_exact_mut(hidden))
+            .for_each(|(row_x, row_n)| {
+                let mean = row_x.iter().copied().sum::<f32>() / hidden as f32;
+                let var = row_x
+                    .iter()
+                    .map(|v| {
+                        let d = *v - mean;
+                        d * d
+                    })
+                    .sum::<f32>()
+                    / hidden as f32;
+                let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
                 for j in 0..hidden {
-                    post_attn[base + j] += b[j];
+                    row_n[j] = (row_x[j] - mean) * inv_std * norm2_gamma[j]
+                        + norm2_beta.map(|b| b[j]).unwrap_or(0.0f32);
                 }
-            }
-        }
-        // Add residual (original x) and keep a copy for the second residual.
-        let mut residual2 = vec![0.0f32; m * hidden];
-        for i in 0..m {
-            let base = i * hidden;
-            for j in 0..hidden {
-                let v = post_attn[base + j] + x_slice[base + j];
-                post_attn[base + j] = v;
-                residual2[base + j] = v;
-            }
-        }
+            });
 
-        // ---- 5. LayerNorm2. ----
-        for i in 0..m {
-            let row = &mut post_attn[i * hidden..(i + 1) * hidden];
-            let mean = row.iter().copied().sum::<f32>() / hidden as f32;
-            let var = row
-                .iter()
-                .map(|v| {
-                    let d = *v - mean;
-                    d * d
-                })
-                .sum::<f32>()
-                / hidden as f32;
-            let inv_std = 1.0f32 / (var + 1e-5f32).sqrt();
-            for j in 0..hidden {
-                row[j] = (row[j] - mean) * inv_std * norm2_gamma[j]
-                    + norm2_beta.as_ref().map(|b| b[j]).unwrap_or(0.0f32);
-            }
-        }
-
-        // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual. ----
-        let mut mlp_hidden_buf = vec![0.0f32; m * fc1_hidden];
-        best_row_major(
-            m,
-            fc1_hidden,
-            hidden,
-            &post_attn,
-            &fc1_w,
-            &mut mlp_hidden_buf,
-        );
+        // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual into attn_buf. ----
+        best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
         if let Some(ref b) = fc1_b {
-            for i in 0..m {
-                let base = i * fc1_hidden;
+            mlp_hidden_buf.par_chunks_exact_mut(fc1_hidden).for_each(|row| {
                 for j in 0..fc1_hidden {
-                    mlp_hidden_buf[base + j] += b[j];
+                    row[j] += b[j];
                 }
-            }
+            });
         }
-        for v in mlp_hidden_buf.iter_mut() {
+        mlp_hidden_buf.par_iter_mut().for_each(|v| {
             *v = gelu_approx_tanh_f32(*v);
+        });
+
+        // Write the fc2 output into attn_buf (overwriting the norm2 input) and
+        // fuse the bias and the residual from norm1_buf in one pass.
+        best_row_major(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, &mut attn_buf);
+        if let Some(ref b) = fc2_b {
+            attn_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(norm1_buf.par_chunks_exact(hidden))
+                .for_each(|(out_row, post_row)| {
+                    for j in 0..hidden {
+                        out_row[j] = out_row[j] + b[j] + post_row[j];
+                    }
+                });
+        } else {
+            attn_buf
+                .par_chunks_exact_mut(hidden)
+                .zip(norm1_buf.par_chunks_exact(hidden))
+                .for_each(|(out_row, post_row)| {
+                    for j in 0..hidden {
+                        out_row[j] += post_row[j];
+                    }
+                });
         }
 
-        let mut output = vec![0.0f32; m * hidden];
-        best_row_major(m, hidden, fc1_hidden, &mlp_hidden_buf, &fc2_w, &mut output);
-        if let Some(ref b) = fc2_b {
-            for i in 0..m {
-                let base = i * hidden;
-                for j in 0..hidden {
-                    output[base + j] += b[j];
-                }
-            }
-        }
-        for i in 0..m {
-            let base = i * hidden;
-            for j in 0..hidden {
-                output[base + j] += residual2[base + j];
-            }
-        }
+        tracing::debug!(
+            "fused_na_flex_block total={:.3}s",
+            t0.elapsed().as_secs_f64()
+        );
 
         // ---- 7. Reconstruct tensor. ----
         let device = x_t.device();
-        match Tensor::<Self, 1>::from_data(output.as_slice(), (&device, DType::F32))
+        match Tensor::<Self, 1>::from_data(attn_buf.as_slice(), (&device, DType::F32))
             .reshape([batch, seq, hidden])
             .into_primitive()
         {
