@@ -270,9 +270,10 @@ fn gemm_row_major_scaled(
     scale: f32,
     par: gemm::Parallelism,
 ) {
-    gemm_row_major(m, n, k, a, b, c, par);
-    for v in c.iter_mut() {
-        *v *= scale;
+    unsafe {
+        gemm_f32_ex(
+            m, n, k, a, k as isize, 1, b, n as isize, 1, c, n as isize, 1, scale, par,
+        );
     }
 }
 
@@ -288,9 +289,115 @@ fn gemm_a_bt_scaled(
     scale: f32,
     par: gemm::Parallelism,
 ) {
-    gemm_a_bt(m, n, k, a, b_t, c, par);
-    for v in c.iter_mut() {
-        *v *= scale;
+    unsafe {
+        gemm_f32_ex(
+            m, n, k, a, k as isize, 1, b_t, 1, k as isize, c, n as isize, 1, scale, par,
+        );
+    }
+}
+
+/// General GEMM accumulation: `C += A @ B` with arbitrary strides.
+///
+/// Existing contents of `C` are read and accumulated into.
+#[inline]
+unsafe fn gemm_f32_accum(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    rsa: isize,
+    csa: isize,
+    b: &[f32],
+    rsb: isize,
+    csb: isize,
+    c: &mut [f32],
+    rsc: isize,
+    csc: isize,
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            c.as_mut_ptr(),
+            csc,
+            rsc,
+            true, // read_dst
+            a.as_ptr(),
+            csa,
+            rsa,
+            b.as_ptr(),
+            csb,
+            rsb,
+            1.0, // dst_scale
+            1.0, // ab_scale
+            false,
+            false,
+            false,
+            par,
+        );
+    }
+}
+
+/// `C += A @ B` with row-major A, B, C. Existing C contents are read and accumulated.
+#[inline]
+fn gemm_row_major_accum(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm_f32_accum(
+            m, n, k, a, k as isize, 1, b, n as isize, 1, c, n as isize, 1, par,
+        );
+    }
+}
+
+/// `C += A @ B^T` with row-major A, B^T, C. Existing C contents are read and accumulated.
+#[inline]
+fn gemm_a_bt_accum(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    b_t: &[f32],
+    c: &mut [f32],
+    par: gemm::Parallelism,
+) {
+    unsafe {
+        gemm_f32_accum(
+            m, n, k, a, k as isize, 1, b_t, 1, k as isize, c, n as isize, 1, par,
+        );
+    }
+}
+
+/// Dispatch to the fastest pure-Rust GEMM for `C += A @ B`.
+///
+/// The caller must initialize `c` before calling; this routine only accumulates
+/// the matrix product into the existing contents.
+#[inline]
+fn best_row_major_accum(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+    if (m as u64) * (n as u64) * (k as u64) >= 20_000_000_000u64 {
+        use faer::linalg::matmul::matmul;
+        use faer::{Accum, MatMut, MatRef, Par};
+        let a_ref = MatRef::from_row_major_slice(a, m, k);
+        let b_ref = MatRef::from_row_major_slice(b, k, n);
+        let mut c_mut = MatMut::from_row_major_slice_mut(c, m, n);
+        matmul(
+            c_mut.as_mut(),
+            Accum::Add,
+            a_ref,
+            b_ref,
+            1.0f32,
+            Par::rayon(0),
+        );
+    } else {
+        gemm_row_major_accum(m, n, k, a, b, c, gemm::Parallelism::Rayon(0));
     }
 }
 
@@ -2134,11 +2241,15 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             });
 
         // ---- 2. QKV projection. ----
+        // Pre-initialise the output with the bias (if any) and accumulate the
+        // matrix product into it, saving a separate bias-add pass.
         let mut qkv = resize_buf(&mut workspace.d, m * qkv_out);
-        best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
         if let Some(ref b) = qkv_b {
             qkv.par_chunks_exact_mut(qkv_out)
-                .for_each(|row| simd_ops::add_bias_in_place(row, b));
+                .for_each(|row| row.copy_from_slice(b));
+            best_row_major_accum(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
+        } else {
+            best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
         }
 
         // ---- 3. Attention from packed QKV, writing merged output into workspace.b. ----
@@ -2168,22 +2279,24 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
 
         // ---- 4. Output projection + first residual into norm1_buf. ----
         // norm1_buf = attn_buf @ W_proj + b_proj + x
-        best_row_major(m, hidden, hidden, &attn_buf, proj_w, &mut norm1_buf);
+        // Initialise norm1_buf with the residual (+ bias), then accumulate the
+        // projection to avoid a separate elementwise pass.
         if let Some(ref b) = proj_b {
             norm1_buf
                 .par_chunks_exact_mut(hidden)
                 .zip(x.par_chunks_exact(hidden))
                 .for_each(|(out_row, x_row)| {
-                    simd_ops::add_bias_and_residual_in_place(out_row, b, x_row);
+                    simd_ops::add2_in_place(out_row, b, x_row);
                 });
         } else {
             norm1_buf
                 .par_chunks_exact_mut(hidden)
                 .zip(x.par_chunks_exact(hidden))
                 .for_each(|(out_row, x_row)| {
-                    simd_ops::add_in_place(out_row, x_row);
+                    out_row.copy_from_slice(x_row);
                 });
         }
+        best_row_major_accum(m, hidden, hidden, &attn_buf, proj_w, &mut norm1_buf);
 
         // ---- 5. LayerNorm2 into workspace.b. ----
         drop(attn_buf);
@@ -2196,30 +2309,35 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
             });
 
         // ---- 6. MLP (fc1 -> GELU -> fc2) + second residual into `out`. ----
-        best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+        // Initialise the MLP hidden buffer with the fc1 bias and accumulate the
+        // fc1 projection, saving a separate bias-add pass.
         if let Some(ref b) = fc1_b {
             mlp_hidden_buf
                 .par_chunks_exact_mut(fc1_hidden)
-                .for_each(|row| simd_ops::add_bias_in_place(row, b));
+                .for_each(|row| row.copy_from_slice(b));
+            best_row_major_accum(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+        } else {
+            best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
         }
         simd_ops::gelu_approx_tanh_in_place(&mut mlp_hidden_buf);
 
         // Write the fc2 output into `out` and fuse the bias and the residual
-        // from norm1_buf in one pass.
-        best_row_major(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, out);
+        // from norm1_buf by initialising `out` with the residual (+ bias) and
+        // accumulating the fc2 projection.
         if let Some(ref b) = fc2_b {
             out.par_chunks_exact_mut(hidden)
                 .zip(norm1_buf.par_chunks_exact(hidden))
                 .for_each(|(out_row, post_row)| {
-                    simd_ops::add_bias_and_residual_in_place(out_row, b, post_row);
+                    simd_ops::add2_in_place(out_row, b, post_row);
                 });
         } else {
             out.par_chunks_exact_mut(hidden)
                 .zip(norm1_buf.par_chunks_exact(hidden))
                 .for_each(|(out_row, post_row)| {
-                    simd_ops::add_in_place(out_row, post_row);
+                    out_row.copy_from_slice(post_row);
                 });
         }
+        best_row_major_accum(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, out);
 
         tracing::debug!(
             "fused_na_flex_block_to_buffer total={:.3}s",
@@ -2344,12 +2462,16 @@ fn fused_hydra_mid_block_to_buffer(
     let t_mid0 = Instant::now();
 
     // ---- 1. Q projection. ----
+    // Initialise the output with the bias and accumulate the projection,
+    // saving a separate bias-add pass.
     let t_q_proj0 = Instant::now();
-    best_row_major(m, hidden, hidden, x_slice, q_proj_w, out_buf);
     if let Some(ref b) = q_proj_b {
         out_buf
             .par_chunks_exact_mut(hidden)
-            .for_each(|row| simd_ops::add_bias_in_place(row, b));
+            .for_each(|row| row.copy_from_slice(b));
+        best_row_major_accum(m, hidden, hidden, x_slice, q_proj_w, out_buf);
+    } else {
+        best_row_major(m, hidden, hidden, x_slice, q_proj_w, out_buf);
     }
     let t_q_proj = t_q_proj0.elapsed();
 
@@ -2473,25 +2595,27 @@ fn fused_hydra_mid_block_to_buffer(
     let mut post_attn = resize_buf(&mut workspace.f, m * hidden);
     let mut glu_proj = resize_buf(&mut workspace.c, m * glu_out2);
 
-    // ---- 4. Output projection + first residual, fused into one pass. ----
+    // ---- 4. Output projection + first residual. ----
+    // Initialise post_attn with the residual (+ bias) and accumulate the
+    // projection, avoiding a separate elementwise pass.
     // post_attn = out_buf @ W_o + b_o + x
     let t_o_proj0 = Instant::now();
-    best_row_major(m, hidden, hidden, out_buf, o_proj_w, &mut post_attn);
     if let Some(ref b) = o_proj_b {
         post_attn
             .par_chunks_exact_mut(hidden)
             .zip(x_slice.par_chunks_exact(hidden))
             .for_each(|(post_row, x_row)| {
-                simd_ops::add_bias_and_residual_in_place(post_row, b, x_row);
+                simd_ops::add2_in_place(post_row, b, x_row);
             });
     } else {
         post_attn
             .par_chunks_exact_mut(hidden)
             .zip(x_slice.par_chunks_exact(hidden))
             .for_each(|(post_row, x_row)| {
-                simd_ops::add_in_place(post_row, x_row);
+                post_row.copy_from_slice(x_row);
             });
     }
+    best_row_major_accum(m, hidden, hidden, out_buf, o_proj_w, &mut post_attn);
     let t_o_proj = t_o_proj0.elapsed();
 
     // ---- 5. FF: norm + GLU + projection + second residual. ----
@@ -2514,9 +2638,25 @@ fn fused_hydra_mid_block_to_buffer(
         .par_chunks_exact_mut(glu_out2)
         .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
 
-    // Output projection from the activated half of glu_proj back into out_buf,
-    // then fuse the bias and second residual in one pass.
+    // Output projection from the activated half of glu_proj back into out_buf.
+    // Initialise out_buf with the residual (+ bias) and accumulate the
+    // strided projection, avoiding a separate elementwise pass.
     // out_buf = glu_proj(strided) @ W_out + b_out + post_attn
+    if let Some(ref b) = proj_out_b {
+        out_buf
+            .par_chunks_exact_mut(hidden)
+            .zip(post_attn.par_chunks_exact(hidden))
+            .for_each(|(out_row, post_row)| {
+                simd_ops::add2_in_place(out_row, b, post_row);
+            });
+    } else {
+        out_buf
+            .par_chunks_exact_mut(hidden)
+            .zip(post_attn.par_chunks_exact(hidden))
+            .for_each(|(out_row, post_row)| {
+                out_row.copy_from_slice(post_row);
+            });
+    }
     if m <= 64 {
         // For tiny batch sizes the strided faer path has high threading overhead.
         // Copy the activated gate half to a contiguous buffer and use gemm with
@@ -2527,7 +2667,7 @@ fn fused_hydra_mid_block_to_buffer(
             let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
             dst.copy_from_slice(src);
         }
-        gemm_row_major(
+        gemm_row_major_accum(
             m,
             hidden,
             glu_out_dim,
@@ -2540,22 +2680,7 @@ fn fused_hydra_mid_block_to_buffer(
         let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
         let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
         let mut c = MatMut::from_row_major_slice_mut(out_buf, m, hidden);
-        matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-    }
-    if let Some(ref b) = proj_out_b {
-        out_buf
-            .par_chunks_exact_mut(hidden)
-            .zip(post_attn.par_chunks_exact(hidden))
-            .for_each(|(out_row, post_row)| {
-                simd_ops::add_bias_and_residual_in_place(out_row, b, post_row);
-            });
-    } else {
-        out_buf
-            .par_chunks_exact_mut(hidden)
-            .zip(post_attn.par_chunks_exact(hidden))
-            .for_each(|(out_row, post_row)| {
-                simd_ops::add_in_place(out_row, post_row);
-            });
+        matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
     }
     let t_ff = t_ff0.elapsed();
 
@@ -2905,6 +3030,24 @@ fn fused_hydra_pool_tail_to_buffer(
                 .par_chunks_exact_mut(glu_out2)
                 .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
 
+            // Initialise post_ff with the residual (+ bias) and accumulate the
+            // output projection, avoiding a separate elementwise pass.
+            if let Some(ref b) = proj_out_b {
+                post_ff
+                    .par_chunks_exact_mut(hidden)
+                    .zip(x_slice.par_chunks_exact(hidden))
+                    .for_each(|(out_row, x_row)| {
+                        simd_ops::add2_in_place(out_row, b, x_row);
+                    });
+            } else {
+                post_ff
+                    .par_chunks_exact_mut(hidden)
+                    .zip(x_slice.par_chunks_exact(hidden))
+                    .for_each(|(out_row, x_row)| {
+                        out_row.copy_from_slice(x_row);
+                    });
+            }
+
             // Output projection into post_ff.
             if m <= 1024 {
                 // For moderate batch sizes the strided faer path loses to a
@@ -2916,7 +3059,7 @@ fn fused_hydra_pool_tail_to_buffer(
                     let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
                     dst.copy_from_slice(src);
                 }
-                gemm_row_major(
+                gemm_row_major_accum(
                     m,
                     hidden,
                     glu_out_dim,
@@ -2930,24 +3073,7 @@ fn fused_hydra_pool_tail_to_buffer(
                     MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
                 let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
                 let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
-                matmul(c.as_mut(), Accum::Replace, a, b, 1.0f32, Par::rayon(0));
-            }
-
-            // Add bias and residual in one pass.
-            if let Some(ref b) = proj_out_b {
-                post_ff
-                    .par_chunks_exact_mut(hidden)
-                    .zip(x_slice.par_chunks_exact(hidden))
-                    .for_each(|(out_row, x_row)| {
-                        simd_ops::add_bias_and_residual_in_place(out_row, b, x_row);
-                    });
-            } else {
-                post_ff
-                    .par_chunks_exact_mut(hidden)
-                    .zip(x_slice.par_chunks_exact(hidden))
-                    .for_each(|(out_row, x_row)| {
-                        simd_ops::add_in_place(out_row, x_row);
-                    });
+                matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
             }
         }
         std::mem::take(&mut workspace.a)
