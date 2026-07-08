@@ -37,9 +37,13 @@
 use burn::prelude::*;
 use burn::tensor::activation;
 use burn::tensor::module::attention;
-use burn::tensor::ops::{AttentionModuleOptions, BoolTensor, FloatTensor, ModuleOps};
+use burn::tensor::ops::{AttentionModuleOptions, BoolTensor, FloatTensor};
 use burn::tensor::{DType, TensorPrimitive};
 
+#[cfg(feature = "burn-flex")]
+use burn::tensor::ops::ModuleOps;
+
+#[cfg(all(feature = "burn-candle", feature = "burn-flex"))]
 use crate::models::burn::kernels as simd_ops;
 
 #[cfg(feature = "burn-flex")]
@@ -55,7 +59,7 @@ mod na_flex;
 
 pub use hydra_mid::FusedHydraMidBlockBackend;
 pub use hydra_pool::{
-    FusedHydraPoolBackend, FusedHydraPoolTailBackend, fused_hydra_pool, fused_hydra_pool_tail,
+    FusedHydraPoolBackend, FusedHydraPoolTailBackend, fused_hydra_pool,
 };
 pub use na_flex::{FusedNaFlexAttnBackend, FusedNaFlexBlockBackend, fused_na_flex_block};
 
@@ -100,47 +104,6 @@ impl BlockWorkspace {
         }
     }
 
-    pub fn get_a(&mut self, len: usize) -> &mut [f32] {
-        if self.a.len() < len {
-            self.a.resize(len, 0.0);
-        }
-        &mut self.a[..len]
-    }
-
-    pub fn get_b(&mut self, len: usize) -> &mut [f32] {
-        if self.b.len() < len {
-            self.b.resize(len, 0.0);
-        }
-        &mut self.b[..len]
-    }
-
-    pub fn get_c(&mut self, len: usize) -> &mut [f32] {
-        if self.c.len() < len {
-            self.c.resize(len, 0.0);
-        }
-        &mut self.c[..len]
-    }
-
-    pub fn get_d(&mut self, len: usize) -> &mut [f32] {
-        if self.d.len() < len {
-            self.d.resize(len, 0.0);
-        }
-        &mut self.d[..len]
-    }
-
-    pub fn get_e(&mut self, len: usize) -> &mut [f32] {
-        if self.e.len() < len {
-            self.e.resize(len, 0.0);
-        }
-        &mut self.e[..len]
-    }
-
-    pub fn get_f(&mut self, len: usize) -> &mut [f32] {
-        if self.f.len() < len {
-            self.f.resize(len, 0.0);
-        }
-        &mut self.f[..len]
-    }
 }
 
 impl Default for BlockWorkspace {
@@ -278,44 +241,6 @@ fn gemm_row_major(
     }
 }
 
-/// `C = A @ B^T` where A is row-major `[m, k]` and `b_t` is row-major `[n, k]`
-/// (i.e. the transpose of the desired B).
-#[inline]
-fn gemm_a_bt(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    b_t: &[f32],
-    c: &mut [f32],
-    par: gemm::Parallelism,
-) {
-    unsafe {
-        gemm_f32(
-            m, n, k, a, k as isize, 1, b_t, 1, k as isize, c, n as isize, 1, par,
-        );
-    }
-}
-
-/// `C = scale * (A @ B)` with row-major A, B, C.
-#[inline]
-fn gemm_row_major_scaled(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    b: &[f32],
-    c: &mut [f32],
-    scale: f32,
-    par: gemm::Parallelism,
-) {
-    unsafe {
-        gemm_f32_ex(
-            m, n, k, a, k as isize, 1, b, n as isize, 1, c, n as isize, 1, scale, par,
-        );
-    }
-}
-
 /// `C = scale * (A @ B^T)` where A is row-major `[m, k]` and `b_t` is row-major `[n, k]`.
 #[inline]
 fn gemm_a_bt_scaled(
@@ -397,24 +322,6 @@ fn gemm_row_major_accum(
     }
 }
 
-/// `C += A @ B^T` with row-major A, B^T, C. Existing C contents are read and accumulated.
-#[inline]
-fn gemm_a_bt_accum(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    b_t: &[f32],
-    c: &mut [f32],
-    par: gemm::Parallelism,
-) {
-    unsafe {
-        gemm_f32_accum(
-            m, n, k, a, k as isize, 1, b_t, 1, k as isize, c, n as isize, 1, par,
-        );
-    }
-}
-
 /// Dispatch to the fastest pure-Rust GEMM for `C += A @ B`.
 ///
 /// The caller must initialize `c` before calling; this routine only accumulates
@@ -437,26 +344,6 @@ fn best_row_major_accum(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
         );
     } else {
         gemm_row_major_accum(m, n, k, a, b, c, gemm::Parallelism::Rayon(0));
-    }
-}
-
-/// `C = A @ B` where A is row-major with arbitrary leading row stride `rsa`.
-///
-/// Useful for reading only the first `k` columns of a wider matrix without a
-/// separate copy.
-#[inline]
-fn gemm_a_strided(
-    m: usize,
-    n: usize,
-    k: usize,
-    a: &[f32],
-    rsa: isize,
-    b: &[f32],
-    c: &mut [f32],
-    par: gemm::Parallelism,
-) {
-    unsafe {
-        gemm_f32(m, n, k, a, rsa, 1, b, n as isize, 1, c, n as isize, 1, par);
     }
 }
 
@@ -684,6 +571,7 @@ pub trait FusedMlpBackend: Backend {
 }
 
 /// Tensor-level entry point for the fused MLP path.
+#[allow(dead_code)]
 pub fn fused_mlp<B: FusedMlpBackend>(
     x: Tensor<B, 3>,
     mlp: &super::modules::NaFlexMlp<B>,
@@ -1077,51 +965,6 @@ pub trait FusedGluBackend: FastLinearBackend {
             proj_bias,
         )
     }
-}
-
-/// Tensor-level entry point for the fused GLU path.
-pub fn fused_linear_glu<B: FusedGluBackend>(x: Tensor<B, 3>, weight: Tensor<B, 2>) -> Tensor<B, 3> {
-    Tensor::from_primitive(TensorPrimitive::Float(B::fused_linear_glu(
-        match x.into_primitive() {
-            TensorPrimitive::Float(tensor) => tensor,
-            _ => unreachable!("input is a float tensor"),
-        },
-        match weight.into_primitive() {
-            TensorPrimitive::Float(tensor) => tensor,
-            _ => unreachable!("weight is a float tensor"),
-        },
-    )))
-}
-
-/// Tensor-level entry point for the fused GLU + output projection path.
-pub fn fused_linear_glu_proj<B: FusedGluBackend>(
-    x: Tensor<B, 3>,
-    glu_weight: Tensor<B, 2>,
-    proj: &burn::nn::Linear<B>,
-) -> Tensor<B, 3> {
-    let x_prim = match x.into_primitive() {
-        TensorPrimitive::Float(t) => t,
-        _ => unreachable!("fused_linear_glu_proj input is a float tensor"),
-    };
-    let glu_w_prim = match glu_weight.into_primitive() {
-        TensorPrimitive::Float(t) => t,
-        _ => unreachable!("glu_weight is a float tensor"),
-    };
-    let proj_w_prim = match proj.weight.val().into_primitive() {
-        TensorPrimitive::Float(t) => t,
-        _ => unreachable!("proj weight is a float tensor"),
-    };
-    let proj_b_prim = proj.bias.as_ref().map(|b| match b.val().into_primitive() {
-        TensorPrimitive::Float(t) => t,
-        _ => unreachable!("proj bias is a float tensor"),
-    });
-
-    Tensor::from_primitive(TensorPrimitive::Float(B::fused_linear_glu_proj(
-        x_prim,
-        glu_w_prim,
-        proj_w_prim,
-        proj_b_prim,
-    )))
 }
 
 /// Tensor-level entry point for the fused norm + GLU + output projection path.
@@ -1686,8 +1529,6 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {
         v: FloatTensor<Self>,
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
         use rayon::prelude::*;
 
         let q_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(q));

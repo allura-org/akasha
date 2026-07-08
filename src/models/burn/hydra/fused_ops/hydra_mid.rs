@@ -1,16 +1,12 @@
 use burn::prelude::*;
-use burn::tensor::ops::{BoolTensor, FloatTensor, ModuleOps};
+use burn::tensor::ops::{BoolTensor, FloatTensor};
 use burn::tensor::{DType, TensorPrimitive};
-use faer::linalg::matmul::matmul;
-use faer::{Accum, MatMut, MatRef, Par};
-use rayon::prelude::*;
-use std::time::Instant;
 
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, best_row_major_accum, gemm_a_bt, gemm_a_bt_accum, gemm_a_bt_scaled,
-    gemm_row_major, gemm_row_major_accum, resize_buf, BlockWorkspace, QUERY_TILE,
+    best_row_major, best_row_major_accum, gemm_a_bt_scaled, gemm_row_major, gemm_row_major_accum,
+    resize_buf, BlockWorkspace,
 };
 
 pub trait FusedHydraMidBlockBackend: Backend {
@@ -283,7 +279,7 @@ pub(crate) fn fused_hydra_mid_block_to_buffer(
         // For tiny batch sizes the strided faer path has high threading overhead.
         // Copy the activated gate half to a contiguous buffer and use gemm with
         // no parallelism.
-        let mut glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
+        let glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
         for i in 0..m {
             let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
             let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
@@ -327,10 +323,6 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
         v: FloatTensor<Self>,
         mask: Option<BoolTensor<Self>>,
     ) -> FloatTensor<Self> {
-        use faer::linalg::matmul::matmul;
-        use faer::{Accum, MatMut, MatRef, Par};
-        use rayon::prelude::*;
-
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
         let v_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v));
@@ -361,44 +353,6 @@ impl FusedHydraMidBlockBackend for burn::backend::candle::Candle {
             heads * head_dim,
             "x hidden dim must match heads*head_dim"
         );
-        let m = batch * seq_q;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-        // ---- Convert inputs and weights to contiguous F32 slices. ----
-        let x_data = x_t.to_data();
-        let x_slice = x_data
-            .as_slice::<f32>()
-            .expect("HydraMidBlock input is contiguous F32");
-
-        let q_proj_w = block.q_proj_w_cache.as_slice();
-        let q_proj_b = block.q_proj_b_cache.as_deref();
-        debug_assert_eq!(q_proj_w.len(), hidden * hidden);
-
-        let o_proj_w = block.o_proj_w_cache.as_slice();
-        let o_proj_b = block.o_proj_b_cache.as_deref();
-        debug_assert_eq!(o_proj_w.len(), hidden * hidden);
-
-        // Norm parameters: Hydra uses no-affine LayerNorm (gamma=1, beta=0, eps=1e-5).
-        let q_norm_eps = block.q_norm.eps;
-
-        let ff_gamma_data = block.ff.norm.gamma.val().to_data();
-        let ff_gamma = ff_gamma_data
-            .as_slice::<f32>()
-            .expect("ff norm gamma is contiguous F32");
-        let ff_beta_data = block.ff.norm.beta.as_ref().map(|b| b.val().to_data());
-        let ff_beta = ff_beta_data
-            .as_ref()
-            .map(|d| d.as_slice::<f32>().expect("ff norm beta is contiguous F32"));
-
-        let glu_w = block.ff.glu_w_cache.as_slice();
-        let glu_out2 = glu_w.len() / hidden;
-        let glu_out_dim = glu_out2 / 2;
-
-        let proj_out_w = block.ff.proj_out_w_cache.as_slice();
-        let proj_out_dim = proj_out_w.len() / glu_out_dim;
-        let proj_out_b = block.ff.proj_out_b_cache.as_deref();
-        debug_assert_eq!(proj_out_dim, hidden);
-
         let k_data = k_t.to_data();
         let v_data = v_t.to_data();
         let k_slice = k_data

@@ -16,12 +16,12 @@ const LANES: usize = 8;
 
 #[inline]
 unsafe fn load_f32x8(ptr: *const f32) -> f32x8 {
-    f32x8::new(std::ptr::read_unaligned(ptr as *const [f32; LANES]))
+    f32x8::new(unsafe { std::ptr::read_unaligned(ptr as *const [f32; LANES]) })
 }
 
 #[inline]
 unsafe fn store_f32x8(ptr: *mut f32, v: f32x8) {
-    std::ptr::write_unaligned(ptr as *mut [f32; LANES], v.to_array());
+    unsafe { std::ptr::write_unaligned(ptr as *mut [f32; LANES], v.to_array()) };
 }
 
 /// In-place softmax over a single contiguous row.
@@ -197,6 +197,7 @@ fn scalar_layer_norm_row(
 }
 
 /// Apply RMS normalization to a single row: `out = x / sqrt(mean(x^2)+eps) * gamma`.
+#[allow(dead_code)]
 pub fn rms_norm_row(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
     debug_assert_eq!(gamma.len(), n);
@@ -234,6 +235,7 @@ pub fn rms_norm_row(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
+#[allow(dead_code)]
 fn scalar_rms_norm_row(x: &[f32], gamma: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
     let sumsq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
@@ -288,6 +290,7 @@ fn scalar_gelu_approx_tanh_f32(x: f32) -> f32 {
 }
 
 /// GLU softplus activation: `out = softplus(gate) * up`.
+#[allow(dead_code)]
 pub fn glu_softplus_in_place(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let n = gate.len();
     debug_assert_eq!(up.len(), n);
@@ -352,38 +355,6 @@ fn scalar_softplus_f32(x: f32) -> f32 {
     x.exp().ln_1p()
 }
 
-/// `out += x`
-pub fn add_in_place(out: &mut [f32], x: &[f32]) {
-    let n = out.len();
-    debug_assert_eq!(x.len(), n);
-    let mut i = 0;
-    while i + LANES <= n {
-        let a = unsafe { load_f32x8(out.as_ptr().add(i)) };
-        let b = unsafe { load_f32x8(x.as_ptr().add(i)) };
-        unsafe { store_f32x8(out.as_mut_ptr().add(i), a + b) };
-        i += LANES;
-    }
-    for j in i..n {
-        out[j] += x[j];
-    }
-}
-
-/// `out += bias` (broadcast)
-pub fn add_bias_in_place(out: &mut [f32], bias: &[f32]) {
-    let n = out.len();
-    debug_assert_eq!(bias.len(), n);
-    let mut i = 0;
-    while i + LANES <= n {
-        let a = unsafe { load_f32x8(out.as_ptr().add(i)) };
-        let b = unsafe { load_f32x8(bias.as_ptr().add(i)) };
-        unsafe { store_f32x8(out.as_mut_ptr().add(i), a + b) };
-        i += LANES;
-    }
-    for j in i..n {
-        out[j] += bias[j];
-    }
-}
-
 /// `out = a + b` (fused two-input add)
 pub fn add2_in_place(out: &mut [f32], a: &[f32], b: &[f32]) {
     let n = out.len();
@@ -402,6 +373,7 @@ pub fn add2_in_place(out: &mut [f32], a: &[f32], b: &[f32]) {
 }
 
 /// `out = out + bias + residual`
+#[allow(dead_code)]
 pub fn add_bias_and_residual_in_place(out: &mut [f32], bias: &[f32], residual: &[f32]) {
     let n = out.len();
     debug_assert_eq!(bias.len(), n);

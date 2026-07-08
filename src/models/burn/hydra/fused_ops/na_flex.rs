@@ -1,14 +1,11 @@
 use burn::prelude::*;
-use burn::tensor::ops::{BoolTensor, FloatTensor, ModuleOps};
+use burn::tensor::ops::{BoolTensor, FloatTensor};
 use burn::tensor::{DType, TensorPrimitive};
-use rayon::prelude::*;
-use std::time::Instant;
 
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, best_row_major_accum, gemm_a_bt, gemm_a_bt_accum, gemm_a_bt_scaled,
-    gemm_a_strided, gemm_f32_ex, gemm_row_major, gemm_row_major_accum, gemm_row_major_scaled,
+    best_row_major, best_row_major_accum, gemm_a_bt_scaled, gemm_f32_ex, gemm_row_major,
     resize_buf, BlockWorkspace, QUERY_TILE,
 };
 
@@ -118,7 +115,6 @@ fn fused_na_flex_attn_buffer(
     debug_assert_eq!(scores_tile_all.len(), batch * heads * QUERY_TILE * max_n_valid);
     debug_assert_eq!(head_out_tile_all.len(), batch * heads * QUERY_TILE * head_dim);
 
-    let qkv_ptr = qkv.as_ptr();
     // The raw output pointer is passed as an integer so the parallel closure
     // can capture it; each head writes to disjoint regions.
     let attn_addr = attn_out.as_mut_ptr() as usize;
@@ -463,8 +459,7 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
         best_row_major_accum(m, hidden, hidden, &attn_buf, proj_w, &mut norm1_buf);
 
         // ---- 5. LayerNorm2 into workspace.b. ----
-        drop(attn_buf);
-        let mut attn_buf = resize_buf(&mut workspace.b, m * hidden);
+        let attn_buf = resize_buf(&mut workspace.b, m * hidden);
         norm1_buf
             .par_chunks_exact(hidden)
             .zip(attn_buf.par_chunks_exact_mut(hidden))
@@ -554,6 +549,7 @@ impl FusedNaFlexBlockBackend for burn::backend::NdArray {
 // Backend-specific fused HydraMidBlock dispatch
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 pub trait FusedNaFlexAttnBackend: Backend {
     /// Compute `x + proj(attention(norm1(x)))` as a single dispatch.
     fn fused_na_flex_attn(

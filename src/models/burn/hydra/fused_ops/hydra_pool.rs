@@ -1,17 +1,12 @@
 use burn::prelude::*;
-use burn::tensor::ops::{BoolTensor, FloatTensor, ModuleOps};
+use burn::tensor::ops::{BoolTensor, FloatTensor};
 use burn::tensor::{DType, TensorPrimitive};
-use faer::linalg::matmul::matmul;
-use faer::{Accum, MatMut, MatRef, Par};
-use rayon::prelude::*;
-use std::time::Instant;
 
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, best_row_major_accum, fused_attention, gemm_a_bt, gemm_a_bt_scaled,
-    gemm_row_major, gemm_row_major_accum, gemm_row_major_scaled, resize_buf, BlockWorkspace,
-    FastRmsNormBackend, FusedAttentionBackend, QUERY_TILE,
+    best_row_major, fused_attention, gemm_a_bt_scaled, gemm_row_major, gemm_row_major_accum,
+    resize_buf, BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
 };
 #[cfg(feature = "burn-candle")]
 use super::hydra_mid::fused_hydra_mid_block_to_buffer;
@@ -160,7 +155,7 @@ fn fused_hydra_pool_tail_to_buffer(
                 // For moderate batch sizes the strided faer path loses to a
                 // contiguous copy + gemm because the latter has a fast pure-Rust
                 // implementation for these shapes.
-                let mut glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
+                let glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
                 for i in 0..m {
                     let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
                     let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
@@ -227,8 +222,6 @@ impl FusedHydraPoolTailBackend for burn::backend::candle::Candle {
         mask: Option<BoolTensor<Self>>,
         workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
-        use rayon::prelude::*;
-
         let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
         let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
         let v_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v));
