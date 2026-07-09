@@ -48,6 +48,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 | Local ONNX inference (default) | `ort` 2.0.0-rc.12 (ONNX Runtime 1.24), `ndarray` 0.17 |
 | Remote inference (optional) | `reqwest` 0.12 (`blocking` + `rustls-tls`), `base64` 0.22 |
 | Local VLM inference (optional) | `mistralrs` 0.8.1, gated behind `mistralrs` feature |
+| Burn deep learning (optional) | `burn` 0.21 with `faer`, `gemm`, `rayon`, `wide`, `bytemuck`; used for the Hydra-3.5 native Burn backend |
 
 ---
 
@@ -86,6 +87,10 @@ cargo test
   - This feature is **excluded from default builds** for license reasons and is only included in the dedicated HEVC binary.
 - `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; `libwebp` is built from source and linked statically, so no system `libwebp-dev`/`libwebp-devel` is required.
 - `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Uses a statically vendored OpenSSL on Linux.
+- `burn` (optional) — Enables the native Burn deep-learning backend and the Hydra-3.5 tagging model implemented in Burn. Pulls in `faer`, `gemm`, `rayon`, `wide`, and `bytemuck`.
+  - `burn-candle` — Runs the Burn Hydra model on Candle (F32; fastest CPU path on the tested hardware).
+  - `burn-flex` — Runs the Burn Hydra model on Burn's Flex backend (supports BF16).
+  - `burn-openblas` — Runs the Burn Hydra model on NdArray with OpenBLAS.
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
@@ -303,6 +308,7 @@ classify_endpoint = "/classify"
 | 9 | Backend-agnostic model plugin interface + Candle/Remote/ONNX backends | ✅ Complete (`Model`/`Backend` traits, `BackendRegistry`, `CandleBackend`, `RemoteBackend`, `OrtBackend`; SearchWorker runs inference generically) |
 | 10 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
 | 11 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
+| 12 | Native Burn backend for Hydra-3.5 | ✅ Complete (CPU inference ~2.25–2.6 s/image via `burn-candle`; experimental attention/MLP kernels disabled by default; `burn-flex`/`burn-openblas` compile but are slower on the reference hardware) |
 
 The full original plan (database evaluation, Searchables trait definition, extensibility hooks, open questions) lives in `SESSION_NOTES.md` under "Full Architectural Roadmap".
 
@@ -339,6 +345,16 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/models/onnx.rs` | `OrtBackend` for local ONNX inference; heuristic preprocessing/tag discovery |
 | `src/models/mistralrs.rs` | `MistralRsBackend` for local VLM description jobs |
 | `src/models/loader.rs` | Resolves model sources (local path vs. HuggingFace slug, `hf-hub` gated) |
+| `src/models/burn/mod.rs` | Burn backend bootstrap; `BurnBackendType` and `BurnDevice` aliases |
+| `src/models/burn/hydra/mod.rs` | Hydra-3.5 model loader/inference entry point (`HydraModel`) |
+| `src/models/burn/hydra/modules.rs` | Backend-agnostic Hydra-3.5 architecture (`Hydra`, `NaFlexBlock`, `HydraPool`, etc.) |
+| `src/models/burn/hydra/fused_ops.rs` | CPU fast-path traits and GEMM helpers for the Hydra model |
+| `src/models/burn/hydra/fused_ops/na_flex.rs` | Fused NaFlex block fast path |
+| `src/models/burn/hydra/fused_ops/hydra_pool.rs` | Fused HydraPool fast path |
+| `src/models/burn/hydra/fused_ops/hydra_mid.rs` | Fused HydraMidBlock fast path |
+| `src/models/burn/hydra/weights.rs` | Safetensors weight loading and cached contiguous weight buffers |
+| `src/models/burn/hydra/image.rs` | Image preprocessing for Hydra (patches, positional embeddings) |
+| `src/models/burn/kernels.rs` | Portable SIMD elementwise kernels (softmax, layer/RMS norm, GELU, GLU) |
 | `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
 | `src/searchables/engine.rs` | Search orchestration and score aggregation |
 | `src/searchables/filename.rs` | Built-in filename Searchable |
