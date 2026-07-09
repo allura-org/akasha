@@ -843,6 +843,12 @@ impl FusedHydraPoolBackend for burn::backend::candle::Candle {
     }
 }
 
+#[cfg(feature = "burn-flex")]
+impl FusedHydraPoolBackend for burn::backend::flex::Flex {}
+
+#[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
+impl FusedHydraPoolBackend for burn::backend::NdArray {}
+
 // ---------------------------------------------------------------------------
 // Backend-specific fused NaFlex attention dispatch (norm1 + attn + residual)
 // ---------------------------------------------------------------------------
