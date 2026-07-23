@@ -5,7 +5,7 @@ use burn::tensor::{DType, TensorPrimitive};
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, fused_attention, fused_attention_online_softmax,
+    best_row_major, bf16_gemm, fused_attention, fused_attention_online_softmax,
     fused_attention_two_gemm_fallback, fused_glu_custom, gemm_row_major_accum, resize_buf,
     use_online_softmax, BlockWorkspace, FastRmsNormBackend, FusedAttentionBackend,
 };
@@ -142,8 +142,26 @@ fn fused_hydra_pool_tail_to_buffer(
             };
 
             if !used_custom_glu {
-                // GLU projection.
-                best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
+                // GLU projection (no bias), preferring the bf16 kernel when available.
+                let bf16_glu = if let Some(packed) = pool.ff.glu_w_bf16.as_ref() {
+                    if packed.k == hidden && packed.n == glu_out2 {
+                        bf16_gemm::linear_replace_from_f32(
+                            &normed,
+                            hidden,
+                            m,
+                            packed,
+                            &mut glu_proj,
+                            &mut workspace.bf16_scratch,
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !bf16_glu {
+                    best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
+                }
 
                 // In-place GLU activation.
                 glu_proj
@@ -168,32 +186,52 @@ fn fused_hydra_pool_tail_to_buffer(
                         });
                 }
 
-                // Output projection into post_ff.
-                if m <= 1024 {
-                    // For moderate batch sizes the strided faer path loses to a
-                    // contiguous copy + gemm because the latter has a fast pure-Rust
-                    // implementation for these shapes.
-                    let glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
-                    for i in 0..m {
-                        let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
-                        let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
-                        dst.copy_from_slice(src);
+                // Output projection into post_ff. The bf16 kernel converts the
+                // strided activation rows directly into its scratch buffer, so
+                // it replaces both F32 branches below.
+                let bf16_proj = if let Some(packed) = pool.ff.proj_out_w_bf16.as_ref() {
+                    if packed.k == glu_out_dim && packed.n == hidden {
+                        bf16_gemm::linear_accum_from_f32(
+                            &glu_proj,
+                            glu_out2,
+                            m,
+                            packed,
+                            &mut post_ff,
+                            &mut workspace.bf16_scratch,
+                        )
+                    } else {
+                        false
                     }
-                    gemm_row_major_accum(
-                        m,
-                        hidden,
-                        glu_out_dim,
-                        &glu_contig,
-                        proj_out_w,
-                        &mut post_ff,
-                        gemm::Parallelism::Rayon(0),
-                    );
                 } else {
-                    let a =
-                        MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
-                    let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-                    let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
-                    matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+                    false
+                };
+                if !bf16_proj {
+                    if m <= 1024 {
+                        // For moderate batch sizes the strided faer path loses to a
+                        // contiguous copy + gemm because the latter has a fast pure-Rust
+                        // implementation for these shapes.
+                        let glu_contig = resize_buf(&mut workspace.e, m * glu_out_dim);
+                        for i in 0..m {
+                            let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
+                            let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
+                            dst.copy_from_slice(src);
+                        }
+                        gemm_row_major_accum(
+                            m,
+                            hidden,
+                            glu_out_dim,
+                            &glu_contig,
+                            proj_out_w,
+                            &mut post_ff,
+                            gemm::Parallelism::Rayon(0),
+                        );
+                    } else {
+                        let a =
+                            MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
+                        let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
+                        let mut c = MatMut::from_row_major_slice_mut(&mut post_ff, m, hidden);
+                        matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+                    }
                 }
             }
         }
@@ -523,6 +561,7 @@ fn fused_hydra_pool_kv_to_buffer(
     head_dim: usize,
     attn_dim: usize,
     kv_proj_buf: &mut Vec<f32>,
+    bf16_scratch: &mut Vec<half::bf16>,
 ) {
     use rayon::prelude::*;
 
@@ -531,15 +570,48 @@ fn fused_hydra_pool_kv_to_buffer(
     let m = batch * seq_kv;
     let kv_out = attn_dim * 2;
 
-    // Project x to the packed [batch, seq_kv, 2*attn_dim] kv buffer.
+    // Project x to the packed [batch, seq_kv, 2*attn_dim] kv buffer, preferring
+    // the bf16 kernel when the packed weight is available.
     let kv_proj = resize_buf(kv_proj_buf, m * kv_out);
-    best_row_major(m, kv_out, x_hidden, x_slice, kv_w, kv_proj);
-    if let Some(b) = kv_b {
-        kv_proj.par_chunks_exact_mut(kv_out).for_each(|row| {
-            for j in 0..kv_out {
-                row[j] += b[j];
+    let bf16_kv = if let Some(packed) = pool.kv_w_bf16.as_ref() {
+        if packed.k == x_hidden && packed.n == kv_out {
+            if let Some(b) = kv_b {
+                kv_proj
+                    .par_chunks_exact_mut(kv_out)
+                    .for_each(|row| row.copy_from_slice(b));
+                bf16_gemm::linear_accum_from_f32(
+                    x_slice,
+                    x_hidden,
+                    m,
+                    packed,
+                    kv_proj,
+                    bf16_scratch,
+                )
+            } else {
+                bf16_gemm::linear_replace_from_f32(
+                    x_slice,
+                    x_hidden,
+                    m,
+                    packed,
+                    kv_proj,
+                    bf16_scratch,
+                )
             }
-        });
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !bf16_kv {
+        best_row_major(m, kv_out, x_hidden, x_slice, kv_w, kv_proj);
+        if let Some(b) = kv_b {
+            kv_proj.par_chunks_exact_mut(kv_out).for_each(|row| {
+                for j in 0..kv_out {
+                    row[j] += b[j];
+                }
+            });
+        }
     }
 
     // Unpack into [batch, heads, seq_kv, head_dim] k/v buffers.
@@ -761,6 +833,7 @@ impl FusedHydraPoolBackend for burn::backend::candle::Candle {
         let mut k_vec = std::mem::take(&mut workspace.h);
         let mut v_vec = std::mem::take(&mut workspace.i);
         let mut kv_proj = std::mem::take(&mut workspace.g);
+        let mut bf16_scratch = std::mem::take(&mut workspace.bf16_scratch);
         k_vec.resize(batch * heads * seq_kv * head_dim, 0.0);
         v_vec.resize(batch * heads * seq_kv * head_dim, 0.0);
         fused_hydra_pool_kv_to_buffer(
@@ -775,8 +848,10 @@ impl FusedHydraPoolBackend for burn::backend::candle::Candle {
             head_dim,
             attn_dim,
             &mut kv_proj,
+            &mut bf16_scratch,
         );
         workspace.g = kv_proj;
+        workspace.bf16_scratch = bf16_scratch;
         let t_kv = t0.elapsed();
 
         // ---- 2. Cross-attention: merged output into workspace.l. ----

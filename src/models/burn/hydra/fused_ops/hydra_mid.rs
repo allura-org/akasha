@@ -5,9 +5,9 @@ use burn::tensor::{DType, TensorPrimitive};
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, best_row_major_accum, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, fused_glu_custom, gemm_row_major_accum, resize_buf,
-    use_online_softmax, BlockWorkspace,
+    best_row_major, best_row_major_accum, best_row_major_accum_bf16, bf16_gemm,
+    fused_attention_online_softmax, fused_attention_two_gemm_fallback, fused_glu_custom,
+    gemm_row_major_accum, resize_buf, use_online_softmax, BlockWorkspace,
 };
 
 pub trait FusedHydraMidBlockBackend: Backend {
@@ -82,15 +82,45 @@ pub(crate) fn fused_hydra_mid_block_to_buffer(
 
     // ---- 1. Q projection. ----
     // Initialise the output with the bias and accumulate the projection,
-    // saving a separate bias-add pass.
+    // saving a separate bias-add pass. Prefer the bf16 kernel when the packed
+    // weight is available; the pre-fill is idempotent, so falling back to the
+    // F32 GEMM on a shape mismatch is safe.
     let t_q_proj0 = Instant::now();
-    if let Some(ref b) = q_proj_b {
-        out_buf
-            .par_chunks_exact_mut(hidden)
-            .for_each(|row| row.copy_from_slice(b));
-        best_row_major_accum(m, hidden, hidden, x_slice, q_proj_w, out_buf);
+    let bf16_q = if let Some(packed) = block.q_proj_w_bf16.as_ref() {
+        if let Some(ref b) = q_proj_b {
+            out_buf
+                .par_chunks_exact_mut(hidden)
+                .for_each(|row| row.copy_from_slice(b));
+            bf16_gemm::linear_accum_from_f32(
+                x_slice,
+                hidden,
+                m,
+                packed,
+                out_buf,
+                &mut workspace.bf16_scratch,
+            )
+        } else {
+            bf16_gemm::linear_replace_from_f32(
+                x_slice,
+                hidden,
+                m,
+                packed,
+                out_buf,
+                &mut workspace.bf16_scratch,
+            )
+        }
     } else {
-        best_row_major(m, hidden, hidden, x_slice, q_proj_w, out_buf);
+        false
+    };
+    if !bf16_q {
+        if let Some(ref b) = q_proj_b {
+            out_buf
+                .par_chunks_exact_mut(hidden)
+                .for_each(|row| row.copy_from_slice(b));
+            best_row_major_accum(m, hidden, hidden, x_slice, q_proj_w, out_buf);
+        } else {
+            best_row_major(m, hidden, hidden, x_slice, q_proj_w, out_buf);
+        }
     }
     let t_q_proj = t_q_proj0.elapsed();
 
@@ -240,7 +270,17 @@ pub(crate) fn fused_hydra_mid_block_to_buffer(
                 post_row.copy_from_slice(x_row);
             });
     }
-    best_row_major_accum(m, hidden, hidden, out_buf, o_proj_w, &mut post_attn);
+    best_row_major_accum_bf16(
+        m,
+        hidden,
+        hidden,
+        out_buf,
+        hidden,
+        o_proj_w,
+        block.o_proj_w_bf16.as_ref(),
+        &mut post_attn,
+        &mut workspace.bf16_scratch,
+    );
     let t_o_proj = t_o_proj0.elapsed();
 
     // ---- 5. FF: norm + GLU + projection + second residual. ----
@@ -277,7 +317,26 @@ pub(crate) fn fused_hydra_mid_block_to_buffer(
     };
 
     if !used_custom_glu {
-        best_row_major(m, glu_out2, hidden, &out_buf, glu_w, &mut glu_proj);
+        // GLU projection (no bias), preferring the bf16 kernel when available.
+        let bf16_glu = if let Some(packed) = block.ff.glu_w_bf16.as_ref() {
+            if packed.k == hidden && packed.n == glu_out2 {
+                bf16_gemm::linear_replace_from_f32(
+                    out_buf,
+                    hidden,
+                    m,
+                    packed,
+                    &mut glu_proj,
+                    &mut workspace.bf16_scratch,
+                )
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !bf16_glu {
+            best_row_major(m, glu_out2, hidden, &out_buf, glu_w, &mut glu_proj);
+        }
 
         // In-place GLU activation: overwrite the gate half with softplus(gate) * up.
         // The activated values remain packed as [activated_gate, up], which the
@@ -305,30 +364,50 @@ pub(crate) fn fused_hydra_mid_block_to_buffer(
                     out_row.copy_from_slice(post_row);
                 });
         }
-        if m <= 64 {
-            // For tiny batch sizes the strided faer path has high threading overhead.
-            // Copy the activated gate half to a contiguous buffer and use gemm with
-            // no parallelism.
-            let glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
-            for i in 0..m {
-                let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
-                let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
-                dst.copy_from_slice(src);
+        // The bf16 kernel converts the strided activation rows directly into
+        // its scratch buffer, so it replaces both F32 branches below.
+        let bf16_proj = if let Some(packed) = block.ff.proj_out_w_bf16.as_ref() {
+            if packed.k == glu_out_dim && packed.n == hidden {
+                bf16_gemm::linear_accum_from_f32(
+                    &glu_proj,
+                    glu_out2,
+                    m,
+                    packed,
+                    out_buf,
+                    &mut workspace.bf16_scratch,
+                )
+            } else {
+                false
             }
-            gemm_row_major_accum(
-                m,
-                hidden,
-                glu_out_dim,
-                &glu_contig,
-                proj_out_w,
-                out_buf,
-                gemm::Parallelism::None,
-            );
         } else {
-            let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
-            let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
-            let mut c = MatMut::from_row_major_slice_mut(out_buf, m, hidden);
-            matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+            false
+        };
+        if !bf16_proj {
+            if m <= 64 {
+                // For tiny batch sizes the strided faer path has high threading overhead.
+                // Copy the activated gate half to a contiguous buffer and use gemm with
+                // no parallelism.
+                let glu_contig = resize_buf(&mut workspace.d, m * glu_out_dim);
+                for i in 0..m {
+                    let src = &glu_proj[i * glu_out2..i * glu_out2 + glu_out_dim];
+                    let dst = &mut glu_contig[i * glu_out_dim..(i + 1) * glu_out_dim];
+                    dst.copy_from_slice(src);
+                }
+                gemm_row_major_accum(
+                    m,
+                    hidden,
+                    glu_out_dim,
+                    &glu_contig,
+                    proj_out_w,
+                    out_buf,
+                    gemm::Parallelism::None,
+                );
+            } else {
+                let a = MatRef::from_row_major_slice_with_stride(&glu_proj, m, glu_out_dim, glu_out2);
+                let b = MatRef::from_row_major_slice(proj_out_w, glu_out_dim, hidden);
+                let mut c = MatMut::from_row_major_slice_mut(out_buf, m, hidden);
+                matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
+            }
         }
     }
     let t_ff = t_ff0.elapsed();

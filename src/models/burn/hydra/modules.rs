@@ -270,6 +270,13 @@ pub struct NaFlexAttn<B: Backend> {
     pub proj_w_cache: Vec<f32>,
     #[module(skip)]
     pub proj_b_cache: Option<Vec<f32>>,
+
+    /// Pre-packed BF16 weights for the bf16 GEMM kernels (only populated when
+    /// `AKASHA_USE_BF16_GEMM` is active at load time).
+    #[module(skip)]
+    pub qkv_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
+    #[module(skip)]
+    pub proj_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
 }
 
 impl<B: FastLinearBackend + FusedAttentionBackend> NaFlexAttn<B> {
@@ -324,6 +331,13 @@ pub struct NaFlexMlp<B: Backend> {
     /// Pre-packed weights for the custom fused MLP/GLU kernel.
     #[module(skip)]
     pub fc1_w_packed: Option<crate::models::burn::hydra::fused_ops::PackedMlpWeights>,
+
+    /// Pre-packed BF16 weights for the bf16 GEMM kernels (only populated when
+    /// `AKASHA_USE_BF16_GEMM` is active at load time).
+    #[module(skip)]
+    pub fc1_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
+    #[module(skip)]
+    pub fc2_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
 }
 
 impl<B: FusedMlpBackend + Backend> NaFlexMlp<B> {
@@ -365,6 +379,11 @@ pub struct HydraPool<B: Backend> {
     pub kv_w_cache: Vec<f32>,
     #[module(skip)]
     pub kv_b_cache: Option<Vec<f32>>,
+
+    /// Pre-packed BF16 kv projection weight for the bf16 GEMM kernel (only
+    /// populated when `AKASHA_USE_BF16_GEMM` is active at load time).
+    #[module(skip)]
+    pub kv_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
 }
 
 impl<
@@ -403,6 +422,13 @@ pub struct HydraMidBlock<B: Backend> {
     pub o_proj_w_cache: Vec<f32>,
     #[module(skip)]
     pub o_proj_b_cache: Option<Vec<f32>>,
+
+    /// Pre-packed BF16 weights for the bf16 GEMM kernels (only populated when
+    /// `AKASHA_USE_BF16_GEMM` is active at load time).
+    #[module(skip)]
+    pub q_proj_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
+    #[module(skip)]
+    pub o_proj_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
 }
 
 impl<B: FusedGluBackend + FusedAttentionBackend + FastLinearBackend + FastRmsNormBackend>
@@ -502,6 +528,13 @@ pub struct HydraFeedForward<B: Backend> {
     /// Pre-packed weights for the custom fused GLU kernel.
     #[module(skip)]
     pub glu_w_packed: Option<crate::models::burn::hydra::fused_ops::PackedGluWeights>,
+
+    /// Pre-packed BF16 weights for the bf16 GEMM kernels (only populated when
+    /// `AKASHA_USE_BF16_GEMM` is active at load time).
+    #[module(skip)]
+    pub glu_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
+    #[module(skip)]
+    pub proj_out_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
 }
 
 impl<B: FusedGluBackend + FastLinearBackend> HydraFeedForward<B> {

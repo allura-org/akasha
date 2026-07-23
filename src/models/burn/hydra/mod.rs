@@ -287,6 +287,45 @@ mod tests {
             let logits = model.infer_logits(img_path).expect("infer");
             assert!(!logits.is_empty(), "expected non-empty logits");
 
+            // A/B helpers: set AKASHA_HYDRA_LOGITS_DUMP=<dir> to write raw
+            // logits per image, and AKASHA_HYDRA_LOGITS_REF=<dir> to compare
+            // this run against a previous dump (e.g. bf16 vs F32 GEMM paths).
+            let img_name = img_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            if let Ok(dir) = std::env::var("AKASHA_HYDRA_LOGITS_DUMP") {
+                let mut bytes = Vec::with_capacity(logits.len() * 4);
+                for v in &logits {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                std::fs::write(Path::new(&dir).join(format!("{img_name}.f32")), &bytes)
+                    .expect("dump logits");
+            }
+            if let Ok(dir) = std::env::var("AKASHA_HYDRA_LOGITS_REF") {
+                let ref_file = Path::new(&dir).join(format!("{img_name}.f32"));
+                if ref_file.is_file() {
+                    let ref_bytes = std::fs::read(&ref_file).expect("read ref logits");
+                    let ref_logits: Vec<f32> = ref_bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                    assert_eq!(ref_logits.len(), logits.len(), "ref logits length mismatch");
+                    let mut max_logit = 0.0f32;
+                    let mut max_prob = 0.0f32;
+                    for (&r, &l) in ref_logits.iter().zip(&logits) {
+                        max_logit = max_logit.max((r - l).abs());
+                        let pr = 1.0 / (1.0 + (-r).exp());
+                        let pl = 1.0 / (1.0 + (-l).exp());
+                        max_prob = max_prob.max((pr - pl).abs());
+                    }
+                    eprintln!(
+                        "A/B vs {ref_file:?}: max abs logit diff {:.6}, max abs prob diff {:.6}",
+                        max_logit, max_prob
+                    );
+                }
+            }
+
             // Compare probabilities against a PyTorch reference for the canonical image.
             // The reference file contains the *sigmoid* output from Hydra's default
             // `load_model()` call (logit=False), so we apply sigmoid to our raw logits

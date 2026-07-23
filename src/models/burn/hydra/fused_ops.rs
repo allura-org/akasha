@@ -54,6 +54,7 @@ use burn::backend::flex::FlexDevice;
 // NaFlex block, HydraMidBlock, and HydraPool kernels live in submodules so each
 // file stays focused and easier to navigate.
 mod attention;
+pub mod bf16_gemm;
 mod hydra_mid;
 mod hydra_pool;
 mod mlp_glu;
@@ -62,6 +63,7 @@ mod na_flex;
 pub use attention::{
     fused_attention_online_softmax, fused_attention_two_gemm_fallback, use_online_softmax,
 };
+pub use bf16_gemm::PackedBf16Weight;
 pub use hydra_mid::FusedHydraMidBlockBackend;
 pub use hydra_pool::{
     FusedHydraPoolBackend, FusedHydraPoolTailBackend, fused_hydra_pool,
@@ -93,6 +95,8 @@ pub struct BlockWorkspace {
     j: Vec<f32>,
     k: Vec<f32>,
     l: Vec<f32>,
+    /// Reusable bf16 scratch buffer for the BF16 GEMM activation conversion.
+    bf16_scratch: Vec<half::bf16>,
 }
 
 impl BlockWorkspace {
@@ -110,6 +114,7 @@ impl BlockWorkspace {
             j: Vec::new(),
             k: Vec::new(),
             l: Vec::new(),
+            bf16_scratch: Vec::new(),
         }
     }
 
@@ -354,6 +359,39 @@ fn best_row_major_accum(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &
     } else {
         gemm_row_major_accum(m, n, k, a, b, c, gemm::Parallelism::Rayon(0));
     }
+}
+
+/// `C += A @ W`, preferring the BF16 kernel when a packed bf16 weight is
+/// available for this layer.
+///
+/// `a` is an `[m, k]` F32 activation matrix with row stride `a_stride`
+/// (contiguous when `a_stride == k`). `w_f32` is the fallback row-major
+/// `[k, n]` F32 weight used when there is no packed bf16 weight or the shapes
+/// do not match; the fallback requires `a_stride == k`. The caller must
+/// pre-fill `c` (bias/residual epilogue) before calling.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn best_row_major_accum_bf16(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f32],
+    a_stride: usize,
+    w_f32: &[f32],
+    w_bf16: Option<&PackedBf16Weight>,
+    c: &mut [f32],
+    scratch: &mut Vec<half::bf16>,
+) {
+    if let Some(packed) = w_bf16 {
+        if packed.k == k
+            && packed.n == n
+            && bf16_gemm::linear_accum_from_f32(a, a_stride, m, packed, c, scratch)
+        {
+            return;
+        }
+    }
+    debug_assert_eq!(a_stride, k, "F32 GEMM fallback requires contiguous A");
+    best_row_major_accum(m, n, k, a, w_f32, c);
 }
 
 /// Dispatch to the fastest pure-Rust GEMM for the given shape.

@@ -5,9 +5,9 @@ use burn::tensor::{DType, TensorPrimitive};
 use crate::models::burn::kernels as simd_ops;
 
 use super::{
-    best_row_major, best_row_major_accum, fused_attention_online_softmax,
-    fused_attention_two_gemm_fallback, fused_mlp_custom, gemm_a_bt_scaled, gemm_row_major,
-    resize_buf, use_online_softmax, BlockWorkspace, QUERY_TILE,
+    best_row_major, best_row_major_accum, best_row_major_accum_bf16, bf16_gemm,
+    fused_attention_online_softmax, fused_attention_two_gemm_fallback, fused_mlp_custom,
+    gemm_a_bt_scaled, gemm_row_major, resize_buf, use_online_softmax, BlockWorkspace, QUERY_TILE,
 };
 
 pub trait FusedNaFlexBlockBackend: Backend {
@@ -394,14 +394,44 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
 
         // ---- 2. QKV projection. ----
         // Pre-initialise the output with the bias (if any) and accumulate the
-        // matrix product into it, saving a separate bias-add pass.
+        // matrix product into it, saving a separate bias-add pass. Prefer the
+        // bf16 kernel when the packed weight is available; the pre-fill is
+        // idempotent, so falling back to the F32 GEMM on a shape mismatch is
+        // safe.
         let mut qkv = resize_buf(&mut workspace.d, m * qkv_out);
-        if let Some(ref b) = qkv_b {
-            qkv.par_chunks_exact_mut(qkv_out)
-                .for_each(|row| row.copy_from_slice(b));
-            best_row_major_accum(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
+        let bf16_qkv = if let Some(packed) = block.attn.qkv_w_bf16.as_ref() {
+            if let Some(ref b) = qkv_b {
+                qkv.par_chunks_exact_mut(qkv_out)
+                    .for_each(|row| row.copy_from_slice(b));
+                bf16_gemm::linear_accum_from_f32(
+                    &norm1_buf,
+                    hidden,
+                    m,
+                    packed,
+                    &mut qkv,
+                    &mut workspace.bf16_scratch,
+                )
+            } else {
+                bf16_gemm::linear_replace_from_f32(
+                    &norm1_buf,
+                    hidden,
+                    m,
+                    packed,
+                    &mut qkv,
+                    &mut workspace.bf16_scratch,
+                )
+            }
         } else {
-            best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
+            false
+        };
+        if !bf16_qkv {
+            if let Some(ref b) = qkv_b {
+                qkv.par_chunks_exact_mut(qkv_out)
+                    .for_each(|row| row.copy_from_slice(b));
+                best_row_major_accum(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
+            } else {
+                best_row_major(m, qkv_out, hidden, &norm1_buf, qkv_w, &mut qkv);
+            }
         }
 
         // ---- 3. Attention from packed QKV, writing merged output into workspace.b. ----
@@ -448,7 +478,17 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                     out_row.copy_from_slice(x_row);
                 });
         }
-        best_row_major_accum(m, hidden, hidden, &attn_buf, proj_w, &mut norm1_buf);
+        best_row_major_accum_bf16(
+            m,
+            hidden,
+            hidden,
+            &attn_buf,
+            hidden,
+            proj_w,
+            block.attn.proj_w_bf16.as_ref(),
+            &mut norm1_buf,
+            &mut workspace.bf16_scratch,
+        );
 
         // ---- 5. LayerNorm2 into workspace.b. ----
         let attn_buf = resize_buf(&mut workspace.b, m * hidden);
@@ -470,14 +510,50 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
 
         if !used_custom_mlp {
             // Initialise the MLP hidden buffer with the fc1 bias and accumulate the
-            // fc1 projection, saving a separate bias-add pass.
-            if let Some(ref b) = fc1_b {
-                mlp_hidden_buf
-                    .par_chunks_exact_mut(fc1_hidden)
-                    .for_each(|row| row.copy_from_slice(b));
-                best_row_major_accum(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+            // fc1 projection, saving a separate bias-add pass. Prefer the bf16
+            // kernel when the packed weight is available.
+            let bf16_fc1 = if let Some(packed) = block.mlp.fc1_w_bf16.as_ref() {
+                if let Some(ref b) = fc1_b {
+                    mlp_hidden_buf
+                        .par_chunks_exact_mut(fc1_hidden)
+                        .for_each(|row| row.copy_from_slice(b));
+                    bf16_gemm::linear_accum_from_f32(
+                        &attn_buf,
+                        hidden,
+                        m,
+                        packed,
+                        &mut mlp_hidden_buf,
+                        &mut workspace.bf16_scratch,
+                    )
+                } else {
+                    bf16_gemm::linear_replace_from_f32(
+                        &attn_buf,
+                        hidden,
+                        m,
+                        packed,
+                        &mut mlp_hidden_buf,
+                        &mut workspace.bf16_scratch,
+                    )
+                }
             } else {
-                best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+                false
+            };
+            if !bf16_fc1 {
+                if let Some(ref b) = fc1_b {
+                    mlp_hidden_buf
+                        .par_chunks_exact_mut(fc1_hidden)
+                        .for_each(|row| row.copy_from_slice(b));
+                    best_row_major_accum(
+                        m,
+                        fc1_hidden,
+                        hidden,
+                        &attn_buf,
+                        fc1_w,
+                        &mut mlp_hidden_buf,
+                    );
+                } else {
+                    best_row_major(m, fc1_hidden, hidden, &attn_buf, fc1_w, &mut mlp_hidden_buf);
+                }
             }
             simd_ops::gelu_approx_tanh_in_place(&mut mlp_hidden_buf);
 
@@ -497,7 +573,17 @@ impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
                         out_row.copy_from_slice(post_row);
                     });
             }
-            best_row_major_accum(m, hidden, fc1_hidden, &mlp_hidden_buf, fc2_w, out);
+            best_row_major_accum_bf16(
+                m,
+                hidden,
+                fc1_hidden,
+                &mlp_hidden_buf,
+                fc1_hidden,
+                fc2_w,
+                block.mlp.fc2_w_bf16.as_ref(),
+                out,
+                &mut workspace.bf16_scratch,
+            );
         }
 
         tracing::debug!(

@@ -349,6 +349,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/models/burn/hydra/mod.rs` | Hydra-3.5 model loader/inference entry point (`HydraModel`) |
 | `src/models/burn/hydra/modules.rs` | Backend-agnostic Hydra-3.5 architecture (`Hydra`, `NaFlexBlock`, `HydraPool`, etc.) |
 | `src/models/burn/hydra/fused_ops.rs` | CPU fast-path traits and GEMM helpers for the Hydra model |
+| `src/models/burn/hydra/fused_ops/bf16_gemm.rs` | BF16 GEMM (AVX512-BF16 `VDPBF16PS`, F32 accum) with packed weights; env `AKASHA_USE_BF16_GEMM` (default on when the CPU supports avx512bf16) |
 | `src/models/burn/hydra/fused_ops/na_flex.rs` | Fused NaFlex block fast path |
 | `src/models/burn/hydra/fused_ops/hydra_pool.rs` | Fused HydraPool fast path |
 | `src/models/burn/hydra/fused_ops/hydra_mid.rs` | Fused HydraMidBlock fast path |
