@@ -316,7 +316,7 @@ fn pack_bf16_w(w: &[f32], k: usize, n: usize, enabled: bool) -> Option<PackedBf1
         Some(packed) => Some(packed),
         None => {
             tracing::warn!(
-                "bf16 GEMM: skipping weight pack for shape [{k}, {n}] (requires even k and n % 32 == 0); using F32 GEMM"
+                "bf16 GEMM: skipping weight pack for shape [{k}, {n}] (requires even k); using F32 GEMM"
             );
             None
         }

@@ -45,16 +45,17 @@ fn to_bf16(src: &[f32]) -> Vec<bf16> {
 /// broadcast one A pair and FMA against 32 columns per instruction pair.
 fn pack_b(b: &[bf16], k: usize, n: usize) -> Vec<u32> {
     assert_eq!(k % 2, 0, "prototype requires even k");
-    assert_eq!(n % NC, 0, "prototype requires n divisible by {NC}");
-    let n_tiles = n / NC;
+    let n_tiles = n.div_ceil(NC);
     let mut packed = vec![0u32; n_tiles * (k / 2) * NC];
     for nt in 0..n_tiles {
         let c0 = nt * NC;
         for kp in 0..k / 2 {
             for l in 0..NC {
-                let lo = b[2 * kp * n + c0 + l].to_bits() as u32;
-                let hi = b[(2 * kp + 1) * n + c0 + l].to_bits() as u32;
-                packed[(nt * (k / 2) + kp) * NC + l] = lo | (hi << 16);
+                if c0 + l < n {
+                    let lo = b[2 * kp * n + c0 + l].to_bits() as u32;
+                    let hi = b[(2 * kp + 1) * n + c0 + l].to_bits() as u32;
+                    packed[(nt * (k / 2) + kp) * NC + l] = lo | (hi << 16);
+                }
             }
         }
     }
@@ -84,7 +85,7 @@ unsafe fn bf16_gemm_avx512(
 ) {
     use std::arch::x86_64::*;
 
-    let n_tiles = n / NC;
+    let n_tiles = n.div_ceil(NC);
     let tile_stride = (k / 2) * NC;
     let kh = k / 2;
 
@@ -134,10 +135,23 @@ unsafe fn micro_6x32(
             acc1[i] = _mm512_dpbf16_ps(acc1[i], av, b1);
         }
     }
-    for i in 0..rows {
-        let dst = c_base.add(i * n + c_col);
-        _mm512_storeu_ps(dst, acc0[i]);
-        _mm512_storeu_ps(dst.add(16), acc1[i]);
+    let rem = n - c_col;
+    if rem >= NC {
+        for i in 0..rows {
+            let dst = c_base.add(i * n + c_col);
+            _mm512_storeu_ps(dst, acc0[i]);
+            _mm512_storeu_ps(dst.add(16), acc1[i]);
+        }
+    } else {
+        let lo = rem.min(16) as u16;
+        let hi = rem.saturating_sub(16) as u16;
+        let mask_lo: __mmask16 = if lo >= 16 { 0xFFFF } else { (1 << lo) - 1 };
+        let mask_hi: __mmask16 = if hi >= 16 { 0xFFFF } else { (1 << hi) - 1 };
+        for i in 0..rows {
+            let dst = c_base.add(i * n + c_col);
+            _mm512_mask_storeu_ps(dst, mask_lo, acc0[i]);
+            _mm512_mask_storeu_ps(dst.add(16), mask_hi, acc1[i]);
+        }
     }
 }
 
@@ -160,7 +174,7 @@ unsafe fn bf16_gemm_avx512_blocked(
     /// 32-column tiles per n-group.
     const GT: usize = 32;
 
-    let n_tiles = n / NC;
+    let n_tiles = n.div_ceil(NC);
     let tile_stride = (k / 2) * NC;
     let kh = k / 2;
     let n_mb = m.div_ceil(MC);
@@ -383,10 +397,12 @@ fn bf16_pool_ff_bench() {
         rayon::current_num_threads()
     );
     // Hydra-3.5 hot shapes: pool FF is the single biggest GEMM in the model;
-    // mlp_fc1/mlp_fc2/qkv dominate the 27 NaFlex blocks.
+    // mlp_fc1/mlp_fc2/qkv dominate the 27 NaFlex blocks. Note fc1's n = 4304
+    // (not 4608 — the real MLP hidden dim), which exercises the padded-n
+    // masked-store edge tile.
     bench_shape("pool_ff", 8886, 2048, 10240);
     bench_shape("pool_proj", 8886, 5120, 2048);
-    bench_shape("mlp_fc1", 1024, 1152, 4608);
-    bench_shape("mlp_fc2", 1024, 4608, 1152);
+    bench_shape("mlp_fc1", 1024, 1152, 4304);
+    bench_shape("mlp_fc2", 1024, 4304, 1152);
     bench_shape("qkv", 1024, 1152, 3456);
 }

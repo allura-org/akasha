@@ -76,8 +76,10 @@ pub fn use_bf16_gemm() -> bool {
 /// A BF16 weight matrix pre-packed for the bf16 microkernel.
 ///
 /// The original weight is row-major `[k, n]` (Burn's `[in, out]` layout); the
-/// packed layout is `n/32` tiles, each holding `k/2` pair-rows of 32 u32 lanes
-/// where each lane packs `{B[2kp][c], B[2kp+1][c]}`.
+/// packed layout is `ceil(n/32)` tiles, each holding `k/2` pair-rows of 32 u32
+/// lanes where each lane packs `{B[2kp][c], B[2kp+1][c]}`. When `n` is not a
+/// multiple of 32 the last tile is zero-padded; the kernel masks off the
+/// padding on store.
 #[derive(Debug, Clone)]
 pub struct PackedBf16Weight {
     packed: Vec<u32>,
@@ -85,24 +87,28 @@ pub struct PackedBf16Weight {
     pub k: usize,
     /// Output dimension (`out_features`).
     pub n: usize,
+    /// `n` rounded up to a multiple of [`NC`]; number of packed columns.
+    n_padded: usize,
 }
 
 impl PackedBf16Weight {
     /// Pack a row-major `[k, n]` F32 weight cache.
     ///
-    /// Returns `None` when the shape is incompatible with the kernel (odd `k`
-    /// or `n` not divisible by 32) so the caller can keep using the F32 path.
+    /// Returns `None` when the shape is incompatible with the kernel (odd `k`)
+    /// so the caller can keep using the F32 path. Any `n` is accepted; the
+    /// final 32-column tile is zero-padded as needed.
     /// The F32 -> bf16 conversion is exact for the Hydra checkpoint, whose
     /// weights are natively BF16.
     pub fn pack_f32(w: &[f32], k: usize, n: usize) -> Option<Self> {
-        if k == 0 || n == 0 || w.len() != k * n || k % 2 != 0 || n % NC != 0 {
+        if k == 0 || n == 0 || w.len() != k * n || k % 2 != 0 {
             return None;
         }
         let mut b = vec![bf16::ZERO; k * n];
         b.par_iter_mut().zip(w.par_iter()).for_each(|(d, &v)| {
             *d = bf16::from_f32(v);
         });
-        let n_tiles = n / NC;
+        let n_padded = n.div_ceil(NC) * NC;
+        let n_tiles = n_padded / NC;
         let kh = k / 2;
         let mut packed = vec![0u32; n_tiles * kh * NC];
         packed
@@ -115,13 +121,17 @@ impl PackedBf16Weight {
                     let r1 = (2 * kp + 1) * n + c0;
                     let dst = &mut tile[kp * NC..(kp + 1) * NC];
                     for l in 0..NC {
-                        let lo = b[r0 + l].to_bits() as u32;
-                        let hi = b[r1 + l].to_bits() as u32;
-                        dst[l] = lo | (hi << 16);
+                        if c0 + l < n {
+                            let lo = b[r0 + l].to_bits() as u32;
+                            let hi = b[r1 + l].to_bits() as u32;
+                            dst[l] = lo | (hi << 16);
+                        } else {
+                            dst[l] = 0;
+                        }
                     }
                 }
             });
-        Some(Self { packed, k, n })
+        Some(Self { packed, k, n, n_padded })
     }
 
     /// Size of the packed weight in bytes.
@@ -259,7 +269,7 @@ unsafe fn gemm_avx512(
     k: usize,
     accumulate: bool,
 ) {
-    let n_tiles = n / NC;
+    let n_tiles = n.div_ceil(NC);
     let tile_stride = (k / 2) * NC;
     let kh = k / 2;
 
@@ -296,7 +306,7 @@ unsafe fn gemm_avx512_blocked(
     /// 32-column tiles per n-group.
     const GT: usize = 32;
 
-    let n_tiles = n / NC;
+    let n_tiles = n.div_ceil(NC);
     let tile_stride = (k / 2) * NC;
     let kh = k / 2;
     let n_mb = m.div_ceil(MC);
@@ -358,14 +368,42 @@ unsafe fn micro_6x32(
             acc1[i] = _mm512_dpbf16_ps(acc1[i], av, b1);
         }
     }
-    for i in 0..rows {
-        let dst = c_base.add(i * n + c_col);
-        if accumulate {
-            _mm512_storeu_ps(dst, _mm512_add_ps(_mm512_loadu_ps(dst), acc0[i]));
-            _mm512_storeu_ps(dst.add(16), _mm512_add_ps(_mm512_loadu_ps(dst.add(16)), acc1[i]));
-        } else {
-            _mm512_storeu_ps(dst, acc0[i]);
-            _mm512_storeu_ps(dst.add(16), acc1[i]);
+    let rem = n - c_col; // valid columns in this tile: NC for full tiles, 1..NC for the edge tile
+    if rem >= NC {
+        for i in 0..rows {
+            let dst = c_base.add(i * n + c_col);
+            if accumulate {
+                _mm512_storeu_ps(dst, _mm512_add_ps(_mm512_loadu_ps(dst), acc0[i]));
+                _mm512_storeu_ps(dst.add(16), _mm512_add_ps(_mm512_loadu_ps(dst.add(16)), acc1[i]));
+            } else {
+                _mm512_storeu_ps(dst, acc0[i]);
+                _mm512_storeu_ps(dst.add(16), acc1[i]);
+            }
+        }
+    } else {
+        // Edge tile: mask off the zero-padded columns so we never write past
+        // the end of a C row.
+        let lo = rem.min(16) as u16;
+        let hi = rem.saturating_sub(16) as u16;
+        let mask_lo: __mmask16 = if lo >= 16 { 0xFFFF } else { (1 << lo) - 1 };
+        let mask_hi: __mmask16 = if hi >= 16 { 0xFFFF } else { (1 << hi) - 1 };
+        for i in 0..rows {
+            let dst = c_base.add(i * n + c_col);
+            if accumulate {
+                _mm512_mask_storeu_ps(
+                    dst,
+                    mask_lo,
+                    _mm512_add_ps(_mm512_maskz_loadu_ps(mask_lo, dst), acc0[i]),
+                );
+                _mm512_mask_storeu_ps(
+                    dst.add(16),
+                    mask_hi,
+                    _mm512_add_ps(_mm512_maskz_loadu_ps(mask_hi, dst.add(16)), acc1[i]),
+                );
+            } else {
+                _mm512_mask_storeu_ps(dst, mask_lo, acc0[i]);
+                _mm512_mask_storeu_ps(dst.add(16), mask_hi, acc1[i]);
+            }
         }
     }
 }
@@ -512,10 +550,12 @@ mod tests {
     #[test]
     fn bf16_gemm_matches_f32_on_hydra_shapes() {
         // NaFlex qkv / o_proj, fc1, fc2 and pool kv shapes with a small m.
+        // fc1's n = 4304 is not a multiple of 32 and exercises the padded-n
+        // edge tile with masked stores.
         check_shape(37, 1152, 3456);
         check_shape(37, 1152, 1152);
-        check_shape(37, 1152, 4608);
-        check_shape(37, 4608, 1152);
+        check_shape(37, 1152, 4304);
+        check_shape(37, 4304, 1152);
         check_shape(37, 2048, 4096);
     }
 
@@ -540,9 +580,9 @@ mod tests {
 
     #[test]
     fn incompatible_shapes_fall_back() {
-        // Odd k and n not divisible by NC must not pack.
+        // Odd k must not pack; any n is accepted (edge tile is zero-padded).
         assert!(PackedBf16Weight::pack_f32(&rand_vec(7 * 32), 7, 32).is_none());
-        assert!(PackedBf16Weight::pack_f32(&rand_vec(8 * 30), 8, 30).is_none());
+        assert!(PackedBf16Weight::pack_f32(&rand_vec(8 * 30), 8, 30).is_some());
 
         // Mismatched activation buffers must report failure without touching C.
         let packed = PackedBf16Weight::pack_f32(&rand_vec(64 * 96), 64, 96).unwrap();
@@ -589,5 +629,35 @@ mod tests {
             max_diff = max_diff.max((x + 0.5 - y).abs());
         }
         assert!(max_diff < 1e-3, "replace vs accum mismatch: {max_diff}");
+    }
+
+    #[test]
+    fn scalar_fallback_matches_avx512_padded_n() {
+        // n = 100 exercises the masked-store edge tile (100 % 32 = 4).
+        let (m, k, n) = (37, 64, 100);
+        let a_f32 = rand_vec(m * k);
+        let w_f32 = rand_vec(k * n);
+        let packed = PackedBf16Weight::pack_f32(&w_f32, k, n).unwrap();
+        let mut a_bf = vec![bf16::ZERO; m * k];
+        f32_to_bf16_strided(&a_f32, k, &mut a_bf, m, k);
+
+        for accumulate in [true, false] {
+            let mut c = vec![0.5f32; m * n];
+            if accumulate {
+                gemm_accum(&a_bf, &packed, &mut c, m);
+            } else {
+                gemm_replace(&a_bf, &packed, &mut c, m);
+            }
+            let mut c_scalar = vec![0.5f32; m * n];
+            gemm_scalar(&a_bf, &packed.packed, &mut c_scalar, m, n, k, accumulate);
+            let mut max_diff = 0.0f32;
+            for (x, y) in c.iter().zip(c_scalar.iter()) {
+                max_diff = max_diff.max((x - y).abs());
+            }
+            assert!(
+                max_diff < 1e-3,
+                "padded-n mismatch (accumulate={accumulate}): {max_diff}"
+            );
+        }
     }
 }
