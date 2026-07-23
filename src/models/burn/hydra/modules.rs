@@ -70,6 +70,20 @@ impl<
         pos_embed: Tensor<B, 3>,
         mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 2> {
+        let mut workspace = BlockWorkspace::new();
+        self.forward_with_workspace(patches, pos_embed, mask, &mut workspace)
+    }
+
+    /// Forward pass with a caller-provided workspace. Keeping the workspace
+    /// alive across calls avoids re-allocating (and page-faulting) the large
+    //  pool/FF scratch buffers on every image.
+    pub fn forward_with_workspace(
+        &self,
+        patches: Tensor<B, 3>,
+        pos_embed: Tensor<B, 3>,
+        mask: Option<Tensor<B, 2, Bool>>,
+        mut workspace: &mut BlockWorkspace,
+    ) -> Tensor<B, 2> {
         let t0 = Instant::now();
         let [batch, seq, _patch_dim] = patches.dims();
         let pos_embed = pos_embed.reshape([batch, seq, 1152]);
@@ -93,8 +107,6 @@ impl<
         // `true` = attend, so invert the mask.
         let attn_mask: Option<Tensor<B, 4, Bool>> =
             mask.map(|m| m.reshape([batch, 1, 1, seq]).bool_not());
-
-        let mut workspace = BlockWorkspace::new();
 
         let t1 = Instant::now();
         // For F32 backends that support it, run all NaFlex blocks directly on

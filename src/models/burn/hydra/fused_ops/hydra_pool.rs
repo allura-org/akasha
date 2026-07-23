@@ -116,14 +116,17 @@ fn fused_hydra_pool_tail_to_buffer(
             let mut post_ff = resize_buf(&mut workspace.a, m * hidden);
             let normed = resize_buf(&mut workspace.c, m * hidden);
             let mut glu_proj = resize_buf(&mut workspace.d, m * glu_out2);
+            let t_alloc = t_ff0.elapsed();
 
             // Layer norm.
+            let t_norm0 = Instant::now();
             x_slice
                 .par_chunks_exact(hidden)
                 .zip(normed.par_chunks_exact_mut(hidden))
                 .for_each(|(row_x, row_n)| {
                     simd_ops::layer_norm_row(row_x, ff_gamma, ff_beta, eps, row_n);
                 });
+            let t_norm = t_norm0.elapsed();
 
             // Try the custom fused GLU kernel first.
             let used_custom_glu = if let Some(packed) = pool.ff.glu_w_packed.as_ref() {
@@ -143,6 +146,7 @@ fn fused_hydra_pool_tail_to_buffer(
 
             if !used_custom_glu {
                 // GLU projection (no bias), preferring the bf16 kernel when available.
+                let t_glu0 = Instant::now();
                 let bf16_glu = if let Some(packed) = pool.ff.glu_w_bf16.as_ref() {
                     if packed.k == hidden && packed.n == glu_out2 {
                         bf16_gemm::linear_replace_from_f32(
@@ -162,15 +166,18 @@ fn fused_hydra_pool_tail_to_buffer(
                 if !bf16_glu {
                     best_row_major(m, glu_out2, hidden, &normed, glu_w, &mut glu_proj);
                 }
+                let t_glu = t_glu0.elapsed();
 
                 // In-place GLU activation.
+                let t_act0 = Instant::now();
                 glu_proj
                     .par_chunks_exact_mut(glu_out2)
                     .for_each(|row| simd_ops::glu_softplus_in_place_interleaved(row, glu_out_dim));
+                let t_act = t_act0.elapsed();
 
                 // Initialise post_ff with the residual (+ bias) and accumulate the
                 // output projection, avoiding a separate elementwise pass.
-                if let Some(ref b) = proj_out_b {
+                let t_res0 = Instant::now();                if let Some(ref b) = proj_out_b {
                     post_ff
                         .par_chunks_exact_mut(hidden)
                         .zip(x_slice.par_chunks_exact(hidden))
@@ -186,9 +193,12 @@ fn fused_hydra_pool_tail_to_buffer(
                         });
                 }
 
+                let t_res = t_res0.elapsed();
+
                 // Output projection into post_ff. The bf16 kernel converts the
                 // strided activation rows directly into its scratch buffer, so
                 // it replaces both F32 branches below.
+                let t_proj0 = Instant::now();
                 let bf16_proj = if let Some(packed) = pool.ff.proj_out_w_bf16.as_ref() {
                     if packed.k == glu_out_dim && packed.n == hidden {
                         bf16_gemm::linear_accum_from_f32(
@@ -233,6 +243,18 @@ fn fused_hydra_pool_tail_to_buffer(
                         matmul(c.as_mut(), Accum::Add, a, b, 1.0f32, Par::rayon(0));
                     }
                 }
+                let t_proj = t_proj0.elapsed();
+                tracing::debug!(
+                    "pool_ff detail: alloc={:.3}s norm={:.3}s glu_gemm={:.3}s act={:.3}s residual={:.3}s proj={:.3}s (bf16_glu={} bf16_proj={})",
+                    t_alloc.as_secs_f64(),
+                    t_norm.as_secs_f64(),
+                    t_glu.as_secs_f64(),
+                    t_act.as_secs_f64(),
+                    t_res.as_secs_f64(),
+                    t_proj.as_secs_f64(),
+                    bf16_glu,
+                    bf16_proj,
+                );
             }
         }
         std::mem::take(&mut workspace.a)

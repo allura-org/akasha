@@ -47,6 +47,10 @@ pub struct HydraModel<B: Backend> {
     top_k: Option<usize>,
     max_seq_len: usize,
     background: [u8; 3],
+    /// Persistent scratch buffers for the fused kernels. Kept across forwards
+    /// so the large pool/FF buffers (~0.5 GB) are allocated and page-faulted
+    /// once per model instead of once per image.
+    workspace: std::sync::Mutex<fused_ops::BlockWorkspace>,
     _phantom: std::marker::PhantomData<B>,
 }
 
@@ -89,6 +93,7 @@ impl<
             top_k,
             max_seq_len: 1024,
             background,
+            workspace: std::sync::Mutex::new(fused_ops::BlockWorkspace::new()),
             _phantom: std::marker::PhantomData,
         })
     }
@@ -157,7 +162,14 @@ impl<
         };
         let t_tensors = t1.elapsed();
 
-        let logits = self.model.forward(patches, pos_embed, mask);
+        let logits = {
+            let mut workspace = self
+                .workspace
+                .lock()
+                .expect("hydra workspace mutex poisoned");
+            self.model
+                .forward_with_workspace(patches, pos_embed, mask, &mut workspace)
+        };
         let t_forward = t1.elapsed();
 
         // Convert to f32 for post-processing.
