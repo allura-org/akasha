@@ -91,6 +91,8 @@ cargo test
   - `burn-candle` — Runs the Burn Hydra model on Candle (F32; fastest CPU path on the tested hardware).
   - `burn-flex` — Runs the Burn Hydra model on Burn's Flex backend (supports BF16).
   - `burn-openblas` — Runs the Burn Hydra model on NdArray with OpenBLAS.
+  - `burn-cuda` — Runs the Burn Hydra model on the CubeCL CUDA backend (GPU; generic tensor-op fallback only, no fused kernels). Takes priority over all other burn backend features. Distinct from the top-level `cuda` feature, which is for the candle CUDA path.
+  - `burn-wgpu` — Runs the Burn Hydra model on the CubeCL wgpu backend (GPU via Vulkan/Metal/DX12/GL; generic tensor-op fallback only).
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 

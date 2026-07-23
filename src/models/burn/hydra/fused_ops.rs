@@ -533,6 +533,12 @@ impl FastLinearBackend for burn::backend::candle::Candle {
 #[cfg(feature = "burn-flex")]
 impl FastLinearBackend for burn::backend::flex::Flex {}
 
+#[cfg(feature = "burn-wgpu")]
+impl FastLinearBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FastLinearBackend for burn::backend::Cuda {}
+
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FastLinearBackend for burn::backend::NdArray {}
 
@@ -919,6 +925,12 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
 
 #[cfg(feature = "burn-flex")]
 impl FusedMlpBackend for burn::backend::flex::Flex {}
+
+#[cfg(feature = "burn-wgpu")]
+impl FusedMlpBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedMlpBackend for burn::backend::Cuda {}
 
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedMlpBackend for burn::backend::NdArray {}
@@ -1343,6 +1355,14 @@ impl FusedGluBackend for burn::backend::candle::Candle {
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedGluBackend for burn::backend::NdArray {}
 
+// GPU backends use the trait's generic tensor-op fallback; the Flex override
+// below relies on Flex-specific raw storage access and does not apply.
+#[cfg(feature = "burn-wgpu")]
+impl FusedGluBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedGluBackend for burn::backend::Cuda {}
+
 #[cfg(feature = "burn-flex")]
 impl FusedGluBackend for burn::backend::flex::Flex {
     fn fused_linear_glu(x: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self> {
@@ -1483,6 +1503,12 @@ impl FastRmsNormBackend for burn::backend::candle::Candle {
 #[cfg(feature = "burn-flex")]
 impl FastRmsNormBackend for burn::backend::flex::Flex {}
 
+#[cfg(feature = "burn-wgpu")]
+impl FastRmsNormBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FastRmsNormBackend for burn::backend::Cuda {}
+
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FastRmsNormBackend for burn::backend::NdArray {}
 
@@ -1567,6 +1593,14 @@ impl FusedAttentionBackend for burn::backend::flex::Flex {
         }
     }
 }
+
+// GPU backends use the trait's default (generic Burn attention); the Flex
+// override above is identical to that default.
+#[cfg(feature = "burn-wgpu")]
+impl FusedAttentionBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedAttentionBackend for burn::backend::Cuda {}
 
 #[cfg(all(feature = "burn-candle", feature = "burn-flex"))]
 impl FusedAttentionBackend for burn::backend::candle::Candle {

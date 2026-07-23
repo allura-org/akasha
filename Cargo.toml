@@ -16,6 +16,8 @@ burn = ["dep:burn", "dep:faer", "dep:gemm", "dep:rayon", "dep:safetensors", "dep
 burn-flex = ["burn", "burn/flex"]
 burn-candle = ["burn", "burn/candle"]
 burn-openblas = ["burn", "burn/openblas"]
+burn-wgpu = ["burn", "burn/wgpu"]
+burn-cuda = ["burn", "burn/cuda"]
 cuda = ["candle", "candle-core/cuda", "mistralrs?/cuda"]
 
 [dependencies]

@@ -437,6 +437,56 @@ impl FusedHydraPoolTailBackend for burn::backend::flex::Flex {
     }
 }
 
+#[cfg(feature = "burn-wgpu")]
+impl FusedHydraPoolTailBackend for burn::backend::Wgpu {
+    fn fused_hydra_pool_tail(
+        x: FloatTensor<Self>,
+        pool: &crate::models::burn::hydra::modules::HydraPool<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+        _workspace: &mut BlockWorkspace,
+    ) -> FloatTensor<Self> {
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
+        let v_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v));
+        let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+        let mut out = x_t.clone() + pool.ff.forward(x_t);
+        for block in &pool.mid_blocks {
+            out = block.forward_fused(out, &k_t, &v_t, mask_t.clone());
+        }
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("HydraPool tail returns a float tensor"),
+        }
+    }
+}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedHydraPoolTailBackend for burn::backend::Cuda {
+    fn fused_hydra_pool_tail(
+        x: FloatTensor<Self>,
+        pool: &crate::models::burn::hydra::modules::HydraPool<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+        _workspace: &mut BlockWorkspace,
+    ) -> FloatTensor<Self> {
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let k_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k));
+        let v_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v));
+        let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+        let mut out = x_t.clone() + pool.ff.forward(x_t);
+        for block in &pool.mid_blocks {
+            out = block.forward_fused(out, &k_t, &v_t, mask_t.clone());
+        }
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("HydraPool tail returns a float tensor"),
+        }
+    }
+}
+
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedHydraPoolTailBackend for burn::backend::NdArray {
     fn fused_hydra_pool_tail(
@@ -942,6 +992,12 @@ impl FusedHydraPoolBackend for burn::backend::candle::Candle {
 
 #[cfg(feature = "burn-flex")]
 impl FusedHydraPoolBackend for burn::backend::flex::Flex {}
+
+#[cfg(feature = "burn-wgpu")]
+impl FusedHydraPoolBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedHydraPoolBackend for burn::backend::Cuda {}
 
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedHydraPoolBackend for burn::backend::NdArray {}

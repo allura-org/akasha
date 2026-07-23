@@ -6,6 +6,8 @@
 //!
 //! By default the Burn NdArray backend is used (pure Rust, F32 only).
 //!
+//! - `burn-cuda` — CubeCL CUDA backend (GPU); takes priority over all others.
+//! - `burn-wgpu` — CubeCL wgpu backend (GPU via Vulkan/Metal/DX12/GL).
 //! - `burn-flex` — Burn's Flex backend, supports BF16/F16 at runtime.
 //! - `burn-candle` — Burn's Candle backend; much faster CPU GEMM and can use
 //!   CUDA/Metal via Candle's own feature flags.
@@ -23,7 +25,24 @@ use super::{Backend, Model};
 pub mod hydra;
 pub mod kernels;
 
-#[cfg(feature = "burn-candle")]
+#[cfg(feature = "burn-cuda")]
+mod backend {
+    // CubeCL CUDA backend. Runs the generic Burn tensor ops on the GPU via
+    // CubeCL-generated kernels; no hand-fused fast paths yet.
+    pub type BurnBackendType = burn::backend::Cuda;
+    pub type BurnDevice = burn::backend::cuda::CudaDevice;
+}
+
+#[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
+mod backend {
+    // CubeCL wgpu backend. Runs the generic Burn tensor ops on the GPU via
+    // wgpu (Vulkan/Metal/DX12/GL selected at runtime); no hand-fused fast
+    // paths yet.
+    pub type BurnBackendType = burn::backend::Wgpu;
+    pub type BurnDevice = burn::backend::wgpu::WgpuDevice;
+}
+
+#[cfg(all(feature = "burn-candle", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
 mod backend {
     // Candle backend uses candle-core under the hood and has much better CPU
     // GEMM than Burn's pure-Rust NdArray/Flex backends.
@@ -31,7 +50,10 @@ mod backend {
     pub type BurnDevice = burn::backend::candle::CandleDevice;
 }
 
-#[cfg(all(feature = "burn-flex", not(feature = "burn-candle")))]
+#[cfg(all(
+    feature = "burn-flex",
+    not(any(feature = "burn-cuda", feature = "burn-wgpu", feature = "burn-candle"))
+))]
 mod backend {
     // Flex implements Backend only for its default type parameters, but it
     // supports BF16/F16 at runtime via explicit DType.
@@ -39,7 +61,12 @@ mod backend {
     pub type BurnDevice = burn::backend::flex::FlexDevice;
 }
 
-#[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
+#[cfg(not(any(
+    feature = "burn-cuda",
+    feature = "burn-wgpu",
+    feature = "burn-candle",
+    feature = "burn-flex"
+)))]
 mod backend {
     pub type BurnBackendType = burn::backend::NdArray;
     pub type BurnDevice = burn::backend::ndarray::NdArrayDevice;

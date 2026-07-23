@@ -5,7 +5,7 @@ use std::time::Instant;
 use burn::module::Param;
 use burn::nn::{LayerNorm, Linear};
 use burn::prelude::*;
-use burn::tensor::{DType, TensorPrimitive};
+use burn::tensor::{BoolStore, DType, TensorPrimitive};
 
 use super::fused_ops::{
     BlockWorkspace, FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
@@ -97,7 +97,12 @@ impl<
         let n_valid: usize = mask
             .as_ref()
             .map(|m| {
-                let data = m.to_data();
+                // CubeCL backends store bools as u8/u32 rather than native
+                // bools, so normalize the readback before slicing.
+                let data = m
+                    .clone()
+                    .to_data()
+                    .convert_dtype(DType::Bool(BoolStore::Native));
                 let slice = data.as_slice::<bool>().expect("mask is contiguous bool");
                 slice.iter().take(seq).filter(|&&b| b).count()
             })
