@@ -59,10 +59,27 @@ impl SearchWorker {
                 tracing::debug!("SearchWorker paused");
                 continue;
             }
-            match self.tick().await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("SearchWorker processed {} jobs", n),
-                Err(e) => tracing::warn!("SearchWorker error: {e}"),
+            // Drain the queue in one go; only the ticker paces *idle* polls.
+            // Claiming once per 5s tick would leave a gap of up to the tick
+            // period whenever a group finishes faster than 5s.
+            loop {
+                let started = std::time::Instant::now();
+                match self.tick().await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let secs = started.elapsed().as_secs_f64();
+                        tracing::info!(
+                            "SearchWorker processed {} jobs in {:.2}s ({:.2} jobs/s)",
+                            n,
+                            secs,
+                            n as f64 / secs
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("SearchWorker error: {e}");
+                        break;
+                    }
+                }
             }
         }
     }
