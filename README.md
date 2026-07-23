@@ -6,6 +6,8 @@ akasha (ah-kuh-sha) is a modern, performance-forward, database-backed image gall
 
 ⚠️  akasha is currently in ALPHA. Most of its features are present, but it is still in heavy flux and the biggest lifts are yet to come!
 
+pairs well with [hypertube](https://github.com/allura-org/hypertube), a unifying gallery-dl (or other things!) server for casual collecting
+
 ## features
 
 - native GUI with Rust+egui (for now...) no webjank.
