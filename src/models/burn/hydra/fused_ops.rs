@@ -1671,10 +1671,20 @@ fn chunked_masked_attention<B: Backend>(
     // Only the broadcastable `[batch, 1, 1, seq_kv]` mask shape can be tiled
     // without also slicing the mask; anything else goes through the full path.
     if mask_t.dims() != [batch, 1, 1, seq_kv] {
+        tracing::warn!(
+            "chunked_masked_attention: non-broadcast mask {:?} (scores would be {} MiB); \
+             falling back to full attention, which may exceed CubeCL's max pool page",
+            mask_t.dims(),
+            scores_bytes / (1024 * 1024),
+        );
         return attention(q, k, v, Some(mask_t), None, AttentionModuleOptions::default());
     }
 
     let chunk = (MAX_SCORES_BYTES / (batch * heads * seq_kv * 4)).max(1);
+    tracing::debug!(
+        "chunked_masked_attention: seq_q={seq_q} chunk={chunk} scores={} MiB",
+        scores_bytes / (1024 * 1024)
+    );
     let mut outs = Vec::new();
     let mut start = 0;
     while start < seq_q {
