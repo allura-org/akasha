@@ -163,10 +163,10 @@ impl<
         let t_tensors = t1.elapsed();
 
         let logits = {
-            let mut workspace = self
-                .workspace
-                .lock()
-                .expect("hydra workspace mutex poisoned");
+            // Recover from poisoning: the workspace is pure scratch memory, so
+            // a panic in a previous forward (e.g. GPU OOM) leaves nothing
+            // inconsistent behind — only buffers to reuse.
+            let mut workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
             self.model
                 .forward_with_workspace(patches, pos_embed, mask, &mut workspace)
         };
