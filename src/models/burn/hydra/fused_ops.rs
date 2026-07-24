@@ -1663,9 +1663,19 @@ fn chunked_masked_attention<B: Backend>(
 
     let scores_bytes = batch * heads * seq_q * seq_kv * 4;
     let Some(mask_t) = mask else {
+        tracing::debug!(
+            "attention: q={:?} kv={seq_kv} mask=None -> fused kernel",
+            [batch, heads, seq_q, head_dim],
+        );
         return attention(q, k, v, None, None, AttentionModuleOptions::default());
     };
     if scores_bytes <= MAX_SCORES_BYTES {
+        tracing::debug!(
+            "attention: q={:?} kv={seq_kv} mask={:?} scores={} MiB -> full (under ceiling)",
+            [batch, heads, seq_q, head_dim],
+            mask_t.dims(),
+            scores_bytes / (1024 * 1024),
+        );
         return attention(q, k, v, Some(mask_t), None, AttentionModuleOptions::default());
     }
     // Only the broadcastable `[batch, 1, 1, seq_kv]` mask shape can be tiled
