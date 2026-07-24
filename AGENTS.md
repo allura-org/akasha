@@ -88,16 +88,16 @@ cargo test
 - `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; `libwebp` is built from source and linked statically, so no system `libwebp-dev`/`libwebp-devel` is required.
 - `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Uses a statically vendored OpenSSL on Linux.
 - `burn` (optional) — Enables the native Burn deep-learning backend and the Hydra-3.5 tagging model implemented in Burn. Pulls in `faer`, `gemm`, `rayon`, `wide`, and `bytemuck`.
-  - `burn-candle` — Runs the Burn Hydra model on Candle (F32; fastest CPU path on the tested hardware).
+  - `burn-candle` — Runs the Burn Hydra model on Candle (F32 + AVX512-BF16 `VDPBF16PS` GEMM kernels for weight-static linears; fastest CPU path, ~1.3 s/image on a Ryzen 7950X).
   - `burn-flex` — Runs the Burn Hydra model on Burn's Flex backend (supports BF16).
   - `burn-openblas` — Runs the Burn Hydra model on NdArray with OpenBLAS.
-  - `burn-cuda` — Runs the Burn Hydra model on the CubeCL CUDA backend (GPU; generic tensor-op fallback only, no fused kernels). Takes priority over all other burn backend features. Distinct from the top-level `cuda` feature, which is for the candle CUDA path.
+  - `burn-cuda` — Runs the Burn Hydra model on the CubeCL CUDA backend (GPU; generic tensor-op fallback only, no fused kernels, ~0.15 s/image on an RTX 4090). Takes priority over all other burn backend features. Distinct from the top-level `cuda` feature, which is for the candle CUDA path. **Link-time caveat:** `cubecl-cuda` unconditionally enables cudarc's `nccl` feature, so `libnccl.so` must be findable at link time (the CUDA toolkit does not ship it; a PyPI `nvidia-nccl-cuXX` wheel works).
   - `burn-wgpu` — Runs the Burn Hydra model on the CubeCL wgpu backend (GPU via Vulkan/Metal/DX12/GL; generic tensor-op fallback only).
 
 **Important:** `sqlx::migrate!()` embeds migrations at compile time. After adding a new migration file, you **must** rebuild (`cargo build` / `cargo run`) before the migration will be applied.
 
 ### Runtime Startup Flow
-1. Initialize `tracing` subscriber at `INFO` level.
+1. Initialize `tracing` subscriber honoring `RUST_LOG` (INFO by default).
 2. Load `Config` from TOML (or create defaults and persist them).
 3. Create a Tokio runtime.
 4. Initialize the SQLite pool and run migrations via `sqlx::migrate!()`.
@@ -109,7 +109,7 @@ cargo test
 8. Changed files are written to the DB in **batches of 500** wrapped in explicit transactions, rather than one implicit transaction per file.
 9. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
 10. Start the filesystem watcher (`watcher::spawn`) for every configured folder. Watcher events are ignored while a manual scan is in flight to avoid races.
-11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`. Jobs are **not** enqueued automatically on scan/import; inference will be triggered manually via the UI in a later milestone.
+11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`. The worker drains the queue within each 5s tick, chunks claimed jobs by each model's `max_batch_size()` (batched inference where supported), and calls `Model::release_memory()` when the queue drains so GPU memory pools return to baseline. Jobs are **not** enqueued automatically on scan/import; inference is triggered manually via the UI.
 
 ---
 
@@ -249,9 +249,11 @@ classify_endpoint = "/classify"
 # cache_mode = "global"  # "global" | "custom" | "disabled"
 # cache_folder = ""      # Defaults to <import_root>/.akasha_thumbnails
 # cache_fallback = "disable"  # "disable" | "global"
+# [models.burn]
+# batch_size = 1        # Burn (Hydra) inference batch size; 1 is fastest on current GPUs
 ```
 
-`exclude`/`include` support exact absolute paths or substring matches against the full path; `exclude` takes precedence. Per-import thumbnail config overrides the global cache location.
+`exclude`/`include` support exact absolute paths or substring matches against the full path; `exclude` takes precedence. Per-import thumbnail config overrides the global cache location. Model-specific option blocks (`[models.jtp3]`, `[models.burn]`) are documented in `config.example.toml`.
 
 ---
 
@@ -310,7 +312,8 @@ classify_endpoint = "/classify"
 | 9 | Backend-agnostic model plugin interface + Candle/Remote/ONNX backends | ✅ Complete (`Model`/`Backend` traits, `BackendRegistry`, `CandleBackend`, `RemoteBackend`, `OrtBackend`; SearchWorker runs inference generically) |
 | 10 | Vector search (HNSW or sqlite-vss) + text search (FTS5) | ❌ Not started |
 | 11 | Unified search UI | 🔄 In progress (search bar + scoring implemented; advanced blending/tuning deferred) |
-| 12 | Native Burn backend for Hydra-3.5 | ✅ Complete (CPU inference ~2.25–2.6 s/image via `burn-candle`; experimental attention/MLP kernels disabled by default; `burn-flex`/`burn-openblas` compile but are slower on the reference hardware) |
+| 12 | Native Burn backend for Hydra-3.5 | ✅ Complete (CPU inference ~1.3 s/image via `burn-candle` + AVX512-BF16 GEMM kernels; experimental Tier-1/2 attention/MLP kernels disabled by default; `burn-flex`/`burn-openblas` compile but are slower on the reference hardware) |
+| 13 | GPU inference for Hydra-3.5 via CubeCL | ✅ Complete (`burn-cuda`/`burn-wgpu` generic tensor-op fallback, ~0.15 s/image on RTX 4090; CubeCL memory bounding + `release_memory` on queue drain; query-tiled attention to stay under CubeCL's max pool page; opt-in `[models.burn] batch_size`, default 1 — batching measured slower than singles on the reference GPU) |
 
 The full original plan (database evaluation, Searchables trait definition, extensibility hooks, open questions) lives in `SESSION_NOTES.md` under "Full Architectural Roadmap".
 
@@ -327,6 +330,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - Missing files (`is_present = 0`) are still shown in the grid and search results with a badge/placeholder; a dedicated hide-missing filter is not yet implemented.
 - **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.
 - **Thumbnail queue velocity tuning:** the scroll-velocity thresholds (60/240 rows/sec) are initial guesses and may need adjustment based on real-world feel.
+- **GPU (CubeCL) notes:** batching is opt-in (`[models.burn] batch_size`, default 1) and currently slower than singles on the reference RTX 4090. Known upstream CubeCL issues: batch ≥16 previously panicked in kernel codegen (avoided by query tiling), and no-mask fused attention materializes a padded scores workspace for unaligned `seq_kv` instead of taking a flash path. `cubecl-cuda` requires `libnccl.so` at link time (see Feature flags). CubeCL memory pools still peak at ~11 GB during an active run by design (page caching); they release on queue drain via `Model::release_memory()`.
 
 ---
 
@@ -350,8 +354,10 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/models/burn/mod.rs` | Burn backend bootstrap; `BurnBackendType` and `BurnDevice` aliases |
 | `src/models/burn/hydra/mod.rs` | Hydra-3.5 model loader/inference entry point (`HydraModel`) |
 | `src/models/burn/hydra/modules.rs` | Backend-agnostic Hydra-3.5 architecture (`Hydra`, `NaFlexBlock`, `HydraPool`, etc.) |
-| `src/models/burn/hydra/fused_ops.rs` | CPU fast-path traits and GEMM helpers for the Hydra model |
+| `src/models/burn/hydra/fused_ops.rs` | CPU fast-path traits, GEMM helpers, and query-tiled GPU attention (`chunked_masked_attention`) for the Hydra model |
 | `src/models/burn/hydra/fused_ops/bf16_gemm.rs` | BF16 GEMM (AVX512-BF16 `VDPBF16PS`, F32 accum) with packed weights; env `AKASHA_USE_BF16_GEMM` (default on when the CPU supports avx512bf16) |
+| `src/models/burn/hydra/fused_ops/attention.rs` | Tier-1 online-softmax fused attention kernel (correct but slower than the two-GEMM path; off by default, `AKASHA_USE_ONLINE_SOFTMAX_ATTENTION=1` to enable) |
+| `src/models/burn/hydra/fused_ops/mlp_glu.rs` | Tier-2 custom packed MLP/GLU kernel (correct but slower than the GEMM path; off by default, `AKASHA_USE_CUSTOM_MLP_GLU=1` to enable) |
 | `src/models/burn/hydra/fused_ops/na_flex.rs` | Fused NaFlex block fast path |
 | `src/models/burn/hydra/fused_ops/hydra_pool.rs` | Fused HydraPool fast path |
 | `src/models/burn/hydra/fused_ops/hydra_mid.rs` | Fused HydraMidBlock fast path |
