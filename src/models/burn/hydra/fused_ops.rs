@@ -1594,13 +1594,104 @@ impl FusedAttentionBackend for burn::backend::flex::Flex {
     }
 }
 
-// GPU backends use the trait's default (generic Burn attention); the Flex
-// override above is identical to that default.
+// GPU backends tile masked attention over the query dimension (see below).
 #[cfg(feature = "burn-wgpu")]
-impl FusedAttentionBackend for burn::backend::Wgpu {}
+impl FusedAttentionBackend for burn::backend::Wgpu {
+    fn fused_attention(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        match chunked_masked_attention(
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(q)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v)),
+            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+        )
+        .into_primitive()
+        {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("attention returns a float tensor"),
+        }
+    }
+}
 
 #[cfg(feature = "burn-cuda")]
-impl FusedAttentionBackend for burn::backend::Cuda {}
+impl FusedAttentionBackend for burn::backend::Cuda {
+    fn fused_attention(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        match chunked_masked_attention(
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(q)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v)),
+            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+        )
+        .into_primitive()
+        {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("attention returns a float tensor"),
+        }
+    }
+}
+
+/// Masked attention tiled over the query dimension.
+///
+/// Burn's generic attention materializes the full `[batch, heads, seq_q,
+/// seq_kv]` scores tensor when a mask is present. For Hydra's pool and
+/// mid-block cross-attention (`[batch, 32, 8886, seq_kv]`) that is multiple
+/// GiB at batch sizes above ~4, which exceeds CubeCL's max pool page
+/// (total VRAM / 4) and panics with "can't allocate buffer" even when plenty
+/// of VRAM is free. Tiling over `seq_q` keeps each chunk small. The no-mask
+/// path uses Burn's fused kernel and is left alone.
+#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
+fn chunked_masked_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    mask: Option<Tensor<B, 4, Bool>>,
+) -> Tensor<B, 4> {
+    /// Target ceiling for one scores chunk, in bytes.
+    const MAX_SCORES_BYTES: usize = 1 << 30; // 1 GiB
+
+    let [batch, heads, seq_q, head_dim] = q.dims();
+    let seq_kv = k.dims()[2];
+
+    let scores_bytes = batch * heads * seq_q * seq_kv * 4;
+    let Some(mask_t) = mask else {
+        return attention(q, k, v, None, None, AttentionModuleOptions::default());
+    };
+    if scores_bytes <= MAX_SCORES_BYTES {
+        return attention(q, k, v, Some(mask_t), None, AttentionModuleOptions::default());
+    }
+    // Only the broadcastable `[batch, 1, 1, seq_kv]` mask shape can be tiled
+    // without also slicing the mask; anything else goes through the full path.
+    if mask_t.dims() != [batch, 1, 1, seq_kv] {
+        return attention(q, k, v, Some(mask_t), None, AttentionModuleOptions::default());
+    }
+
+    let chunk = (MAX_SCORES_BYTES / (batch * heads * seq_kv * 4)).max(1);
+    let mut outs = Vec::new();
+    let mut start = 0;
+    while start < seq_q {
+        let end = (start + chunk).min(seq_q);
+        let q_c = q.clone().slice([0..batch, 0..heads, start..end, 0..head_dim]);
+        outs.push(attention(
+            q_c,
+            k.clone(),
+            v.clone(),
+            Some(mask_t.clone()),
+            None,
+            AttentionModuleOptions::default(),
+        ));
+        start = end;
+    }
+    Tensor::cat(outs, 2)
+}
 
 #[cfg(all(feature = "burn-candle", feature = "burn-flex"))]
 impl FusedAttentionBackend for burn::backend::candle::Candle {

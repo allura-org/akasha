@@ -687,6 +687,28 @@ mod tests {
             t_batch2.as_secs_f64() / img_paths.len() as f64
         );
 
+        // Ragged batch of 8: the full masked-attention scores tensor would be
+        // ~7 GiB here, which exceeds CubeCL's max pool page; on GPU this
+        // exercises the query-tiled masked attention.
+        let ragged_idx = [0usize, 1, 2, 0, 1, 2, 1, 2];
+        let ragged8: Vec<&Path> = ragged_idx.iter().map(|&i| img_paths[i]).collect();
+        let ragged = model.infer_logits_batch(&ragged8).expect("ragged batch of 8");
+        assert_eq!(ragged.len(), ragged_idx.len());
+        for (i, logits) in ragged.iter().enumerate() {
+            let expected = &singles[ragged_idx[i]];
+            let mut max_prob = 0.0f32;
+            for (&x, &y) in expected.iter().zip(logits.iter()) {
+                let px = 1.0 / (1.0 + (-x).exp());
+                let py = 1.0 / (1.0 + (-y).exp());
+                max_prob = max_prob.max((px - py).abs());
+            }
+            assert!(
+                max_prob < 1e-3,
+                "ragged batch item {i} mismatch: {max_prob}"
+            );
+        }
+        eprintln!("ragged batch of 8 ok");
+
         // Diagnostics: AKASHA_HYDRA_BATCH_SAME[=N] batches the same (all-valid)
         // image N times (default 3) to isolate the masked/ragged path's cost
         // from batching itself.
