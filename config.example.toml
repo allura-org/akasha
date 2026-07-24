@@ -187,3 +187,21 @@ cache_fallback = "disable"
 # # intra_threads = 4
 # # inter_threads = 1
 # # memory_pattern = false
+
+# Example: Hydra-3.5 tagger via the native Burn backend. Requires one of the
+# `burn-*` build features (burn-candle for CPU, burn-cuda/burn-wgpu for GPU).
+# Batching amortizes per-image fixed costs on GPU; each step of batch size
+# costs roughly ~0.4 GB of extra VRAM in pool activations (RTX 4090), so keep
+# it at 4 unless you have headroom.
+# [[models]]
+# name = "hydra-3.5"
+# type = "local"
+# backend = "burn"
+# path = "/path/to/hydra-3.5.safetensors"
+#
+# [models.tags]
+# threshold = 0.35
+# top_k = 20
+#
+# [models.burn]
+# batch_size = 4

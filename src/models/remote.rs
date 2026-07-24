@@ -140,6 +140,7 @@ mod tests {
             remote: Some(ModelRemoteOptions::default()),
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(backend.supports(&cfg));
     }
@@ -179,6 +180,7 @@ mod tests {
             remote: Some(ModelRemoteOptions::default()),
             onnx: None,
             jtp3: None,
+            burn: None,
         };
 
         let output = RemoteBackend::new(RemoteConfig::default())
@@ -232,6 +234,7 @@ mod tests {
             remote: Some(ModelRemoteOptions::default()),
             onnx: None,
             jtp3: None,
+            burn: None,
         };
 
         let output = RemoteBackend::new(RemoteConfig::default())

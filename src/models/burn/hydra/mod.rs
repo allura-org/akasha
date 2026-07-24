@@ -46,6 +46,7 @@ pub struct HydraModel<B: Backend> {
     threshold: f32,
     top_k: Option<usize>,
     max_seq_len: usize,
+    max_batch_size: usize,
     background: [u8; 3],
     /// Persistent scratch buffers for the fused kernels. Kept across forwards
     /// so the large pool/FF buffers (~0.5 GB) are allocated and page-faulted
@@ -88,6 +89,18 @@ impl<
 
         let threshold = config.tags.as_ref().map(|t| t.threshold).unwrap_or(0.35);
         let top_k = config.tags.as_ref().and_then(|t| t.top_k);
+        // Batching pays off on GPU (amortizes readback/fixed costs); the CPU
+        // path already saturates all cores at batch 1 and measures slightly
+        // slower when batched, so keep it at 1 there.
+        #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
+        let max_batch_size = config
+            .burn
+            .as_ref()
+            .map(|b| b.batch_size)
+            .unwrap_or(crate::config::default_burn_batch_size())
+            .max(1);
+        #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
+        let max_batch_size = 1;
 
         Ok(Self {
             model,
@@ -96,6 +109,7 @@ impl<
             threshold,
             top_k,
             max_seq_len: 1024,
+            max_batch_size,
             background,
             workspace: std::sync::Mutex::new(fused_ops::BlockWorkspace::new()),
             _phantom: std::marker::PhantomData,
@@ -118,49 +132,62 @@ impl<
 {
     /// Run the model and return raw logits (one score per label).
     pub fn infer_logits(&self, image_path: &Path) -> Result<Vec<f32>> {
+        Ok(self.infer_logits_batch(&[image_path])?.remove(0))
+    }
+
+    /// Run the model on a batch of images; returns one logits row per image.
+    pub fn infer_logits_batch(&self, image_paths: &[&Path]) -> Result<Vec<Vec<f32>>> {
         let t0 = Instant::now();
         let device = <B::Device as Default>::default();
-        let pre = preprocess(
-            image_path,
-            &self.pos_embed,
-            self.max_seq_len,
-            self.background,
-        )
-        .with_context(|| format!("failed to preprocess image: {}", image_path.display()))?;
+        let n = image_paths.len();
+        anyhow::ensure!(n > 0, "infer_logits_batch: empty batch");
+
+        let mut pres = Vec::with_capacity(n);
+        for path in image_paths {
+            pres.push(
+                preprocess(path, &self.pos_embed, self.max_seq_len, self.background)
+                    .with_context(|| format!("failed to preprocess image: {}", path.display()))?,
+            );
+        }
         let t_pre = t0.elapsed();
 
-        // Convert ndarray outputs to Burn tensors.
+        // Stack per-image preprocess outputs into batch tensors.
         let t1 = Instant::now();
+        let seq = self.max_seq_len;
+        let mut patches_flat = Vec::with_capacity(n * seq * 768);
+        let mut pos_flat = Vec::with_capacity(n * seq * 1152);
+        let mut valid_raw = Vec::with_capacity(n * seq);
+        let mut all_valid = true;
+        for pre in pres {
+            patches_flat.extend(pre.patches.into_raw_vec_and_offset().0);
+            pos_flat.extend(pre.pos_embed.into_raw_vec_and_offset().0);
+            let valid = pre.valid.into_raw_vec_and_offset().0;
+            if valid.iter().any(|&b| !b) {
+                all_valid = false;
+            }
+            valid_raw.extend(valid.into_iter().map(|b| if b { 1i32 } else { 0i32 }));
+        }
+
         let patches = Tensor::<B, 1>::from_data(
-            pre.patches.into_raw_vec_and_offset().0.as_slice(),
+            patches_flat.as_slice(),
             (&device, MODEL_DTYPE),
         )
-        .reshape([1, self.max_seq_len, 768]);
+        .reshape([n, seq, 768]);
 
-        let pos_embed = Tensor::<B, 1>::from_data(
-            pre.pos_embed.into_raw_vec_and_offset().0.as_slice(),
-            (&device, MODEL_DTYPE),
-        )
-        .reshape([1, self.max_seq_len, 1152]);
+        let pos_embed =
+            Tensor::<B, 1>::from_data(pos_flat.as_slice(), (&device, MODEL_DTYPE))
+                .reshape([n, seq, 1152]);
 
-        // Skip building the bool mask when every patch is valid; this lets
-        // Burn's attention take a faster no-mask path.
-        let all_valid = pre.valid.iter().all(|&b| b);
+        // Skip building the bool mask when every patch of every image is
+        // valid; this lets attention take the faster no-mask path.
         let mask: Option<Tensor<B, 2, Bool>> = if all_valid {
             None
         } else {
-            // Candle does not support bool_from_data, so build the mask as an Int
-            // tensor and compare to 1.
-            let valid_raw: Vec<i32> = pre
-                .valid
-                .into_raw_vec_and_offset()
-                .0
-                .into_iter()
-                .map(|b| if b { 1i32 } else { 0i32 })
-                .collect();
+            // Candle does not support bool_from_data, so build the mask as an
+            // Int tensor and compare to 1.
             Some(
                 Tensor::<B, 1, Int>::from_data(valid_raw.as_slice(), &device)
-                    .reshape([1, self.max_seq_len])
+                    .reshape([n, seq])
                     .equal_elem(1),
             )
         };
@@ -179,38 +206,25 @@ impl<
         // Convert to f32 for post-processing.
         let t2 = Instant::now();
         let logits_f32 = logits.cast(DType::F32);
-        let out = logits_f32.to_data().to_vec::<f32>().map_err(Into::into);
+        let flat = logits_f32.to_data().to_vec::<f32>()?;
         let t_post = t2.elapsed();
 
         tracing::debug!(
-            "infer_logits total={:.3}s preprocess={:.3}s tensor_create={:.3}s forward={:.3}s postprocess={:.3}s",
+            "infer_logits_batch total={:.3}s batch={} preprocess={:.3}s tensor_create={:.3}s forward={:.3}s postprocess={:.3}s",
             t0.elapsed().as_secs_f64(),
+            n,
             t_pre.as_secs_f64(),
             t_tensors.as_secs_f64(),
             t_forward.as_secs_f64(),
             t_post.as_secs_f64()
         );
 
-        out
+        let n_labels = flat.len() / n;
+        Ok(flat.chunks_exact(n_labels).map(|c| c.to_vec()).collect())
     }
-}
 
-impl<
-    B: FusedGluBackend
-        + FusedMlpBackend
-        + FusedAttentionBackend
-        + FastLinearBackend
-        + FastRmsNormBackend
-        + FusedHydraMidBlockBackend
-        + FusedHydraPoolTailBackend
-        + FusedHydraPoolBackend
-        + FusedNaFlexBlockBackend
-        + 'static,
-> Model for HydraModel<B>
-{
-    fn infer(&self, image_path: &Path) -> Result<crate::models::ModelOutput> {
-        let scores = self.infer_logits(image_path)?;
-
+    /// Map raw logits to the thresholded, top-k filtered tag output.
+    fn logits_to_output(&self, scores: Vec<f32>) -> crate::models::ModelOutput {
         let mut labels: HashMap<String, f32> = HashMap::new();
         for (idx, &score) in scores.iter().enumerate() {
             let prob = 1.0 / (1.0 + (-score).exp());
@@ -230,7 +244,40 @@ impl<
             tags.truncate(top_k);
         }
 
-        Ok(crate::models::ModelOutput::Tags(tags.into_iter().collect()))
+        crate::models::ModelOutput::Tags(tags.into_iter().collect())
+    }
+}
+
+impl<
+    B: FusedGluBackend
+        + FusedMlpBackend
+        + FusedAttentionBackend
+        + FastLinearBackend
+        + FastRmsNormBackend
+        + FusedHydraMidBlockBackend
+        + FusedHydraPoolTailBackend
+        + FusedHydraPoolBackend
+        + FusedNaFlexBlockBackend
+        + 'static,
+> Model for HydraModel<B>
+{
+    fn infer(&self, image_path: &Path) -> Result<crate::models::ModelOutput> {
+        Ok(self.logits_to_output(self.infer_logits(image_path)?))
+    }
+
+    fn infer_batch(&self, image_paths: &[&Path]) -> Result<Vec<crate::models::ModelOutput>> {
+        if image_paths.len() == 1 {
+            return Ok(vec![self.infer(image_paths[0])?]);
+        }
+        let batch = self.infer_logits_batch(image_paths)?;
+        Ok(batch
+            .into_iter()
+            .map(|scores| self.logits_to_output(scores))
+            .collect())
+    }
+
+    fn max_batch_size(&self) -> usize {
+        self.max_batch_size
     }
 
     fn release_memory(&self) {
@@ -301,6 +348,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
 
         let model = HydraModel::<crate::models::burn::BurnBackendType>::load(&cfg, device)
@@ -428,6 +476,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
 
         let model = HydraModel::<crate::models::burn::BurnBackendType>::load(&cfg, device)
@@ -548,6 +597,125 @@ mod tests {
                 "Got {} tags, max score {}",
                 tags.len(),
                 tags.values().copied().fold(0.0f32, |a, b| a.max(b))
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual: requires Hydra-3.5 safetensors"]
+    fn hydra_burn_batch_matches_single() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let device = <crate::models::burn::BurnDevice as Default>::default();
+        let cfg = ModelConfig {
+            name: "hydra-3.5".into(),
+            kind: crate::config::ModelKind::Local,
+            backend: Some("burn".into()),
+            path: Some(
+                "/home/asriel/Projects/RedRocket--Hydra/models/hydra-3.5.safetensors".into(),
+            ),
+            base_url: None,
+            model_id: None,
+            api_key: None,
+            tags: Some(crate::config::ModelTagsOptions {
+                threshold: 0.35,
+                top_k: Some(20),
+            }),
+            description: None,
+            classification: None,
+            remote: None,
+            onnx: None,
+            jtp3: None,
+            burn: None,
+        };
+
+        let model = HydraModel::<crate::models::burn::BurnBackendType>::load(&cfg, device)
+            .expect("load model");
+        let img_paths = [
+            Path::new("/home/asriel/Projects/akasha/test_imgs/dagnpats.png"),
+            Path::new("/home/asriel/Projects/akasha/test_imgs/portrait.png"),
+            Path::new("/home/asriel/Projects/akasha/test_imgs/landscape.webp"),
+        ];
+
+        // Single-image reference logits.
+        let mut singles = Vec::new();
+        let t_single0 = Instant::now();
+        for img_path in &img_paths {
+            singles.push(model.infer_logits(img_path).expect("infer"));
+        }
+        let t_singles = t_single0.elapsed();
+
+        // One batched call. The three images have different aspect ratios, so
+        // their valid patch counts differ and the ragged-mask path (pool
+        // key-padding mask) is exercised.
+        let refs: Vec<&Path> = img_paths.to_vec();
+        let t_batch0 = Instant::now();
+        let batch = model.infer_logits_batch(&refs).expect("batch infer");
+        let t_batch = t_batch0.elapsed();
+
+        assert_eq!(batch.len(), singles.len());
+        for (img, (s, b)) in img_paths.iter().zip(singles.iter().zip(batch.iter())) {
+            assert_eq!(s.len(), b.len(), "logits length mismatch on {img:?}");
+            let mut max_prob = 0.0f32;
+            for (&x, &y) in s.iter().zip(b.iter()) {
+                let px = 1.0 / (1.0 + (-x).exp());
+                let py = 1.0 / (1.0 + (-y).exp());
+                max_prob = max_prob.max((px - py).abs());
+            }
+            eprintln!("{img:?}: batch-vs-single max abs prob diff {max_prob:.6}");
+            assert!(
+                max_prob < 1e-3,
+                "batch vs single mismatch on {img:?}: {max_prob}"
+            );
+        }
+
+        eprintln!(
+            "batch of {} took {:.3}s; singles took {:.3}s total",
+            img_paths.len(),
+            t_batch.as_secs_f64(),
+            t_singles.as_secs_f64()
+        );
+
+        // Steady-state: kernels for the batch shapes are now compiled.
+        let t_batch2_0 = Instant::now();
+        let batch2 = model.infer_logits_batch(&refs).expect("batch infer 2");
+        let t_batch2 = t_batch2_0.elapsed();
+        std::hint::black_box(&batch2);
+        eprintln!(
+            "steady-state batch of {} took {:.3}s ({:.3}s/image)",
+            img_paths.len(),
+            t_batch2.as_secs_f64(),
+            t_batch2.as_secs_f64() / img_paths.len() as f64
+        );
+
+        // Diagnostics: AKASHA_HYDRA_BATCH_SAME[=N] batches the same (all-valid)
+        // image N times (default 3) to isolate the masked/ragged path's cost
+        // from batching itself.
+        if let Ok(n_str) = std::env::var("AKASHA_HYDRA_BATCH_SAME") {
+            let bn: usize = n_str.parse().unwrap_or(3);
+            let same: Vec<&Path> = std::iter::repeat_n(img_paths[0], bn).collect();
+            for _ in 0..2 {
+                std::hint::black_box(model.infer_logits_batch(&same).expect("warm"));
+            }
+            let t0 = Instant::now();
+            let reps = 5;
+            for _ in 0..reps {
+                std::hint::black_box(model.infer_logits_batch(&same).expect("same batch"));
+            }
+            eprintln!(
+                "same-image batch of {bn}: {:.3}s/batch ({:.3}s/image) over {reps} reps",
+                t0.elapsed().as_secs_f64() / reps as f64,
+                t0.elapsed().as_secs_f64() / reps as f64 / bn as f64
+            );
+            let t1 = Instant::now();
+            for _ in 0..reps {
+                for p in &same {
+                    std::hint::black_box(model.infer_logits(p).expect("single"));
+                }
+            }
+            eprintln!(
+                "steady singles: {:.3}s/image over {} reps",
+                t1.elapsed().as_secs_f64() / (reps * bn) as f64,
+                reps * bn
             );
         }
     }

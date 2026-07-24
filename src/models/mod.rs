@@ -182,6 +182,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(reg.select(&config).is_some());
     }
@@ -203,6 +204,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(reg.select(&config).is_none());
     }

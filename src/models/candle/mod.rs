@@ -124,6 +124,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(backend.supports(&cfg));
     }
