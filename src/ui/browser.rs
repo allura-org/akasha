@@ -50,6 +50,9 @@ pub struct BrowserPanel {
     pub media_items: Vec<db::media::MediaFile>,
     pub textures: HashMap<String, egui::TextureHandle>,
     pub pending_thumbnails: HashSet<String>,
+    /// Hashes whose thumbnail generation already failed this session; skipped by
+    /// the queue so a broken/missing file doesn't get retried every frame.
+    pub failed_thumbnails: HashSet<String>,
     pub thumbnail_queue: Vec<ThumbnailJob>,
     pub queued_indices: HashSet<usize>,
     pub scroll_offset: f32,
@@ -114,6 +117,7 @@ impl BrowserPanel {
             media_items: Vec::new(),
             textures: HashMap::new(),
             pending_thumbnails: HashSet::new(),
+            failed_thumbnails: HashSet::new(),
             thumbnail_queue: Vec::new(),
             queued_indices: HashSet::new(),
             scroll_offset: 0.0,
@@ -162,6 +166,7 @@ impl BrowserPanel {
             self.media_items.clear();
             self.textures.clear();
             self.pending_thumbnails.clear();
+            self.failed_thumbnails.clear();
             self.thumbnail_queue.clear();
             self.queued_indices.clear();
             self.scroll_offset = 0.0;
@@ -803,6 +808,7 @@ impl BrowserPanel {
             let hash = &media.blake3_hash;
             if !self.textures.contains_key(hash)
                 && !self.pending_thumbnails.contains(hash)
+                && !self.failed_thumbnails.contains(hash)
             {
                 let row = i / cols;
                 let dist = if row > center_row {

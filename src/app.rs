@@ -400,11 +400,45 @@ impl AkashaApp {
                         .map(|f| f.id)
                         .collect();
 
+                    // Exclude/include filters come from the live config; the DB
+                    // rows can be stale (they're only written at folder creation).
+                    let root_configs: std::collections::HashMap<i64, (Vec<String>, Vec<String>)> = folders
+                        .iter()
+                        .filter(|f| f.parent_id.is_none())
+                        .map(|f| {
+                            let cfg = self.config.imports.iter().find(|i| i.path == f.path);
+                            let exclude = cfg
+                                .map(|i| i.exclude.clone())
+                                .unwrap_or_else(|| f.exclude.clone());
+                            let include = cfg
+                                .map(|i| i.include.clone())
+                                .unwrap_or_else(|| f.include.clone());
+                            (f.id, (exclude, include))
+                        })
+                        .collect();
+
                     let folders: Vec<db::folder::Folder> = folders
                         .into_iter()
                         .filter(|f| {
                             let root_id = root_map.get(&f.id).copied().unwrap_or(f.id);
                             reachable_roots.contains(&root_id)
+                        })
+                        // Hide folders rejected by their import root's exclude/include
+                        // filters. The DB rows (and their media, tags, etc.) are kept so
+                        // removing the filter later restores everything as-is.
+                        .filter(|f| {
+                            if f.parent_id.is_none() {
+                                return true;
+                            }
+                            let root_id = root_map.get(&f.id).copied().unwrap_or(f.id);
+                            match root_configs.get(&root_id) {
+                                Some((exclude, include)) => {
+                                    let path = std::path::Path::new(&f.path);
+                                    !crate::scanner::is_excluded(path, exclude)
+                                        && crate::scanner::is_included(path, include)
+                                }
+                                None => true,
+                            }
                         })
                         .collect();
 
@@ -579,9 +613,24 @@ impl AkashaApp {
             self.media_refresh_in_flight = false;
             match result {
                 Ok(items) => {
+                    // Hide media belonging to folders that were filtered out of the
+                    // tree (excluded paths, unreachable roots), and hide missing
+                    // files — their rows stay in the DB so metadata survives, but
+                    // they don't belong in the grid. If the folder list hasn't
+                    // loaded yet, only apply the missing filter.
+                    let visible: HashSet<i64> =
+                        self.browser.folders.iter().map(|f| f.id).collect();
+                    let items: Vec<db::media::MediaSummary> = items
+                        .into_iter()
+                        .filter(|m| m.is_present && (visible.is_empty() || visible.contains(&m.folder_id)))
+                        .collect();
                     let needed: HashSet<String> = items.iter().map(|m| m.blake3_hash.clone()).collect();
                     self.browser.textures.retain(|hash, _| needed.contains(hash));
                     self.browser.pending_thumbnails.retain(|hash| needed.contains(hash));
+                    // A fresh media list may reflect files that came back; allow
+                    // previously failed thumbnails one retry per refresh. Files that
+                    // failed with ENOENT were marked missing, so they won't re-queue.
+                    self.browser.failed_thumbnails.clear();
                     self.browser.thumbnail_queue.clear();
                     self.browser.queued_indices.clear();
                     self.browser.media_summaries = items;
@@ -652,6 +701,35 @@ impl AkashaApp {
                 }
                 Err(e) => {
                     tracing::warn!("Thumbnail failed for {}: {}", hash, e);
+                    self.browser.failed_thumbnails.insert(hash.clone());
+
+                    // The file vanished while we weren't watching (e.g. deleted
+                    // offline while the app was closed). Mark it missing so it
+                    // stops being queued and disappears from the grid.
+                    if e.contains("No such file or directory") {
+                        if let Some(media) = self
+                            .browser
+                            .media_summaries
+                            .iter_mut()
+                            .find(|m| m.blake3_hash == hash)
+                        {
+                            if media.is_present {
+                                media.is_present = false;
+                                let pool = Arc::clone(&self.pool);
+                                let folder_id = media.folder_id;
+                                let relative_path = media.relative_path.clone();
+                                self.rt.spawn(async move {
+                                    if let Err(err) =
+                                        db::media::mark_missing_by_path(&pool, folder_id, &relative_path)
+                                            .await
+                                    {
+                                        tracing::warn!("Failed to mark {relative_path} missing: {err}");
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     self.push_toast(format!("Thumbnail failed: {}", e), ToastLevel::Warning);
                 }
             }
@@ -1256,6 +1334,7 @@ impl eframe::App for AkashaApp {
                         self.thumbnailer.size = size;
                         self.browser.textures.clear();
                         self.browser.pending_thumbnails.clear();
+                        self.browser.failed_thumbnails.clear();
                         self.browser.thumbnail_queue.clear();
                         self.browser.queued_indices.clear();
                         self.browser.thumbnail_epoch += 1;

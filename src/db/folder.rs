@@ -105,6 +105,16 @@ pub async fn get_or_create(
     cache_fallback: &str,
 ) -> anyhow::Result<i64> {
     if let Some(folder) = get_by_path(pool, path).await? {
+        // Config is the source of truth for exclude/include; the stored row is
+        // only written at insert time, so resync it when the filters changed.
+        if folder.exclude != exclude || folder.include != include {
+            sqlx::query("UPDATE folders SET exclude = ?1, include = ?2 WHERE id = ?3")
+                .bind(serde_json::to_string(exclude)?)
+                .bind(serde_json::to_string(include)?)
+                .bind(folder.id)
+                .execute(pool)
+                .await?;
+        }
         return Ok(folder.id);
     }
     insert(

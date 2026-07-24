@@ -26,7 +26,7 @@ pub fn is_supported(path: &Path) -> bool {
 /// Returns true if `path` should be excluded based on the user's exclude list.
 /// An entry that resolves to an absolute path performs exact-path matching;
 /// otherwise the entry is treated as a substring matched against the full path.
-fn is_excluded(path: &Path, patterns: &[String]) -> bool {
+pub(crate) fn is_excluded(path: &Path, patterns: &[String]) -> bool {
     for pattern in patterns {
         let candidate = std::path::Path::new(pattern);
         if candidate.is_absolute() {
@@ -47,7 +47,7 @@ fn is_excluded(path: &Path, patterns: &[String]) -> bool {
 /// If the include list is empty, everything is allowed.
 /// An entry that resolves to an absolute path performs exact-path matching;
 /// otherwise the entry is treated as a substring matched against the full path.
-fn is_included(path: &Path, patterns: &[String]) -> bool {
+pub(crate) fn is_included(path: &Path, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return true;
     }

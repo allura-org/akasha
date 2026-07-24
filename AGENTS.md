@@ -207,7 +207,8 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Summary queries (`list_summaries_by_folder*`) stream rows incrementally via `sqlx::query_as().fetch()` rather than `.fetch_all()`, avoiding a massive allocation spike for large folders.
 - Search results are hydrated with `search_summaries()`, which uses `json_each()` to match a batch of media IDs.
 - The thumbnail cache uses a 2-level hash prefix (`aa/bb/{hash}_{size}.webp`) to avoid ext4/xfs metadata stress with hundreds of thousands of files.
-- Missing files: rows with `is_present = 0` are preserved in `media_files` so metadata (hashes, Searchable values, embeddings, etc.) survives temporary unavailability. Any bulk operation or background job that touches media rows must skip `is_present = 0` records (the thumbnail queue, viewer, and `claim_pending_jobs` already do this).
+- Missing files: rows with `is_present = 0` are preserved in `media_files` so metadata (hashes, Searchable values, embeddings, etc.) survives temporary unavailability. Any bulk operation or background job that touches media rows must skip `is_present = 0` records (the thumbnail queue, viewer, and `claim_pending_jobs` already do this). A thumbnail that fails with ENOENT also marks the row missing, which covers files deleted while the app was closed.
+- Excluded folders: import `exclude`/`include` filters are enforced at display time only — `poll_folders_events` hides rejected folders from the tree and `poll_media_events` hides their media from the grid/search — without deleting DB rows, so removing a filter later restores everything (tags, metadata) as-is. Failed thumbnails are tracked in `BrowserPanel::failed_thumbnails` and not retried until the next media refresh.
 - The bare-minimum Searchable is `filename` (kind `text`), seeded by migration `008_seed_filename_searchable.sql`.
 
 ---
@@ -327,7 +328,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - Tags and descriptions are now backed by FTS5 (trigram for tags, `searchable_text_fts` for descriptions). Sidecar text search is still deferred.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
 - Cross-root file moves appear as a Remove + Create pair; no move deduplication.
-- Missing files (`is_present = 0`) are still shown in the grid and search results with a badge/placeholder; a dedicated hide-missing filter is not yet implemented.
+- Missing files (`is_present = 0`) are hidden from the grid and search results (filtered in `poll_media_events`); their rows and metadata stay in the DB and can be purged via DB Management.
 - **Paginated full records (Phase 6):** `media_items` in `app.rs` is currently empty. An LRU cache of `MediaFile` pages (~500 records/page, 5 pages hot) is planned for detail panels / bulk ops, but deferred until those features exist.
 - **Thumbnail queue velocity tuning:** the scroll-velocity thresholds (60/240 rows/sec) are initial guesses and may need adjustment based on real-world feel.
 - **GPU (CubeCL) notes:** batching is opt-in (`[models.burn] batch_size`, default 1) and currently slower than singles on the reference RTX 4090. Known upstream CubeCL issues: batch ≥16 previously panicked in kernel codegen (avoided by query tiling), and no-mask fused attention materializes a padded scores workspace for unaligned `seq_kv` instead of taking a flash path. `cubecl-cuda` requires `libnccl.so` at link time (see Feature flags). CubeCL memory pools still peak at ~11 GB during an active run by design (page caching); they release on queue drain via `Model::release_memory()`.
