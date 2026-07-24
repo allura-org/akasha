@@ -67,6 +67,10 @@ impl<
 > HydraModel<B>
 {
     pub fn load(config: &ModelConfig, device: B::Device) -> Result<Self> {
+        // Configure the CubeCL runtime (single shared stream) before the first
+        // GPU allocation; no-op on CPU backends and on later calls.
+        super::init_cubecl_runtime();
+
         let path = config.path.as_deref().context("hydra model missing path")?;
         let file = resolve_model_file(path)?;
         if !file.is_file() {
@@ -228,6 +232,17 @@ impl<
 
         Ok(crate::models::ModelOutput::Tags(tags.into_iter().collect()))
     }
+
+    fn release_memory(&self) {
+        // Free the CubeCL memory pool's unused pages and sync so the deferred
+        // frees execute and the driver's async mempool gets a release point.
+        // No-ops on CPU backends.
+        let device = <B::Device as Default>::default();
+        B::memory_cleanup(&device);
+        if let Err(e) = B::sync(&device) {
+            tracing::warn!("hydra: backend sync after memory cleanup failed: {e}");
+        }
+    }
 }
 
 fn resolve_model_file(path: &str) -> Result<PathBuf> {
@@ -259,6 +274,135 @@ fn resolve_model_file(path: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VRAM growth investigation: run `infer_logits` in a loop and print
+    /// per-process GPU memory (via nvidia-smi) after each iteration.
+    #[test]
+    #[ignore = "manual: VRAM growth investigation"]
+    fn hydra_burn_vram_loop() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let device = <crate::models::burn::BurnDevice as Default>::default();
+        let cfg = ModelConfig {
+            name: "hydra-3.5".into(),
+            kind: crate::config::ModelKind::Local,
+            backend: Some("burn".into()),
+            path: Some(
+                "/home/asriel/Projects/RedRocket--Hydra/models/hydra-3.5.safetensors".into(),
+            ),
+            base_url: None,
+            model_id: None,
+            api_key: None,
+            tags: Some(crate::config::ModelTagsOptions {
+                threshold: 0.35,
+                top_k: Some(20),
+            }),
+            description: None,
+            classification: None,
+            remote: None,
+            onnx: None,
+            jtp3: None,
+        };
+
+        let model = HydraModel::<crate::models::burn::BurnBackendType>::load(&cfg, device)
+            .expect("load model");
+        let img_paths = [
+            Path::new("/home/asriel/Projects/akasha/test_imgs/dagnpats.png"),
+            Path::new("/home/asriel/Projects/akasha/test_imgs/portrait.png"),
+            Path::new("/home/asriel/Projects/akasha/test_imgs/landscape.webp"),
+        ];
+
+        let pid = std::process::id().to_string();
+        let vram = move || -> String {
+            match std::process::Command::new("nvidia-smi")
+                .args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader"])
+                .output()
+            {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    let mine: Vec<&str> = stdout
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with(pid.as_str()))
+                        .collect();
+                    if mine.is_empty() {
+                        format!("(no per-process entry; all: {})", stdout.trim())
+                    } else {
+                        mine.join(" | ")
+                    }
+                }
+                Err(e) => format!("nvidia-smi error: {e}"),
+            }
+        };
+
+        // Set AKASHA_HYDRA_VRAM_CLEANUP=1 to call `Backend::memory_cleanup`
+        // after every inference, releasing the cubecl memory pool pages.
+        let do_cleanup = std::env::var("AKASHA_HYDRA_VRAM_CLEANUP").is_ok();
+        let device = <crate::models::burn::BurnDevice as Default>::default();
+
+        eprintln!("after load: {}", vram());
+        let iters: usize = std::env::var("AKASHA_HYDRA_VRAM_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        // AKASHA_HYDRA_VRAM_THREADS=N runs the loop on N std threads sharing
+        // the same model, simulating tokio's blocking thread pool (each thread
+        // gets its own CubeCL StreamId unless max_streams is capped).
+        let threads: usize = std::env::var("AKASHA_HYDRA_VRAM_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+
+        let model = std::sync::Arc::new(model);
+        let run_loop = |model: &std::sync::Arc<HydraModel<crate::models::burn::BurnBackendType>>,
+                        tid: usize| {
+            for i in 0..iters {
+                let img = img_paths[i % img_paths.len()];
+                let t0 = std::time::Instant::now();
+                let logits = model.infer_logits(img).expect("infer");
+                let t_infer = t0.elapsed();
+                std::hint::black_box(&logits);
+                if do_cleanup {
+                    use burn::tensor::backend::Backend as _;
+                    let t1 = std::time::Instant::now();
+                    crate::models::burn::BurnBackendType::memory_cleanup(&device);
+                    crate::models::burn::BurnBackendType::sync(&device).expect("sync");
+                    eprintln!(
+                        "t{} iter {:02} {}: infer={:.3}s cleanup={:.3}s vram={}",
+                        tid,
+                        i,
+                        img.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                        t_infer.as_secs_f64(),
+                        t1.elapsed().as_secs_f64(),
+                        vram()
+                    );
+                } else {
+                    eprintln!(
+                        "t{} iter {:02} {}: infer={:.3}s vram={}",
+                        tid,
+                        i,
+                        img.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                        t_infer.as_secs_f64(),
+                        vram()
+                    );
+                }
+            }
+        };
+
+        if threads <= 1 {
+            run_loop(&model, 0);
+        } else {
+            std::thread::scope(|s| {
+                for tid in 0..threads {
+                    let model = model.clone();
+                    s.spawn(move || run_loop(&model, tid));
+                }
+            });
+        }
+
+        // Production-path check: the batch-end release (what the SearchWorker
+        // calls after the queue drains) must return VRAM to baseline.
+        crate::models::Model::release_memory(model.as_ref());
+        eprintln!("after release_memory: {}", vram());
+    }
 
     #[test]
     #[ignore = "manual: requires Hydra-3.5 safetensors"]

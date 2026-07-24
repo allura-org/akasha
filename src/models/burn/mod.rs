@@ -75,6 +75,45 @@ mod backend {
 pub(crate) type BurnBackendType = backend::BurnBackendType;
 pub(crate) type BurnDevice = backend::BurnDevice;
 
+/// Restrict CubeCL to a single compute stream per device.
+///
+/// CubeCL assigns every calling OS thread its own stream slot — each with its
+/// own memory pools — up to `streaming.max_streams` (default 128). Inference
+/// run from tokio's blocking thread pool then scatters multi-GB, never-freed
+/// pool pages across many streams, and `Backend::memory_cleanup` (which only
+/// cleans the calling thread's stream) cannot reclaim them. Capping
+/// `max_streams` at 1 makes all threads share one stream and one memory
+/// manager, so a single cleanup pass reclaims everything. Sequential
+/// inference does not need multiple streams.
+///
+/// Must run before the first GPU operation; afterwards the global config is
+/// frozen. No-op on CPU backends.
+#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
+pub(crate) fn init_cubecl_runtime() {
+    use burn::cubecl::config::{CubeClRuntimeConfig, RuntimeConfig};
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        if <CubeClRuntimeConfig as RuntimeConfig>::storage()
+            .lock()
+            .is_some()
+        {
+            tracing::warn!(
+                "CubeCL runtime config was already initialized; max_streams=1 not applied"
+            );
+            return;
+        }
+        let mut config = CubeClRuntimeConfig::default();
+        config.streaming.max_streams = 1;
+        CubeClRuntimeConfig::set(config);
+        tracing::info!("CubeCL runtime configured with streaming.max_streams = 1");
+    });
+}
+
+#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
+pub(crate) fn init_cubecl_runtime() {}
+
 pub struct BurnBackend;
 
 impl Backend for BurnBackend {
@@ -105,6 +144,7 @@ impl Backend for BurnBackend {
     }
 
     fn load(&self, config: &ModelConfig) -> Result<Arc<dyn Model>> {
+        init_cubecl_runtime();
         let device = <BurnDevice as Default>::default();
         let model = hydra::HydraModel::<BurnBackendType>::load(config, device)
             .context("failed to load Hydra-3.5 Burn model")?;

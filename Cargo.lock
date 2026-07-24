@@ -1050,6 +1050,7 @@ dependencies = [
  "burn-tch",
  "burn-vision",
  "burn-wgpu",
+ "cubecl",
 ]
 
 [[package]]
