@@ -114,9 +114,12 @@ impl<
             mask.map(|m| m.reshape([batch, 1, 1, seq]).bool_not());
 
         let t1 = Instant::now();
-        // For F32 backends that support it, run all NaFlex blocks directly on
-        // buffers to avoid the per-block Burn tensor from_data/to_data round-trip.
-        if x.dtype() == DType::F32 {
+        // For F32 backends with a real buffer fast path (Candle), run all
+        // NaFlex blocks directly on buffers to avoid the per-block Burn tensor
+        // from_data/to_data round-trip. On backends where the buffer path is
+        // the default host round-trip (e.g. GPU), stay on-device with the
+        // generic tensor path instead.
+        if x.dtype() == DType::F32 && B::HAS_BUFFER_BLOCK_PATH {
             let x_device = x.device();
             let [_, _, hidden] = x.dims();
             let x_data = x.to_data();

@@ -11,6 +11,12 @@ use super::{
 };
 
 pub trait FusedNaFlexBlockBackend: Backend {
+    /// Whether `fused_na_flex_block_to_buffer` is a genuine on-device fast
+    /// path. Backends that use the default implementation (which round-trips
+    /// the data through the host per block) must leave this `false` so the
+    /// caller keeps activations on-device and uses the tensor path instead.
+    const HAS_BUFFER_BLOCK_PATH: bool = false;
+
     /// Compute one NaFlexBlock forward pass: norm1, self-attention, residual,
     /// norm2, MLP, residual. The `mask` argument is accepted for parity with
     /// the generic forward path; the fast implementation currently requires an
@@ -209,6 +215,8 @@ fn fused_na_flex_attn_buffer(
 
 #[cfg(feature = "burn-candle")]
 impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
+    const HAS_BUFFER_BLOCK_PATH: bool = true;
+
     fn fused_na_flex_block(
         x: FloatTensor<Self>,
         block: &crate::models::burn::hydra::modules::NaFlexBlock<Self>,
