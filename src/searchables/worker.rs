@@ -33,7 +33,11 @@ impl SearchWorker {
     ) -> Self {
         Self {
             pool,
-            batch_size: 4,
+            // Claim generously; per-model `max_batch_size` chunks the group
+            // afterwards. This must be at least the largest supported model
+            // batch (currently 8 for Burn GPU models) or configured batches
+            // never fill.
+            batch_size: 16,
             registry: BackendRegistry::with_remote(remote),
             resident: None,
             running,
@@ -44,7 +48,7 @@ impl SearchWorker {
     pub fn with_registry(pool: Arc<SqlitePool>, registry: BackendRegistry) -> Self {
         Self {
             pool,
-            batch_size: 4,
+            batch_size: 16,
             registry,
             resident: None,
             running: Arc::new(AtomicBool::new(true)),
