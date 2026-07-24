@@ -1639,15 +1639,18 @@ impl FusedAttentionBackend for burn::backend::Cuda {
     }
 }
 
-/// Masked attention tiled over the query dimension.
+/// Attention tiled over the query dimension when the scores tensor would be
+/// large.
 ///
-/// Burn's generic attention materializes the full `[batch, heads, seq_q,
-/// seq_kv]` scores tensor when a mask is present. For Hydra's pool and
-/// mid-block cross-attention (`[batch, 32, 8886, seq_kv]`) that is multiple
-/// GiB at batch sizes above ~4, which exceeds CubeCL's max pool page
-/// (total VRAM / 4) and panics with "can't allocate buffer" even when plenty
-/// of VRAM is free. Tiling over `seq_q` keeps each chunk small. The no-mask
-/// path uses Burn's fused kernel and is left alone.
+/// Burn's attention materializes the full `[batch, heads, seq_q, seq_kv]`
+/// scores tensor when a mask is present — and even without a mask its fused
+/// kernel may fall back to a scores-materializing path (with seq_kv padded to
+/// a tile multiple) for shapes a flash kernel rejects, such as unaligned
+/// seq_kv. For Hydra's pool and mid-block cross-attention (`[batch, 32, 8886,
+/// seq_kv]`) that is multiple GiB at batch sizes above ~4, which exceeds
+/// CubeCL's max pool page (total VRAM / 4) and panics with "can't allocate
+/// buffer" even when plenty of VRAM is free. Tiling over `seq_q` keeps each
+/// chunk small; small attentions pass through untouched.
 #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
 fn chunked_masked_attention<B: Backend>(
     q: Tensor<B, 4>,
@@ -1662,37 +1665,39 @@ fn chunked_masked_attention<B: Backend>(
     let seq_kv = k.dims()[2];
 
     let scores_bytes = batch * heads * seq_q * seq_kv * 4;
-    let Some(mask_t) = mask else {
-        tracing::debug!(
-            "attention: q={:?} kv={seq_kv} mask=None -> fused kernel",
-            [batch, heads, seq_q, head_dim],
-        );
-        return attention(q, k, v, None, None, AttentionModuleOptions::default());
-    };
     if scores_bytes <= MAX_SCORES_BYTES {
         tracing::debug!(
             "attention: q={:?} kv={seq_kv} mask={:?} scores={} MiB -> full (under ceiling)",
             [batch, heads, seq_q, head_dim],
-            mask_t.dims(),
+            mask.as_ref().map(|m| m.dims()),
             scores_bytes / (1024 * 1024),
         );
-        return attention(q, k, v, Some(mask_t), None, AttentionModuleOptions::default());
+        return attention(q, k, v, mask, None, AttentionModuleOptions::default());
     }
-    // Only the broadcastable `[batch, 1, 1, seq_kv]` mask shape can be tiled
-    // without also slicing the mask; anything else goes through the full path.
-    if mask_t.dims() != [batch, 1, 1, seq_kv] {
-        tracing::warn!(
-            "chunked_masked_attention: non-broadcast mask {:?} (scores would be {} MiB); \
-             falling back to full attention, which may exceed CubeCL's max pool page",
-            mask_t.dims(),
-            scores_bytes / (1024 * 1024),
-        );
-        return attention(q, k, v, Some(mask_t), None, AttentionModuleOptions::default());
+    // Even without a mask, Burn's "fused" attention may not take a flash
+    // kernel (e.g. unaligned seq_kv) and instead materializes a scores
+    // workspace padded to a tile multiple — which can exceed CubeCL's max
+    // pool page. Tile over queries regardless of masking.
+    if let Some(mask_t) = &mask {
+        // Only the broadcastable `[batch, 1, 1, seq_kv]` mask shape can be
+        // tiled without also slicing the mask; anything else goes through
+        // the full path.
+        if mask_t.dims() != [batch, 1, 1, seq_kv] {
+            tracing::warn!(
+                "chunked_masked_attention: non-broadcast mask {:?} (scores would be {} MiB); \
+                 falling back to full attention, which may exceed CubeCL's max pool page",
+                mask_t.dims(),
+                scores_bytes / (1024 * 1024),
+            );
+            return attention(q, k, v, mask, None, AttentionModuleOptions::default());
+        }
     }
 
     let chunk = (MAX_SCORES_BYTES / (batch * heads * seq_kv * 4)).max(1);
     tracing::debug!(
-        "chunked_masked_attention: seq_q={seq_q} chunk={chunk} scores={} MiB",
+        "attention: q={:?} kv={seq_kv} mask={:?} scores={} MiB -> tiled chunk={chunk}",
+        [batch, heads, seq_q, head_dim],
+        mask.as_ref().map(|m| m.dims()),
         scores_bytes / (1024 * 1024)
     );
     let mut outs = Vec::new();
@@ -1704,7 +1709,7 @@ fn chunked_masked_attention<B: Backend>(
             q_c,
             k.clone(),
             v.clone(),
-            Some(mask_t.clone()),
+            mask.clone(),
             None,
             AttentionModuleOptions::default(),
         ));
