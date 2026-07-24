@@ -249,15 +249,19 @@ fn default_jtp3_memory_pattern() -> bool {
 }
 
 pub fn default_burn_batch_size() -> usize {
-    4
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BurnOptions {
-    /// Inference batch size for Burn-backed models (e.g. Hydra-3.5). Larger
-    /// batches amortize per-image fixed costs on GPU but need proportionally
-    /// more VRAM (~1.5 GB of pool activations per 4 images on an RTX 4090).
+    /// Inference batch size for Burn-backed models (e.g. Hydra-3.5). Default
+    /// is 1: on an RTX 4090 single-image inference is fastest (the tiling
+    /// required to keep large masked batches under CubeCL's max pool page
+    /// costs more than batching saves). Larger batches (up to 8) are
+    /// supported — useful if you want to experiment — but expect ~5 jobs/s
+    /// vs ~6.6 jobs/s at 1 on current hardware. Values above 8 hit a CubeCL
+    /// kernel-codegen limit.
     #[serde(default = "default_burn_batch_size")]
     pub batch_size: usize,
 }

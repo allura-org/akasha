@@ -190,9 +190,9 @@ cache_fallback = "disable"
 
 # Example: Hydra-3.5 tagger via the native Burn backend. Requires one of the
 # `burn-*` build features (burn-candle for CPU, burn-cuda/burn-wgpu for GPU).
-# Batching amortizes per-image fixed costs on GPU; each step of batch size
-# costs roughly ~0.4 GB of extra VRAM in pool activations (RTX 4090), so keep
-# it at 4 unless you have headroom.
+# Note: batch_size defaults to 1, which is the fastest config on current
+# hardware — larger batches (up to 8) work but measure slower in practice
+# (~5 jobs/s vs ~6.6 jobs/s on an RTX 4090).
 # [[models]]
 # name = "hydra-3.5"
 # type = "local"
@@ -204,4 +204,4 @@ cache_fallback = "disable"
 # top_k = 20
 #
 # [models.burn]
-# batch_size = 4
+# batch_size = 1
