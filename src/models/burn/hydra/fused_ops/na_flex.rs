@@ -11,6 +11,12 @@ use super::{
 };
 
 pub trait FusedNaFlexBlockBackend: Backend {
+    /// Whether `fused_na_flex_block_to_buffer` is a genuine on-device fast
+    /// path. Backends that use the default implementation (which round-trips
+    /// the data through the host per block) must leave this `false` so the
+    /// caller keeps activations on-device and uses the tensor path instead.
+    const HAS_BUFFER_BLOCK_PATH: bool = false;
+
     /// Compute one NaFlexBlock forward pass: norm1, self-attention, residual,
     /// norm2, MLP, residual. The `mask` argument is accepted for parity with
     /// the generic forward path; the fast implementation currently requires an
@@ -209,6 +215,8 @@ fn fused_na_flex_attn_buffer(
 
 #[cfg(feature = "burn-candle")]
 impl FusedNaFlexBlockBackend for burn::backend::candle::Candle {
+    const HAS_BUFFER_BLOCK_PATH: bool = true;
+
     fn fused_na_flex_block(
         x: FloatTensor<Self>,
         block: &crate::models::burn::hydra::modules::NaFlexBlock<Self>,
@@ -599,13 +607,59 @@ impl FusedNaFlexBlockBackend for burn::backend::flex::Flex {
         x: FloatTensor<Self>,
         block: &crate::models::burn::hydra::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
-        workspace: &mut BlockWorkspace,
+        _workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
-        let out = block.forward(
-            Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
-            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
-            workspace,
-        );
+        // Generic tensor-op path. Note: this must NOT call `block.forward`
+        // (that dispatches back to this trait method and recurses forever).
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+        let attn = block.attn.forward(block.norm1.forward(x_t.clone()), mask_t);
+        let x_t = x_t + attn;
+        let out = x_t.clone() + block.mlp.forward(block.norm2.forward(x_t));
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("NaFlexBlock returns a float tensor"),
+        }
+    }
+}
+
+#[cfg(feature = "burn-wgpu")]
+impl FusedNaFlexBlockBackend for burn::backend::Wgpu {
+    fn fused_na_flex_block(
+        x: FloatTensor<Self>,
+        block: &crate::models::burn::hydra::modules::NaFlexBlock<Self>,
+        mask: Option<BoolTensor<Self>>,
+        _workspace: &mut BlockWorkspace,
+    ) -> FloatTensor<Self> {
+        // Generic tensor-op path. Note: this must NOT call `block.forward`
+        // (that dispatches back to this trait method and recurses forever).
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+        let attn = block.attn.forward(block.norm1.forward(x_t.clone()), mask_t);
+        let x_t = x_t + attn;
+        let out = x_t.clone() + block.mlp.forward(block.norm2.forward(x_t));
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("NaFlexBlock returns a float tensor"),
+        }
+    }
+}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedNaFlexBlockBackend for burn::backend::Cuda {
+    fn fused_na_flex_block(
+        x: FloatTensor<Self>,
+        block: &crate::models::burn::hydra::modules::NaFlexBlock<Self>,
+        mask: Option<BoolTensor<Self>>,
+        _workspace: &mut BlockWorkspace,
+    ) -> FloatTensor<Self> {
+        // Generic tensor-op path. Note: this must NOT call `block.forward`
+        // (that dispatches back to this trait method and recurses forever).
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+        let attn = block.attn.forward(block.norm1.forward(x_t.clone()), mask_t);
+        let x_t = x_t + attn;
+        let out = x_t.clone() + block.mlp.forward(block.norm2.forward(x_t));
         match out.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
             _ => unreachable!("NaFlexBlock returns a float tensor"),
@@ -619,13 +673,15 @@ impl FusedNaFlexBlockBackend for burn::backend::NdArray {
         x: FloatTensor<Self>,
         block: &crate::models::burn::hydra::modules::NaFlexBlock<Self>,
         mask: Option<BoolTensor<Self>>,
-        workspace: &mut BlockWorkspace,
+        _workspace: &mut BlockWorkspace,
     ) -> FloatTensor<Self> {
-        let out = block.forward(
-            Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
-            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
-            workspace,
-        );
+        // Generic tensor-op path. Note: this must NOT call `block.forward`
+        // (that dispatches back to this trait method and recurses forever).
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+        let attn = block.attn.forward(block.norm1.forward(x_t.clone()), mask_t);
+        let x_t = x_t + attn;
+        let out = x_t.clone() + block.mlp.forward(block.norm2.forward(x_t));
         match out.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
             _ => unreachable!("NaFlexBlock returns a float tensor"),

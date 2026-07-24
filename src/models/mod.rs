@@ -52,6 +52,12 @@ pub trait Model: Send + Sync {
     fn max_batch_size(&self) -> usize {
         1
     }
+
+    /// Release cached accelerator memory (e.g. GPU memory-pool pages) back to
+    /// the driver/OS. Called by the SearchWorker after the job queue drains so
+    /// idle VRAM returns to the baseline instead of staying at the run peak.
+    /// Default is a no-op.
+    fn release_memory(&self) {}
 }
 
 pub trait Backend: Send + Sync {
@@ -176,6 +182,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(reg.select(&config).is_some());
     }
@@ -197,6 +204,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(reg.select(&config).is_none());
     }

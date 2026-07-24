@@ -533,6 +533,12 @@ impl FastLinearBackend for burn::backend::candle::Candle {
 #[cfg(feature = "burn-flex")]
 impl FastLinearBackend for burn::backend::flex::Flex {}
 
+#[cfg(feature = "burn-wgpu")]
+impl FastLinearBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FastLinearBackend for burn::backend::Cuda {}
+
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FastLinearBackend for burn::backend::NdArray {}
 
@@ -919,6 +925,12 @@ impl FusedMlpBackend for burn::backend::candle::Candle {
 
 #[cfg(feature = "burn-flex")]
 impl FusedMlpBackend for burn::backend::flex::Flex {}
+
+#[cfg(feature = "burn-wgpu")]
+impl FusedMlpBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedMlpBackend for burn::backend::Cuda {}
 
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedMlpBackend for burn::backend::NdArray {}
@@ -1343,6 +1355,14 @@ impl FusedGluBackend for burn::backend::candle::Candle {
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedGluBackend for burn::backend::NdArray {}
 
+// GPU backends use the trait's generic tensor-op fallback; the Flex override
+// below relies on Flex-specific raw storage access and does not apply.
+#[cfg(feature = "burn-wgpu")]
+impl FusedGluBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedGluBackend for burn::backend::Cuda {}
+
 #[cfg(feature = "burn-flex")]
 impl FusedGluBackend for burn::backend::flex::Flex {
     fn fused_linear_glu(x: FloatTensor<Self>, weight: FloatTensor<Self>) -> FloatTensor<Self> {
@@ -1483,6 +1503,12 @@ impl FastRmsNormBackend for burn::backend::candle::Candle {
 #[cfg(feature = "burn-flex")]
 impl FastRmsNormBackend for burn::backend::flex::Flex {}
 
+#[cfg(feature = "burn-wgpu")]
+impl FastRmsNormBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FastRmsNormBackend for burn::backend::Cuda {}
+
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FastRmsNormBackend for burn::backend::NdArray {}
 
@@ -1566,6 +1592,130 @@ impl FusedAttentionBackend for burn::backend::flex::Flex {
             _ => unreachable!("attention returns a float tensor"),
         }
     }
+}
+
+// GPU backends tile masked attention over the query dimension (see below).
+#[cfg(feature = "burn-wgpu")]
+impl FusedAttentionBackend for burn::backend::Wgpu {
+    fn fused_attention(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        match chunked_masked_attention(
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(q)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v)),
+            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+        )
+        .into_primitive()
+        {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("attention returns a float tensor"),
+        }
+    }
+}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedAttentionBackend for burn::backend::Cuda {
+    fn fused_attention(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        match chunked_masked_attention(
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(q)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k)),
+            Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v)),
+            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+        )
+        .into_primitive()
+        {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("attention returns a float tensor"),
+        }
+    }
+}
+
+/// Attention tiled over the query dimension when the scores tensor would be
+/// large.
+///
+/// Burn's attention materializes the full `[batch, heads, seq_q, seq_kv]`
+/// scores tensor when a mask is present — and even without a mask its fused
+/// kernel may fall back to a scores-materializing path (with seq_kv padded to
+/// a tile multiple) for shapes a flash kernel rejects, such as unaligned
+/// seq_kv. For Hydra's pool and mid-block cross-attention (`[batch, 32, 8886,
+/// seq_kv]`) that is multiple GiB at batch sizes above ~4, which exceeds
+/// CubeCL's max pool page (total VRAM / 4) and panics with "can't allocate
+/// buffer" even when plenty of VRAM is free. Tiling over `seq_q` keeps each
+/// chunk small; small attentions pass through untouched.
+#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
+fn chunked_masked_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    mask: Option<Tensor<B, 4, Bool>>,
+) -> Tensor<B, 4> {
+    /// Target ceiling for one scores chunk, in bytes.
+    const MAX_SCORES_BYTES: usize = 1 << 30; // 1 GiB
+
+    let [batch, heads, seq_q, head_dim] = q.dims();
+    let seq_kv = k.dims()[2];
+
+    let scores_bytes = batch * heads * seq_q * seq_kv * 4;
+    if scores_bytes <= MAX_SCORES_BYTES {
+        tracing::debug!(
+            "attention: q={:?} kv={seq_kv} mask={:?} scores={} MiB -> full (under ceiling)",
+            [batch, heads, seq_q, head_dim],
+            mask.as_ref().map(|m| m.dims()),
+            scores_bytes / (1024 * 1024),
+        );
+        return attention(q, k, v, mask, None, AttentionModuleOptions::default());
+    }
+    // Even without a mask, Burn's "fused" attention may not take a flash
+    // kernel (e.g. unaligned seq_kv) and instead materializes a scores
+    // workspace padded to a tile multiple — which can exceed CubeCL's max
+    // pool page. Tile over queries regardless of masking.
+    if let Some(mask_t) = &mask {
+        // Only the broadcastable `[batch, 1, 1, seq_kv]` mask shape can be
+        // tiled without also slicing the mask; anything else goes through
+        // the full path.
+        if mask_t.dims() != [batch, 1, 1, seq_kv] {
+            tracing::warn!(
+                "chunked_masked_attention: non-broadcast mask {:?} (scores would be {} MiB); \
+                 falling back to full attention, which may exceed CubeCL's max pool page",
+                mask_t.dims(),
+                scores_bytes / (1024 * 1024),
+            );
+            return attention(q, k, v, mask, None, AttentionModuleOptions::default());
+        }
+    }
+
+    let chunk = (MAX_SCORES_BYTES / (batch * heads * seq_kv * 4)).max(1);
+    tracing::debug!(
+        "attention: q={:?} kv={seq_kv} mask={:?} scores={} MiB -> tiled chunk={chunk}",
+        [batch, heads, seq_q, head_dim],
+        mask.as_ref().map(|m| m.dims()),
+        scores_bytes / (1024 * 1024)
+    );
+    let mut outs = Vec::new();
+    let mut start = 0;
+    while start < seq_q {
+        let end = (start + chunk).min(seq_q);
+        let q_c = q.clone().slice([0..batch, 0..heads, start..end, 0..head_dim]);
+        outs.push(attention(
+            q_c,
+            k.clone(),
+            v.clone(),
+            mask.clone(),
+            None,
+            AttentionModuleOptions::default(),
+        ));
+        start = end;
+    }
+    Tensor::cat(outs, 2)
 }
 
 #[cfg(all(feature = "burn-candle", feature = "burn-flex"))]

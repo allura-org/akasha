@@ -9,15 +9,18 @@ mod thumbnailer;
 mod ui;
 mod watcher;
 
-use tracing::{info, Level};
+use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 
 fn main() -> anyhow::Result<()> {
     #[cfg(feature = "hevc")]
     libheif_rs::integration::image::register_all_decoding_hooks();
 
+    // RUST_LOG overrides; defaults to INFO (e.g. RUST_LOG=debug,akasha::models=trace).
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_env_filter(filter)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 

@@ -5,7 +5,7 @@ use std::time::Instant;
 use burn::module::Param;
 use burn::nn::{LayerNorm, Linear};
 use burn::prelude::*;
-use burn::tensor::{DType, TensorPrimitive};
+use burn::tensor::{BoolStore, DType, TensorPrimitive};
 
 use super::fused_ops::{
     BlockWorkspace, FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
@@ -91,27 +91,50 @@ impl<
         let mut x = self.embeds.forward(patches, pos_embed, mask.clone());
         let t_embeds = t0.elapsed();
 
-        // Determine the actual number of valid patch positions. Hydra pads to
+        // Determine per-item valid patch counts. Hydra pads each image to
         // `max_seq_len` with a contiguous suffix of invalid positions, so the
-        // valid prefix length is all we need for the rest of the forward pass.
-        let n_valid: usize = mask
+        // valid prefix length per item is all we need. The batch is sliced to
+        // the max count before the pool, and a key-padding mask keeps shorter
+        // items unaffected past their own valid prefix.
+        let n_valids: Vec<usize> = mask
             .as_ref()
             .map(|m| {
-                let data = m.to_data();
+                // CubeCL backends store bools as u8/u32 rather than native
+                // bools, so normalize the readback before slicing.
+                let data = m
+                    .clone()
+                    .to_data()
+                    .convert_dtype(DType::Bool(BoolStore::Native));
                 let slice = data.as_slice::<bool>().expect("mask is contiguous bool");
-                slice.iter().take(seq).filter(|&&b| b).count()
+                (0..batch)
+                    .map(|b| slice[b * seq..(b + 1) * seq].iter().filter(|&&v| v).count())
+                    .collect()
             })
-            .unwrap_or(seq);
+            .unwrap_or_else(|| vec![seq; batch]);
+        let max_valid = n_valids.iter().copied().max().unwrap_or(seq);
 
         // Burn's attention treats `true` as "mask out"; our mask semantics are
         // `true` = attend, so invert the mask.
         let attn_mask: Option<Tensor<B, 4, Bool>> =
             mask.map(|m| m.reshape([batch, 1, 1, seq]).bool_not());
 
+        // Key-padding mask for the pool, sliced to `max_valid`. Only needed
+        // when some item is shorter than the slice; an all-attend mask would
+        // just slow the pool down.
+        let pool_mask: Option<Tensor<B, 4, Bool>> = match &attn_mask {
+            Some(m) if n_valids.iter().any(|&v| v < max_valid) => {
+                Some(m.clone().slice([0..batch, 0..1, 0..1, 0..max_valid]))
+            }
+            _ => None,
+        };
+
         let t1 = Instant::now();
-        // For F32 backends that support it, run all NaFlex blocks directly on
-        // buffers to avoid the per-block Burn tensor from_data/to_data round-trip.
-        if x.dtype() == DType::F32 {
+        // For F32 backends with a real buffer fast path (Candle), run all
+        // NaFlex blocks directly on buffers to avoid the per-block Burn tensor
+        // from_data/to_data round-trip. On backends where the buffer path is
+        // the default host round-trip (e.g. GPU), stay on-device with the
+        // generic tensor path instead.
+        if x.dtype() == DType::F32 && B::HAS_BUFFER_BLOCK_PATH {
             let x_device = x.device();
             let [_, _, hidden] = x.dims();
             let x_data = x.to_data();
@@ -160,14 +183,15 @@ impl<
         x = self.norm.forward(x);
         let t_norm = t2.elapsed();
 
-        // Slice to the valid prefix before the pool. Padded positions are masked
-        // out of attention anyway, so dropping them avoids wasted work in the
-        // large kv projection and cross-attention without changing semantics.
+        // Slice to the longest valid prefix before the pool. Padded positions
+        // are masked out of attention anyway, so dropping them avoids wasted
+        // work in the large kv projection and cross-attention without changing
+        // semantics.
         let hidden = x.dims()[2];
-        let mut x = x.slice([0..batch, 0..n_valid, 0..hidden]);
+        let mut x = x.slice([0..batch, 0..max_valid, 0..hidden]);
 
         let t3 = Instant::now();
-        x = self.attn_pool.forward(x, None, &mut workspace);
+        x = self.attn_pool.forward(x, pool_mask, &mut workspace);
         let t_pool = t3.elapsed();
 
         let t4 = Instant::now();

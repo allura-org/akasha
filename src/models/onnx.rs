@@ -712,6 +712,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         assert!(backend.supports(&cfg));
     }
@@ -741,6 +742,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
 
         let model = OrtBackend.load(&cfg).expect("load model");

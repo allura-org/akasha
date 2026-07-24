@@ -846,6 +846,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
 
         let model = Jtp3Backend.load(&cfg).expect("load model");

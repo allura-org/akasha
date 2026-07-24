@@ -568,6 +568,50 @@ impl FusedHydraMidBlockBackend for burn::backend::flex::Flex {
     }
 }
 
+#[cfg(feature = "burn-wgpu")]
+impl FusedHydraMidBlockBackend for burn::backend::Wgpu {
+    fn fused_hydra_mid_block(
+        x: FloatTensor<Self>,
+        block: &crate::models::burn::hydra::modules::HydraMidBlock<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        let out = block.forward(
+            Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
+            &Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k)),
+            &Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v)),
+            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+        );
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("HydraMidBlock returns a float tensor"),
+        }
+    }
+}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedHydraMidBlockBackend for burn::backend::Cuda {
+    fn fused_hydra_mid_block(
+        x: FloatTensor<Self>,
+        block: &crate::models::burn::hydra::modules::HydraMidBlock<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        mask: Option<BoolTensor<Self>>,
+    ) -> FloatTensor<Self> {
+        let out = block.forward(
+            Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
+            &Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(k)),
+            &Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(v)),
+            mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m)),
+        );
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("HydraMidBlock returns a float tensor"),
+        }
+    }
+}
+
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedHydraMidBlockBackend for burn::backend::NdArray {
     fn fused_hydra_mid_block(

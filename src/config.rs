@@ -151,6 +151,7 @@ pub struct ModelConfig {
     pub remote: Option<ModelRemoteOptions>,
     pub onnx: Option<ModelOnnxOptions>,
     pub jtp3: Option<ModelJtp3Options>,
+    pub burn: Option<BurnOptions>,
 }
 
 impl Default for ModelConfig {
@@ -169,6 +170,7 @@ impl Default for ModelConfig {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         }
     }
 }
@@ -244,6 +246,32 @@ pub struct ModelJtp3Options {
 
 fn default_jtp3_memory_pattern() -> bool {
     false
+}
+
+pub fn default_burn_batch_size() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BurnOptions {
+    /// Inference batch size for Burn-backed models (e.g. Hydra-3.5). Default
+    /// is 1: on an RTX 4090 single-image inference is fastest (the tiling
+    /// required to keep large masked batches under CubeCL's max pool page
+    /// costs more than batching saves). Larger batches (up to 8) are
+    /// supported — useful if you want to experiment — but expect ~5 jobs/s
+    /// vs ~6.6 jobs/s at 1 on current hardware. Values above 8 hit a CubeCL
+    /// kernel-codegen limit.
+    #[serde(default = "default_burn_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for BurnOptions {
+    fn default() -> Self {
+        Self {
+            batch_size: default_burn_batch_size(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

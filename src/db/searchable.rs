@@ -365,6 +365,7 @@ pub async fn sync_model_configs(
             "remote": model.remote,
             "onnx": model.onnx,
             "jtp3": model.jtp3,
+            "burn": model.burn,
             "kind": model.kind,
         });
 
@@ -441,6 +442,10 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         .get("jtp3")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    let burn: Option<crate::config::BurnOptions> = opts
+        .get("burn")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
     let tags: Option<crate::config::ModelTagsOptions> = opts
         .get("threshold")
         .and_then(|_| serde_json::from_value(opts.clone()).ok());
@@ -467,6 +472,7 @@ pub fn model_config_from_searchable_config(cfg: &SearchableConfig) -> Result<cra
         remote,
         onnx,
         jtp3,
+        burn,
         tags,
         description,
         classification,
@@ -889,6 +895,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -929,6 +936,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         sync_model_configs(&pool, &[model2]).await.unwrap();
 
@@ -977,6 +985,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -1013,6 +1022,7 @@ mod tests {
             }),
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
@@ -1058,6 +1068,7 @@ mod tests {
             remote: None,
             onnx: None,
             jtp3: None,
+            burn: None,
         };
         sync_model_configs(&pool, &[model]).await.unwrap();
 
