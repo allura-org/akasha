@@ -281,6 +281,7 @@ classify_endpoint = "/classify"
 ## Testing Instructions
 
 - Use `cargo test` to run unit and integration tests.
+- The matmul microbenchmarks in `tests/` (`bf16_gemm_bench`, `matmul_bench`, `gpu_matmul_bench`) are gated behind the opt-in `matmul-benches` feature and do not run under plain `cargo test`. Run them explicitly, e.g. `cargo test --release --features matmul-benches --test bf16_gemm_bench -- --nocapture` (`gpu_matmul_bench` also needs `burn-cuda`).
 - Existing tests live in `src/searchables/` and use an in-memory SQLite database (`sqlite::memory:`) with embedded migrations.
 - For DB-dependent tests, run `sqlx::migrate!("./migrations").run(&pool)` in test setup.
 - The project uses `sqlx`, so `SQLX_OFFLINE` may be relevant if query macros are used in the future (currently raw SQL strings are used).

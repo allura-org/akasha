@@ -26,6 +26,12 @@ burn-wgpu = ["burn", "burn/wgpu", "burn/cubecl", "burn/fusion", "gpu-kernels"]
 burn-cuda = ["burn", "burn/cuda", "burn/cubecl", "burn/fusion", "gpu-kernels"]
 gpu-kernels = ["dep:burn-fusion", "dep:burn-ir", "dep:burn-cubecl", "dep:cubecl"]
 cuda = ["candle", "candle-core/cuda", "mistralrs?/cuda"]
+# Opt-in gate for the matmul microbenchmark integration tests. They are slow
+# to build and run and only matter when changing AI inference kernels, so they
+# are excluded from plain `cargo test`. Run them with:
+#   cargo test --release --features matmul-benches --test bf16_gemm_bench -- --nocapture
+# (gpu_matmul_bench additionally needs burn-cuda.)
+matmul-benches = []
 
 [dependencies]
 # UI
@@ -145,3 +151,19 @@ gemm = "0.18"
 candle-core = "0.11.0"
 half = "2"
 rayon = "1"
+
+# Matmul microbenchmarks: opt-in via the `matmul-benches` feature (see above).
+[[test]]
+name = "bf16_gemm_bench"
+path = "tests/bf16_gemm_bench.rs"
+required-features = ["matmul-benches"]
+
+[[test]]
+name = "matmul_bench"
+path = "tests/matmul_bench.rs"
+required-features = ["matmul-benches"]
+
+[[test]]
+name = "gpu_matmul_bench"
+path = "tests/gpu_matmul_bench.rs"
+required-features = ["matmul-benches", "burn-cuda"]

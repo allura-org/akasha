@@ -15,7 +15,7 @@
 //! - Parallelism is over row tiles (rayon); each thread streams the packed B
 //!   from L3 (42 MB packed for the pool_ff shape, L3-resident).
 //!
-//! Run with: `cargo test --release --test bf16_gemm_bench -- --nocapture`
+//! Run with: `cargo test --release --features matmul-benches --test bf16_gemm_bench -- --nocapture`
 
 #![allow(unsafe_op_in_unsafe_fn)]
 

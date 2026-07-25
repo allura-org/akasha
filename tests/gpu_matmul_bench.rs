@@ -5,7 +5,7 @@
 //! are included alongside a large square GEMM where any half-decent kernel
 //! should saturate.
 //!
-//! Run with: `cargo test --release --features burn-cuda --test gpu_matmul_bench -- --nocapture`
+//! Run with: `cargo test --release --features matmul-benches,burn-cuda --test gpu_matmul_bench -- --nocapture`
 
 #![cfg(feature = "burn-cuda")]
 
