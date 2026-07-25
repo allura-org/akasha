@@ -52,6 +52,14 @@ pub(crate) fn fused_gelu_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("AKASHA_HYDRA_GPU_FUSED_GELU").as_deref() != Ok("0"))
 }
 
+/// Whether the fused QKV split / merge_heads layout kernels are active
+/// (default on). `AKASHA_HYDRA_GPU_FUSED_LAYOUT=0` falls back to burn's
+/// strided reshape copies.
+pub(crate) fn fused_layout_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AKASHA_HYDRA_GPU_FUSED_LAYOUT").as_deref() != Ok("0"))
+}
+
 // ---------------------------------------------------------------------------
 // Kernels
 // ---------------------------------------------------------------------------
@@ -187,6 +195,77 @@ fn add_layernorm_kernel<F: Float, N: Size>(
     }
 }
 
+/// Fused QKV split: reads the packed `[b*seq, 3*hidden]` projection and
+/// writes q/k/v as `[b, heads, seq, head_dim]` in one launch (the generic
+/// path does three strided reshape copies). Grid covers 3 × one output.
+#[cube(launch, address_type = "dynamic")]
+fn qkv_split_kernel<F: Float, N: Size>(
+    qkv: &LinearView<Vector<F, N>>,
+    q: &mut LinearView<Vector<F, N>, ReadWrite>,
+    k: &mut LinearView<Vector<F, N>, ReadWrite>,
+    v: &mut LinearView<Vector<F, N>, ReadWrite>,
+    seq: u32,
+    heads: u32,
+    n_vec_head: u32,
+    n_vec_part: u32,
+    out_len: u32,
+    #[define(F)] _dtype: StorageType,
+) {
+    let n_vec_head = n_vec_head as usize;
+    let n_vec_part = n_vec_part as usize;
+    let seq = seq as usize;
+    let heads = heads as usize;
+    let out_len = out_len as usize;
+    if ABSOLUTE_POS >= 3 * out_len {
+        terminate!();
+    }
+    let part = ABSOLUTE_POS / out_len;
+    let local = ABSOLUTE_POS % out_len;
+    let bh = local / (seq * n_vec_head);
+    let rest = local % (seq * n_vec_head);
+    let s = rest / n_vec_head;
+    let d = rest % n_vec_head;
+    let b = bh / heads;
+    let h = bh % heads;
+    let src = ((b * seq + s) * 3 + part) * n_vec_part + h * n_vec_head + d;
+    let val = qkv[src];
+    if part == 0usize {
+        q[local] = val;
+    } else if part == 1usize {
+        k[local] = val;
+    } else {
+        v[local] = val;
+    }
+}
+
+/// Fused merge_heads: `[b, heads, seq, head_dim]` -> `[b*seq, hidden]` in one
+/// launch (inverse permutation of `qkv_split_kernel`).
+#[cube(launch, address_type = "dynamic")]
+fn merge_heads_kernel<F: Float, N: Size>(
+    x: &LinearView<Vector<F, N>>,
+    out: &mut LinearView<Vector<F, N>, ReadWrite>,
+    seq: u32,
+    heads: u32,
+    n_vec_head: u32,
+    n_vec_part: u32,
+    #[define(F)] _dtype: StorageType,
+) {
+    if !out.is_in_bounds(ABSOLUTE_POS) {
+        terminate!();
+    }
+    let n_vec_head = n_vec_head as usize;
+    let n_vec_part = n_vec_part as usize;
+    let seq = seq as usize;
+    let heads = heads as usize;
+    let row = ABSOLUTE_POS / n_vec_part;
+    let col = ABSOLUTE_POS % n_vec_part;
+    let h = col / n_vec_head;
+    let d = col % n_vec_head;
+    let b = row / seq;
+    let s = row % seq;
+    out[ABSOLUTE_POS] = x[((b * heads + h) * seq + s) * n_vec_head + d];
+}
+
 // ---------------------------------------------------------------------------
 // Host-side launch helpers (generic over the CubeCL runtime)
 // ---------------------------------------------------------------------------
@@ -243,6 +322,82 @@ fn launch_bias_gelu<R: CubeRuntime>(
         bias.into_linear_view(),
         out.clone().into_linear_view(),
         n_vec as u32,
+        dtype.into(),
+    );
+    out
+}
+
+fn launch_qkv_split<R: CubeRuntime>(
+    qkv: CubeTensor<R>,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+) -> (CubeTensor<R>, CubeTensor<R>, CubeTensor<R>) {
+    let client = qkv.client.clone();
+    let device = qkv.device.clone();
+    let dtype = qkv.dtype;
+    let hidden = heads * head_dim;
+    let vec = vector_size(&qkv, head_dim).min(vector_size(&qkv, hidden));
+    let n_vec_head = head_dim / vec;
+    let n_vec_part = hidden / vec;
+    let out_shape = burn::tensor::Shape::new([batch, heads, seq, head_dim]);
+    let make = || empty_device_dtype(client.clone(), device.clone(), out_shape.clone(), dtype);
+    let (q, k, v) = (make(), make(), make());
+    let out_len = batch * heads * seq * n_vec_head;
+    let cube_dim = CubeDim::new(&client, out_len);
+    let cube_count = cubecl::calculate_cube_count_elemwise(&client, 3 * out_len, cube_dim);
+    qkv_split_kernel::launch::<R>(
+        &client,
+        cube_count,
+        cube_dim,
+        AddressType::U32,
+        vec,
+        qkv.into_linear_view(),
+        q.clone().into_linear_view(),
+        k.clone().into_linear_view(),
+        v.clone().into_linear_view(),
+        seq as u32,
+        heads as u32,
+        n_vec_head as u32,
+        n_vec_part as u32,
+        out_len as u32,
+        dtype.into(),
+    );
+    (q, k, v)
+}
+
+fn launch_merge_heads<R: CubeRuntime>(x: CubeTensor<R>) -> CubeTensor<R> {
+    let client = x.client.clone();
+    let device = x.device.clone();
+    let dtype = x.dtype;
+    let shape = x.shape();
+    let (batch, heads, seq, head_dim) = (shape[0], shape[1], shape[2], shape[3]);
+    let hidden = heads * head_dim;
+    let vec = vector_size(&x, head_dim).min(vector_size(&x, hidden));
+    let n_vec_head = head_dim / vec;
+    let n_vec_part = hidden / vec;
+    let out = empty_device_dtype(
+        client.clone(),
+        device,
+        burn::tensor::Shape::new([batch, seq, hidden]),
+        dtype,
+    );
+    let working_units = batch * seq * n_vec_part;
+    let cube_dim = CubeDim::new(&client, working_units);
+    let cube_count = cubecl::calculate_cube_count_elemwise(&client, working_units, cube_dim);
+    merge_heads_kernel::launch::<R>(
+        &client,
+        cube_count,
+        cube_dim,
+        AddressType::U32,
+        vec,
+        x.into_linear_view(),
+        out.clone().into_linear_view(),
+        seq as u32,
+        heads as u32,
+        n_vec_head as u32,
+        n_vec_part as u32,
         dtype.into(),
     );
     out
@@ -400,6 +555,103 @@ impl<R: CubeRuntime> Operation<FusionCubeRuntime<R>> for AddLayerNormOp<R> {
         handles.register_float_tensor::<InnerB<R>>(&out_sum.id, sum_t);
         handles.register_float_tensor::<InnerB<R>>(&out_norm.id, norm_t);
     }
+}
+
+#[derive(Clone, Debug)]
+struct QkvSplitOp<R: CubeRuntime> {
+    desc: CustomOpIr,
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    head_dim: usize,
+    _r: PhantomData<R>,
+}
+
+impl<R: CubeRuntime> Operation<FusionCubeRuntime<R>> for QkvSplitOp<R> {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<FusionCubeRuntime<R> as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([qkv], [q, k, v]) = self.desc.as_fixed();
+        let qkv = handles.get_float_tensor::<InnerB<R>>(qkv);
+        let (q_t, k_t, v_t) =
+            launch_qkv_split(qkv, self.batch, self.seq, self.heads, self.head_dim);
+        handles.register_float_tensor::<InnerB<R>>(&q.id, q_t);
+        handles.register_float_tensor::<InnerB<R>>(&k.id, k_t);
+        handles.register_float_tensor::<InnerB<R>>(&v.id, v_t);
+    }
+}
+
+/// Split packed `[batch, seq, 3*hidden]` QKV projections into q/k/v of
+/// `[batch, heads, seq, head_dim]` in a single kernel launch.
+pub(crate) fn gpu_split_qkv<R: CubeRuntime>(
+    qkv: &FusionTensor<FusionCubeRuntime<R>>,
+    heads: usize,
+    head_dim: usize,
+) -> (
+    FusionTensor<FusionCubeRuntime<R>>,
+    FusionTensor<FusionCubeRuntime<R>>,
+    FusionTensor<FusionCubeRuntime<R>>,
+) {
+    let client = qkv.client.clone();
+    let (batch, seq) = (qkv.shape[0], qkv.shape[1]);
+    let streams = OperationStreams::with_inputs([qkv]);
+    let out_shape = burn::tensor::Shape::new([batch, heads, seq, head_dim]);
+    let q_ir = TensorIr::uninit(client.create_empty_handle(), out_shape.clone(), qkv.dtype);
+    let k_ir = TensorIr::uninit(client.create_empty_handle(), out_shape.clone(), qkv.dtype);
+    let v_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, qkv.dtype);
+    let desc = CustomOpIr::new("hydra_qkv_split", &[qkv.clone().into_ir()], &[q_ir, k_ir, v_ir]);
+    let op = QkvSplitOp::<R> {
+        desc: desc.clone(),
+        batch,
+        seq,
+        heads,
+        head_dim,
+        _r: PhantomData,
+    };
+    let [q, k, v] = client
+        .register(streams, OperationIr::Custom(desc), op)
+        .try_into()
+        .expect("hydra_qkv_split produces three outputs");
+    (q, k, v)
+}
+
+#[derive(Clone, Debug)]
+struct MergeHeadsOp<R: CubeRuntime> {
+    desc: CustomOpIr,
+    _r: PhantomData<R>,
+}
+
+impl<R: CubeRuntime> Operation<FusionCubeRuntime<R>> for MergeHeadsOp<R> {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<FusionCubeRuntime<R> as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([x], [out]) = self.desc.as_fixed();
+        let x = handles.get_float_tensor::<InnerB<R>>(x);
+        let out_t = launch_merge_heads(x);
+        handles.register_float_tensor::<InnerB<R>>(&out.id, out_t);
+    }
+}
+
+/// Merge `[batch, heads, seq, head_dim]` attention output back into
+/// `[batch, seq, hidden]` in a single kernel launch.
+pub(crate) fn gpu_merge_heads<R: CubeRuntime>(
+    x: &FusionTensor<FusionCubeRuntime<R>>,
+) -> FusionTensor<FusionCubeRuntime<R>> {
+    let client = x.client.clone();
+    let (batch, heads, seq, head_dim) = (x.shape[0], x.shape[1], x.shape[2], x.shape[3]);
+    let streams = OperationStreams::with_inputs([x]);
+    let out_shape = burn::tensor::Shape::new([batch, seq, heads * head_dim]);
+    let out_ir = TensorIr::uninit(client.create_empty_handle(), out_shape, x.dtype);
+    let desc = CustomOpIr::new("hydra_merge_heads", &[x.clone().into_ir()], &[out_ir]);
+    let op = MergeHeadsOp::<R> {
+        desc: desc.clone(),
+        _r: PhantomData,
+    };
+    client
+        .register(streams, OperationIr::Custom(desc), op)
+        .output()
 }
 
 #[derive(Clone, Debug)]
@@ -695,6 +947,62 @@ mod tests {
             // x magnitudes reach ~9 where BF16 half-ulp is 0.03125.
             let tol = if dtype == DType::BF16 { 0.06 } else { 0.001 };
             assert!(diff < tol, "bias_gelu {dtype:?} diff: {diff}");
+        }
+    }
+
+    #[test]
+    fn qkv_layout_kernels_match_reference() {
+        init_cubecl_runtime();
+        let device = CudaDevice::new(0);
+        let (batch, seq, heads, head_dim) = (2usize, 37usize, 16usize, 72usize);
+        let hidden = heads * head_dim;
+
+        let qkv_f32 = Tensor::<Inner, 3>::from_data(
+            TensorData::new(pattern(batch * seq * 3 * hidden, 1, 2.0), [batch, seq, 3 * hidden]),
+            &device,
+        );
+
+        // Reference: burn's strided reshape copies.
+        let (q_ref, k_ref, v_ref) =
+            crate::models::burn::hydra::ops::split_qkv(qkv_f32.clone(), heads, head_dim);
+        let m_ref = crate::models::burn::hydra::ops::merge_heads(q_ref.clone());
+
+        for dtype in [DType::F32, DType::BF16] {
+            let qkv = qkv_f32.clone().cast(dtype);
+            let (q, k, v) = launch_qkv_split(to_cube(qkv), batch, seq, heads, head_dim);
+            let q = from_cube::<4>(q).cast(DType::F32);
+            let k = from_cube::<4>(k).cast(DType::F32);
+            let v = from_cube::<4>(v).cast(DType::F32);
+            let q_diff: f32 = (q - q_ref.clone().cast(dtype).cast(DType::F32))
+                .abs()
+                .max()
+                .into_scalar();
+            let k_diff: f32 = (k - k_ref.clone().cast(dtype).cast(DType::F32))
+                .abs()
+                .max()
+                .into_scalar();
+            let v_diff: f32 = (v - v_ref.clone().cast(dtype).cast(DType::F32))
+                .abs()
+                .max()
+                .into_scalar();
+            println!("qkv_split ({dtype:?}): q={q_diff} k={k_diff} v={v_diff}");
+            assert!(q_diff == 0.0 && k_diff == 0.0 && v_diff == 0.0);
+
+            // merge(split) must round-trip the q third of the packed input.
+            let q2 = from_cube::<4>(
+                launch_qkv_split(
+                    to_cube(qkv_f32.clone().cast(dtype)),
+                    batch,
+                    seq,
+                    heads,
+                    head_dim,
+                )
+                .0,
+            );
+            let m = from_cube::<3>(launch_merge_heads(to_cube(q2))).cast(DType::F32);
+            let m_diff: f32 = (m - m_ref.clone()).abs().max().into_scalar();
+            println!("merge_heads round-trip ({dtype:?}): {m_diff}");
+            assert!(m_diff < 0.05, "merge_heads {dtype:?} diff: {m_diff}");
         }
     }
 }

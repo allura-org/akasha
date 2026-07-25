@@ -2040,6 +2040,83 @@ impl FusedAttentionBackend for burn::backend::candle::Candle {}
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedAttentionBackend for burn::backend::NdArray {}
 
+// ---------------------------------------------------------------------------
+// Backend-specific QKV layout kernels (split / merge_heads)
+// ---------------------------------------------------------------------------
+
+/// Backends that provide fused QKV split / merge_heads layout kernels.
+pub trait FusedQkvLayoutBackend: Backend {
+    /// Split `[batch, seq, 3 * hidden]` packed QKV into q/k/v of
+    /// `[batch, n_heads, seq, head_dim]`.
+    fn split_qkv_dispatch(
+        x: FloatTensor<Self>,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let (q, k, v) = super::ops::split_qkv(x_t, n_heads, head_dim);
+        let into_float = |t: Tensor<Self, 4>| match t.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("split_qkv returns float tensors"),
+        };
+        (into_float(q), into_float(k), into_float(v))
+    }
+
+    /// Merge `[batch, n_heads, seq, head_dim]` into `[batch, seq, hidden]`.
+    fn merge_heads_dispatch(x: FloatTensor<Self>) -> FloatTensor<Self> {
+        let x_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(x));
+        match super::ops::merge_heads(x_t).into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("merge_heads returns a float tensor"),
+        }
+    }
+}
+
+#[cfg(feature = "burn-candle")]
+impl FusedQkvLayoutBackend for burn::backend::candle::Candle {}
+
+#[cfg(feature = "burn-flex")]
+impl FusedQkvLayoutBackend for burn::backend::flex::Flex {}
+
+#[cfg(feature = "burn-wgpu")]
+impl FusedQkvLayoutBackend for burn::backend::Wgpu {}
+
+#[cfg(feature = "burn-cuda")]
+impl FusedQkvLayoutBackend for burn::backend::Cuda {
+    fn split_qkv_dispatch(
+        x: FloatTensor<Self>,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        if !gpu_kernels::fused_layout_enabled() {
+            let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+            let (q, k, v) = super::ops::split_qkv(x_t, n_heads, head_dim);
+            let into_float = |t: Tensor<Self, 4>| match t.into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("split_qkv returns float tensors"),
+            };
+            return (into_float(q), into_float(k), into_float(v));
+        }
+        use cubecl::cuda::CudaRuntime;
+        gpu_kernels::gpu_split_qkv::<CudaRuntime>(&x, n_heads, head_dim)
+    }
+
+    fn merge_heads_dispatch(x: FloatTensor<Self>) -> FloatTensor<Self> {
+        if !gpu_kernels::fused_layout_enabled() {
+            let x_t = Tensor::<Self, 4>::from_primitive(TensorPrimitive::Float(x));
+            return match super::ops::merge_heads(x_t).into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("merge_heads returns a float tensor"),
+            };
+        }
+        use cubecl::cuda::CudaRuntime;
+        gpu_kernels::gpu_merge_heads::<CudaRuntime>(&x)
+    }
+}
+
+#[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
+impl FusedQkvLayoutBackend for burn::backend::NdArray {}
+
 #[cfg(all(test, feature = "burn-candle"))]
 #[allow(deprecated)]
 mod tests {

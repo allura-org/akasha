@@ -10,10 +10,10 @@ use burn::tensor::{BoolStore, DType, TensorPrimitive};
 use super::fused_ops::{
     BlockWorkspace, FastLinearBackend, FastRmsNormBackend, FusedAttentionBackend, FusedGluBackend,
     FusedHydraMidBlockBackend, FusedHydraPoolBackend, FusedHydraPoolTailBackend, FusedMlpBackend,
-    FusedNaFlexAttnBackend, FusedNaFlexBlockBackend, fused_attention, fused_hydra_pool, fused_mlp,
-    fused_na_flex_block, fused_norm_linear_glu_proj, fused_norm_mlp,
+    FusedNaFlexAttnBackend, FusedNaFlexBlockBackend, FusedQkvLayoutBackend, fused_attention,
+    fused_hydra_pool, fused_mlp, fused_na_flex_block, fused_norm_linear_glu_proj, fused_norm_mlp,
 };
-use super::ops::{merge_heads, rms_norm, split_qkv, vecdot};
+use super::ops::{rms_norm, vecdot};
 
 pub const NAFLEX_HEADS: usize = 16;
 pub const NAFLEX_HEAD_DIM: usize = 72; // 1152 / 16
@@ -331,22 +331,34 @@ pub struct NaFlexAttn<B: Backend> {
     pub proj_w_bf16: Option<super::fused_ops::PackedBf16Weight>,
 }
 
-impl<B: FastLinearBackend + FusedAttentionBackend> NaFlexAttn<B> {
+impl<B: FastLinearBackend + FusedAttentionBackend + FusedQkvLayoutBackend> NaFlexAttn<B> {
     pub fn forward(&self, x: Tensor<B, 3>, mask: Option<Tensor<B, 4, Bool>>) -> Tensor<B, 3> {
         let t0 = Instant::now();
         let qkv = fast_linear(x, &self.qkv);
         let t_qkv = t0.elapsed();
 
         let t1 = Instant::now();
-        let (q, k, v) = split_qkv(qkv, NAFLEX_HEADS, NAFLEX_HEAD_DIM);
+        let qkv_prim = match qkv.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("qkv projection is a float tensor"),
+        };
+        let (q, k, v) = B::split_qkv_dispatch(qkv_prim, NAFLEX_HEADS, NAFLEX_HEAD_DIM);
         let t_split = t1.elapsed();
 
         let t2 = Instant::now();
-        let out = fused_attention(q, k, v, mask);
+        let out = Tensor::<B, 4>::from_primitive(TensorPrimitive::Float(B::fused_attention(
+            q, k, v,
+            mask.map(|m| m.into_primitive()),
+        )));
         let t_attn = t2.elapsed();
 
         let t3 = Instant::now();
-        let out = merge_heads(out);
+        let out = Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(B::merge_heads_dispatch(
+            match out.into_primitive() {
+                TensorPrimitive::Float(t) => t,
+                _ => unreachable!("attention returns a float tensor"),
+            },
+        )));
         let t_merge = t3.elapsed();
 
         let t4 = Instant::now();
