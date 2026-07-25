@@ -1639,6 +1639,56 @@ impl FusedAttentionBackend for burn::backend::Cuda {
     }
 }
 
+/// Target head_dim for GPU attention padding, from `AKASHA_HYDRA_ATTN_PAD`
+/// (default 0 = disabled). Zero-pads NaFlex's head_dim 72 up to a multiple
+/// of 32 so the batched scores/AV matmuls run on aligned tiles. Measured on
+/// an RTX 4090 as a wash (96: ~0.098, 80: ~0.099, off: ~0.095 s/img) — the
+/// pad/slice copies eat the tiling gain — so it stays off by default.
+#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
+fn attn_pad_target() -> usize {
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("AKASHA_HYDRA_ATTN_PAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// GPU attention entry point. Zero-pads head_dim up to [`attn_pad_target`]
+/// before delegating to the (query-tiled) attention implementation. Padded
+/// lanes are zero, so they contribute nothing to the scores dot product; the
+/// softmax scale is pinned to the *original* head_dim (Burn would otherwise
+/// derive `1/sqrt(head_dim)` from the padded dim), and the output is sliced
+/// back. Results are unchanged apart from float noise from different kernel
+/// tiling.
+#[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
+fn chunked_masked_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    mask: Option<Tensor<B, 4, Bool>>,
+) -> Tensor<B, 4> {
+    let [batch, heads, seq_q, head_dim] = q.dims();
+    let target = attn_pad_target();
+    if target <= head_dim {
+        return chunked_masked_attention_inner(q, k, v, mask, None);
+    }
+
+    let pad = target - head_dim;
+    let device = q.device();
+    let dtype = q.dtype();
+    let seq_kv = k.dims()[2];
+    let zeros = |rows: usize| Tensor::<B, 4>::zeros([batch, heads, rows, pad], &device).cast(dtype);
+    let q = Tensor::cat(vec![q, zeros(seq_q)], 3);
+    let k = Tensor::cat(vec![k, zeros(seq_kv)], 3);
+    let v = Tensor::cat(vec![v, zeros(seq_kv)], 3);
+    let scale = Some(1.0 / (head_dim as f64).sqrt());
+
+    chunked_masked_attention_inner(q, k, v, mask, scale)
+        .slice([0..batch, 0..heads, 0..seq_q, 0..head_dim])
+}
+
 /// Attention tiled over the query dimension when the scores tensor would be
 /// large.
 ///
@@ -1652,17 +1702,22 @@ impl FusedAttentionBackend for burn::backend::Cuda {
 /// buffer" even when plenty of VRAM is free. Tiling over `seq_q` keeps each
 /// chunk small; small attentions pass through untouched.
 #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
-fn chunked_masked_attention<B: Backend>(
+fn chunked_masked_attention_inner<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
     mask: Option<Tensor<B, 4, Bool>>,
+    scale: Option<f64>,
 ) -> Tensor<B, 4> {
     /// Target ceiling for one scores chunk, in bytes.
     const MAX_SCORES_BYTES: usize = 1 << 30; // 1 GiB
 
     let [batch, heads, seq_q, head_dim] = q.dims();
     let seq_kv = k.dims()[2];
+    let options = AttentionModuleOptions {
+        scale,
+        ..Default::default()
+    };
 
     let scores_bytes = batch * heads * seq_q * seq_kv * 4;
     if scores_bytes <= MAX_SCORES_BYTES {
@@ -1672,7 +1727,7 @@ fn chunked_masked_attention<B: Backend>(
             mask.as_ref().map(|m| m.dims()),
             scores_bytes / (1024 * 1024),
         );
-        return attention(q, k, v, mask, None, AttentionModuleOptions::default());
+        return attention(q, k, v, mask, None, options);
     }
     // Even without a mask, Burn's "fused" attention may not take a flash
     // kernel (e.g. unaligned seq_kv) and instead materializes a scores
@@ -1689,7 +1744,7 @@ fn chunked_masked_attention<B: Backend>(
                 mask_t.dims(),
                 scores_bytes / (1024 * 1024),
             );
-            return attention(q, k, v, mask, None, AttentionModuleOptions::default());
+            return attention(q, k, v, mask, None, options);
         }
     }
 
@@ -1711,7 +1766,7 @@ fn chunked_masked_attention<B: Backend>(
             v.clone(),
             mask.clone(),
             None,
-            AttentionModuleOptions::default(),
+            options.clone(),
         ));
         start = end;
     }
