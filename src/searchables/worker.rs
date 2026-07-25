@@ -205,32 +205,100 @@ impl SearchWorker {
 
         // Split the config group into inference chunks sized to what the model
         // says it can handle without blowing up memory.
-        for chunk in jobs.chunks(max_batch) {
+        //
+        // The loop is pipelined one chunk ahead: the next chunk's inference
+        // (path resolution, CPU preprocess, GPU forward) is spawned *before*
+        // this chunk's results are written, so the GPU never idles behind DB
+        // commits. The model's internal workspace mutex serializes the actual
+        // forwards, so at most one extra chunk's worth of tensors is in
+        // flight.
+        let chunks: Vec<&[crate::db::searchable::JobRow]> = jobs.chunks(max_batch).collect();
+        let mut pending: Option<
+            tokio::task::JoinHandle<anyhow::Result<Vec<crate::models::ModelOutput>>>,
+        > = None;
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let handle = match pending.take() {
+                Some(h) => Some(h),
+                None => match self.spawn_chunk_infer(chunk, model.clone()).await {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SearchWorker: chunk preprocessing failed");
+                        self.fail_chunk(chunk, &e).await;
+                        None
+                    }
+                },
+            };
+
+            // Kick off the next chunk before awaiting this chunk's results.
+            let next = match chunks.get(i + 1) {
+                Some(next_chunk) => match self.spawn_chunk_infer(next_chunk, model.clone()).await
+                {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "SearchWorker: chunk preprocessing failed");
+                        self.fail_chunk(next_chunk, &e).await;
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let Some(handle) = handle else {
+                pending = next;
+                continue;
+            };
+
+            let outputs = match handle.await {
+                Ok(Ok(outputs)) => outputs,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, chunk_size = chunk.len(), "SearchWorker: inference chunk failed");
+                    self.fail_chunk(chunk, &e).await;
+                    pending = next;
+                    continue;
+                }
+                Err(e) => {
+                    let e = anyhow::anyhow!("inference task panicked: {e}");
+                    tracing::warn!(error = %e, chunk_size = chunk.len(), "SearchWorker: inference chunk failed");
+                    self.fail_chunk(chunk, &e).await;
+                    pending = next;
+                    continue;
+                }
+            };
+
             if let Err(e) = self
-                .process_chunk(chunk, &cfg, &model_config, model.clone())
+                .write_chunk_results(chunk, outputs, &cfg, &model_config)
                 .await
             {
                 tracing::warn!(
                     error = %e,
                     chunk_size = chunk.len(),
-                    "SearchWorker: inference chunk failed"
+                    "SearchWorker: writing chunk results failed"
                 );
-                for job in chunk {
-                    let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
-                }
+                self.fail_chunk(chunk, &e).await;
             }
+
+            pending = next;
         }
 
         Ok(())
     }
 
-    async fn process_chunk(
+    /// Mark every job in a failed chunk as failed.
+    async fn fail_chunk(&self, chunk: &[crate::db::searchable::JobRow], e: &anyhow::Error) {
+        for job in chunk {
+            let _ = crate::db::searchable::fail_job(&self.pool, job.id, &e.to_string()).await;
+        }
+    }
+
+    /// Resolve media paths for a chunk and spawn its inference on a blocking
+    /// thread. Path resolution is async (DB); inference itself is blocking.
+    async fn spawn_chunk_infer(
         &self,
         jobs: &[crate::db::searchable::JobRow],
-        cfg: &crate::db::searchable::SearchableConfig,
-        model_config: &crate::config::ModelConfig,
         model: Arc<dyn crate::models::Model>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<Vec<crate::models::ModelOutput>>>>
+    {
         use std::path::Path;
 
         let mut paths = Vec::with_capacity(jobs.len());
@@ -241,13 +309,21 @@ impl SearchWorker {
             paths.push(media.absolute_path);
         }
 
-        let outputs = tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || {
             let path_refs: Vec<&Path> = paths.iter().map(|p| Path::new(p)).collect();
             model.infer_batch(&path_refs)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("inference task panicked: {e}"))??;
+        }))
+    }
 
+    /// Write a chunk's inference outputs to the database and mark the jobs
+    /// complete.
+    async fn write_chunk_results(
+        &self,
+        jobs: &[crate::db::searchable::JobRow],
+        outputs: Vec<crate::models::ModelOutput>,
+        cfg: &crate::db::searchable::SearchableConfig,
+        model_config: &crate::config::ModelConfig,
+    ) -> anyhow::Result<()> {
         if outputs.len() != jobs.len() {
             anyhow::bail!(
                 "model returned {} outputs for {} jobs",
