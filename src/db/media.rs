@@ -479,30 +479,42 @@ pub async fn mark_present_by_path(
     Ok(result.rows_affected())
 }
 
-/// Permanently delete all rows that are currently marked missing.
+/// Permanently delete all media rows that are currently marked missing, plus
+/// all folder rows marked missing. Deleting a missing folder cascade-deletes
+/// its subfolders and their media (present or not — everything under a missing
+/// folder is unreachable by definition).
 /// This is an explicit, user-initiated action from the DB Management menu.
-pub async fn delete_missing(pool: &SqlitePool) -> anyhow::Result<u64> {
+/// Returns `(media rows deleted, folder rows deleted)`.
+pub async fn delete_missing(pool: &SqlitePool) -> anyhow::Result<(u64, u64)> {
     let mut tx = pool.begin().await?;
 
     // Virtual FTS5 tables cannot declare foreign keys, so clean up orphans
-    // explicitly before deleting the parent media_files rows.
-    sqlx::query(
-        "DELETE FROM searchable_tags_fts WHERE media_file_id IN (SELECT id FROM media_files WHERE is_present = 0)"
-    )
+    // explicitly before deleting the parent media_files rows. This covers both
+    // media marked missing directly and media under a missing folder (which is
+    // removed by the folder cascade below).
+    const MISSING_MEDIA: &str =
+        "SELECT id FROM media_files WHERE is_present = 0 OR folder_id IN (SELECT id FROM folders WHERE is_present = 0)";
+    sqlx::query(&format!(
+        "DELETE FROM searchable_tags_fts WHERE media_file_id IN ({MISSING_MEDIA})"
+    ))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "DELETE FROM searchable_text_fts WHERE media_file_id IN (SELECT id FROM media_files WHERE is_present = 0)"
-    )
+    sqlx::query(&format!(
+        "DELETE FROM searchable_text_fts WHERE media_file_id IN ({MISSING_MEDIA})"
+    ))
     .execute(&mut *tx)
     .await?;
 
-    let result = sqlx::query("DELETE FROM media_files WHERE is_present = 0")
+    let media = sqlx::query("DELETE FROM media_files WHERE is_present = 0")
+        .execute(&mut *tx)
+        .await?;
+
+    let folders = sqlx::query("DELETE FROM folders WHERE is_present = 0")
         .execute(&mut *tx)
         .await?;
 
     tx.commit().await?;
-    Ok(result.rows_affected())
+    Ok((media.rows_affected(), folders.rows_affected()))
 }
 
 #[derive(sqlx::FromRow)]
@@ -716,12 +728,84 @@ mod tests {
         let gone = all.iter().find(|m| m.relative_path == "gone.jpg").unwrap();
         assert!(!gone.is_present);
 
-        let deleted = delete_missing(&pool).await.unwrap();
-        assert_eq!(deleted, 1);
+        let (media_deleted, folders_deleted) = delete_missing(&pool).await.unwrap();
+        assert_eq!(media_deleted, 1);
+        assert_eq!(folders_deleted, 0);
 
         let all = list_by_folder(&pool, fid).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].relative_path, "present.jpg");
+    }
+
+    #[tokio::test]
+    async fn delete_missing_purges_missing_folders_and_their_media() {
+        let pool = setup_pool().await;
+        let root = folder::insert(&pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+        let sub = folder::insert(
+            &pool, Some(root), "/tmp/root/gone", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+
+        let mid = upsert(
+            &pool,
+            sub,
+            "a.jpg",
+            "/tmp/root/gone/a.jpg",
+            "hash1",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Present media under the soon-to-be-missing folder: it should be
+        // cascade-deleted with the folder, and its FTS rows cleaned up.
+        crate::db::searchable::update_description_json(&pool, mid, "blip", "a cat")
+            .await
+            .unwrap();
+        let keep = upsert(
+            &pool,
+            root,
+            "keep.jpg",
+            "/tmp/root/keep.jpg",
+            "hash2",
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let marked = folder::mark_missing(&pool, sub).await.unwrap();
+        assert_eq!(marked, 1);
+
+        // The folder's media is marked missing with it.
+        let media = get_by_id(&pool, mid).await.unwrap().unwrap();
+        assert!(!media.is_present);
+
+        let (media_deleted, folders_deleted) = delete_missing(&pool).await.unwrap();
+        assert_eq!(folders_deleted, 1);
+        assert!(media_deleted >= 1);
+
+        // Folder, its media, and its FTS rows are gone; unrelated rows survive.
+        assert!(folder::get_by_path(&pool, "/tmp/root/gone").await.unwrap().is_none());
+        assert!(get_by_id(&pool, mid).await.unwrap().is_none());
+        assert!(get_by_id(&pool, keep).await.unwrap().is_some());
+        let fts_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM searchable_text_fts WHERE media_file_id = ?1",
+        )
+        .bind(mid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(fts_count.0, 0);
     }
 
     #[tokio::test]

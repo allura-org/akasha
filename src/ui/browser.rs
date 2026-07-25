@@ -972,6 +972,7 @@ mod tests {
             thumbnail_cache_mode: cache_mode.map(|s| s.to_string()),
             thumbnail_cache_folder: None,
             thumbnail_cache_fallback: "disable".to_string(),
+            is_present: true,
         }
     }
 

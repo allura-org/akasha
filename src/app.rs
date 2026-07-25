@@ -479,6 +479,10 @@ impl AkashaApp {
                             let root_id = root_map.get(&f.id).copied().unwrap_or(f.id);
                             reachable_roots.contains(&root_id)
                         })
+                        // Hide folders marked missing (path vanished from disk).
+                        // The DB rows (and their media, tags, etc.) are kept so
+                        // everything is restored if the folder reappears.
+                        .filter(|f| f.is_present)
                         // Hide folders rejected by their import root's exclude/include
                         // filters. The DB rows (and their media, tags, etc.) are kept so
                         // removing the filter later restores everything as-is.
@@ -540,12 +544,14 @@ impl AkashaApp {
         let pool = Arc::clone(&self.pool);
         let imports_config = self.config.imports.clone();
         let media_tx = self.media_tx.clone();
+        let folders_tx = self.folders_tx.clone();
         let epoch = self.browser.media_epoch;
         let selected_folder_id = self.browser.selected_folder_id;
 
         self.rt.spawn(async move {
             let mut upserted = 0usize;
             let mut marked_missing = 0usize;
+            let mut folders_changed = false;
             let mut affected_folder_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
             for change in changes {
@@ -568,6 +574,12 @@ impl AkashaApp {
                             Ok(_) => {
                                 upserted += 1;
                                 affected_folder_ids.insert(folder_id);
+                                // The path exists again; restore the folder (and
+                                // any ancestors) if it was marked missing.
+                                match db::folder::mark_present_with_ancestors(&pool, folder_id).await {
+                                    Ok(n) => folders_changed |= n > 0,
+                                    Err(e) => tracing::warn!("Watcher folder restore failed for {}: {e}", change.absolute_path.display()),
+                                }
                             }
                             Err(e) => tracing::warn!("Watcher upsert failed for {}: {e}", change.absolute_path.display()),
                         }
@@ -580,8 +592,20 @@ impl AkashaApp {
                             }
                             Err(e) => tracing::warn!("Watcher mark-missing failed for {}: {e}", change.absolute_path.display()),
                         }
+                        // If the removed path was a tracked folder itself, mark
+                        // it and everything under it missing — per-file events
+                        // alone don't cover the folder row.
+                        match db::folder::mark_missing_by_path(&pool, change.absolute_path.to_string_lossy().as_ref()).await {
+                            Ok(n) => folders_changed |= n > 0,
+                            Err(e) => tracing::warn!("Watcher folder mark-missing failed for {}: {e}", change.absolute_path.display()),
+                        }
                     }
                 }
+            }
+
+            if folders_changed {
+                let result = db::folder::list_all(&pool).await;
+                let _ = folders_tx.send(result.map_err(|e| e.to_string()));
             }
 
             if upserted > 0 || marked_missing > 0 {
@@ -1296,8 +1320,8 @@ impl eframe::App for AkashaApp {
             let selected_folder_id = self.browser.selected_folder_id;
             self.rt.spawn(async move {
                 match db::media::delete_missing(&pool).await {
-                    Ok(n) => {
-                        tracing::info!("Cleared {} missing records", n);
+                    Ok((media, folders)) => {
+                        tracing::info!("Cleared {} missing media records and {} missing folders", media, folders);
                         if let Some(folder_id) = selected_folder_id {
                             let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await;
                             let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));

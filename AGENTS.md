@@ -128,7 +128,7 @@ src/
   theme.rs       — Custom flat egui theme
   db/
     mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
-    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`
+    folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `list_subtree`, `mark_missing`, `mark_missing_by_path`, `mark_present_with_ancestors`
     media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `mark_missing`, `mark_missing_by_path`, `mark_present_by_path`, `delete_missing`, `delete_by_path`, `search_summaries`
     searchable.rs — Searchable config/value CRUD and generic `job_queue` helpers
   ui/
@@ -161,6 +161,8 @@ Migrations live in `migrations/` and are embedded at compile time.
 - `path` (unique, absolute)
 - `recursive` (bool), `flatten` (bool)
 - `scan_complete` (bool, DEFAULT 0) — per-subfolder completion tracking
+- `is_present` (bool, DEFAULT 1) — `0` means the folder's path was gone the last time the scanner/watcher checked; rows and media metadata are preserved
+- `missing_since` (datetime) — set to `CURRENT_TIMESTAMP` when `is_present` becomes `0`
 - `exclude` (JSON array string), `include` (JSON array string)
 - `thumbnail_cache_mode` (optional string: 'disabled' | 'global' | 'custom')
 - `thumbnail_cache_folder` (optional string)
@@ -208,6 +210,7 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Search results are hydrated with `search_summaries()`, which uses `json_each()` to match a batch of media IDs.
 - The thumbnail cache uses a 2-level hash prefix (`aa/bb/{hash}_{size}.webp`) to avoid ext4/xfs metadata stress with hundreds of thousands of files.
 - Missing files: rows with `is_present = 0` are preserved in `media_files` so metadata (hashes, Searchable values, embeddings, etc.) survives temporary unavailability. Any bulk operation or background job that touches media rows must skip `is_present = 0` records (the thumbnail queue, viewer, and `claim_pending_jobs` already do this). A thumbnail that fails with ENOENT also marks the row missing, which covers files deleted while the app was closed.
+- Missing folders: the same preservation philosophy applies to `folders` (`is_present = 0`). The scanner reconciles every folder row in the scanned subtree against disk at the end of a scan (vanished → folder + its media marked missing; reappeared → restored and flagged for rescan), and the watcher marks removed directory paths missing via `db::folder::mark_missing_by_path`. Missing folders are hidden from the tree at display time (`poll_folders_events`); "Clear missing records" purges them (cascade-deleting their subfolders and media, with explicit FTS cleanup) along with missing media.
 - Excluded folders: import `exclude`/`include` filters are enforced at display time only — `poll_folders_events` hides rejected folders from the tree and `poll_media_events` hides their media from the grid/search — without deleting DB rows, so removing a filter later restores everything (tags, metadata) as-is. Failed thumbnails are tracked in `BrowserPanel::failed_thumbnails` and not retried until the next media refresh.
 - The bare-minimum Searchable is `filename` (kind `text`), seeded by migration `008_seed_filename_searchable.sql`.
 

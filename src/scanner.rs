@@ -343,6 +343,39 @@ pub async fn scan_folder(
         }
     }
 
+    // Folders the walker entered but where no supported files were seen still
+    // need a missing sweep (e.g. all their files were deleted while we weren't
+    // watching). An empty path list marks every present record in the folder.
+    for &folder_id in folder_ids.values() {
+        if !folder_paths.contains_key(&folder_id) {
+            let marked = crate::db::media::mark_missing(pool, folder_id, &[]).await?;
+            if marked > 0 {
+                info!("Marked {} missing records in emptied folder {}", marked, folder_id);
+            }
+        }
+    }
+
+    // Reconcile folder rows against disk: folders whose path no longer exists
+    // are marked missing (hiding them from the tree while preserving metadata,
+    // same philosophy as missing files); folders that reappeared are restored
+    // and flagged so a later scan re-walks them.
+    for (id, path, present) in crate::db::folder::list_subtree(pool, root_folder_id).await? {
+        let exists = std::path::Path::new(&path).is_dir();
+        match (exists, present) {
+            (false, true) => {
+                if crate::db::folder::mark_missing(pool, id).await? > 0 {
+                    info!("Folder vanished, marked missing: {}", path);
+                }
+            }
+            (true, false) => {
+                crate::db::folder::mark_present_with_ancestors(pool, id).await?;
+                crate::db::folder::update_scan_complete(pool, id, false).await?;
+                info!("Folder reappeared, flagged for rescan: {}", path);
+            }
+            _ => {}
+        }
+    }
+
     info!(
         "Scan complete: {} files processed",
         scanned_count
