@@ -45,6 +45,13 @@ pub(crate) fn fused_ln_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("AKASHA_HYDRA_GPU_FUSED_LN").as_deref() != Ok("0"))
 }
 
+/// Whether the custom fused bias+GELU kernel is active (default on).
+/// `AKASHA_HYDRA_GPU_FUSED_GELU=0` falls back to burn's decomposed epilogue.
+pub(crate) fn fused_gelu_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AKASHA_HYDRA_GPU_FUSED_GELU").as_deref() != Ok("0"))
+}
+
 // ---------------------------------------------------------------------------
 // Kernels
 // ---------------------------------------------------------------------------
@@ -183,6 +190,64 @@ fn add_layernorm_kernel<F: Float, N: Size>(
 // ---------------------------------------------------------------------------
 // Host-side launch helpers (generic over the CubeCL runtime)
 // ---------------------------------------------------------------------------
+
+/// Fused `gelu_tanh(x + bias)` epilogue for the NaFlex MLP fc1 projection.
+/// One elementwise launch; GELU is the PyTorch tanh approximation
+/// `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))`, computed in F32.
+#[cube(launch, address_type = "dynamic")]
+fn bias_gelu_kernel<F: Float, N: Size>(
+    x: &LinearView<Vector<F, N>>,
+    bias: &LinearView<Vector<F, N>>,
+    out: &mut LinearView<Vector<F, N>, ReadWrite>,
+    n_vec: u32,
+    #[define(F)] _dtype: StorageType,
+) {
+    if !out.is_in_bounds(ABSOLUTE_POS) {
+        terminate!();
+    }
+    let col = ABSOLUTE_POS % (n_vec as usize);
+    let v: Vector<f32, N> =
+        Vector::cast_from(x[ABSOLUTE_POS]) + Vector::cast_from(bias[col]);
+    let sqrt_2_over_pi = Vector::<f32, N>::empty().fill(0.7978845608028654);
+    let coeff = Vector::<f32, N>::empty().fill(0.044715);
+    let half = Vector::<f32, N>::empty().fill(0.5);
+    let one = Vector::<f32, N>::empty().fill(1.0);
+    let inner = (v * coeff * (v * v) + v) * sqrt_2_over_pi;
+    out[ABSOLUTE_POS] = Vector::cast_from(v * half * (inner.tanh() + one));
+}
+
+fn launch_bias_gelu<R: CubeRuntime>(
+    x: CubeTensor<R>,
+    bias: CubeTensor<R>,
+) -> CubeTensor<R> {
+    assert_eq!(x.dtype, bias.dtype, "bias_gelu dtype mismatch");
+    let client = x.client.clone();
+    let device = x.device.clone();
+    let shape = x.shape();
+    let dtype = x.dtype;
+    let rank = shape.num_dims();
+    let hidden = shape[rank - 1];
+    let vec = vector_size(&x, hidden).min(vector_size(&bias, hidden));
+    let n_vec = hidden / vec;
+    let working_units = shape.num_elements() / vec;
+    let out = empty_device_dtype(client.clone(), device, shape.clone(), dtype);
+    let cube_dim = CubeDim::new(&client, working_units);
+    let cube_count = cubecl::calculate_cube_count_elemwise(&client, working_units, cube_dim);
+    bias_gelu_kernel::launch::<R>(
+        &client,
+        cube_count,
+        cube_dim,
+        AddressType::U32,
+        vec,
+        x.into_linear_view(),
+        bias.into_linear_view(),
+        out.clone().into_linear_view(),
+        n_vec as u32,
+        dtype.into(),
+    );
+    out
+}
+
 
 /// Widest I/O vector size the runtime supports that also divides `hidden`.
 /// Row pitch is always a multiple of 512 bytes, so it never constrains the
@@ -335,6 +400,47 @@ impl<R: CubeRuntime> Operation<FusionCubeRuntime<R>> for AddLayerNormOp<R> {
         handles.register_float_tensor::<InnerB<R>>(&out_sum.id, sum_t);
         handles.register_float_tensor::<InnerB<R>>(&out_norm.id, norm_t);
     }
+}
+
+#[derive(Clone, Debug)]
+struct BiasGeluOp<R: CubeRuntime> {
+    desc: CustomOpIr,
+    _r: PhantomData<R>,
+}
+
+impl<R: CubeRuntime> Operation<FusionCubeRuntime<R>> for BiasGeluOp<R> {
+    fn execute(
+        &self,
+        handles: &mut HandleContainer<<FusionCubeRuntime<R> as FusionRuntime>::FusionHandle>,
+    ) {
+        let ([x, bias], [out]) = self.desc.as_fixed();
+        let x = handles.get_float_tensor::<InnerB<R>>(x);
+        let bias = handles.get_float_tensor::<InnerB<R>>(bias);
+        let out_t = launch_bias_gelu(x, bias);
+        handles.register_float_tensor::<InnerB<R>>(&out.id, out_t);
+    }
+}
+
+/// `gelu_tanh(x + bias)` in a single kernel launch (NaFlex MLP fc1 epilogue).
+pub(crate) fn gpu_bias_gelu<R: CubeRuntime>(
+    x: &FusionTensor<FusionCubeRuntime<R>>,
+    bias: &FusionTensor<FusionCubeRuntime<R>>,
+) -> FusionTensor<FusionCubeRuntime<R>> {
+    let client = x.client.clone();
+    let streams = OperationStreams::with_inputs([x, bias]);
+    let out_ir = TensorIr::uninit(client.create_empty_handle(), x.shape.clone(), x.dtype);
+    let desc = CustomOpIr::new(
+        "hydra_bias_gelu",
+        &[x.clone().into_ir(), bias.clone().into_ir()],
+        &[out_ir],
+    );
+    let op = BiasGeluOp::<R> {
+        desc: desc.clone(),
+        _r: PhantomData,
+    };
+    client
+        .register(streams, OperationIr::Custom(desc), op)
+        .output()
 }
 
 /// `layer_norm(x)` in a single kernel launch. All tensors must share the same
@@ -555,6 +661,40 @@ mod tests {
                 norm_diff < 0.05,
                 "add_layernorm {dtype:?} norm diff: {norm_diff}"
             );
+        }
+    }
+
+    #[test]
+    fn bias_gelu_kernel_matches_reference() {
+        init_cubecl_runtime();
+        let device = CudaDevice::new(0);
+        let (rows, hidden) = (37usize, 4304usize);
+
+        let x_f32 = Tensor::<Inner, 2>::from_data(
+            TensorData::new(pattern(rows * hidden, 1, 3.0), [rows, hidden]),
+            &device,
+        );
+        let b_f32 = Tensor::<Inner, 1>::from_data(
+            TensorData::new(pattern(hidden, 3, 0.25), [hidden]),
+            &device,
+        );
+
+        let gelu = |v: Tensor<Inner, 2>| {
+            let inner = (v.clone().powf_scalar(3.0) * 0.044715 + v.clone()) * 0.7978845608028654;
+            v * 0.5 * (inner.tanh() + 1.0)
+        };
+        let expected = gelu(x_f32.clone() + b_f32.clone().reshape([1, hidden]));
+
+        for dtype in [DType::F32, DType::BF16] {
+            let x = x_f32.clone().cast(dtype);
+            let bias = b_f32.clone().cast(dtype);
+            let out = from_cube::<2>(launch_bias_gelu(to_cube(x), to_cube(bias)))
+                .cast(DType::F32);
+            let diff: f32 = (out - expected.clone()).abs().max().into_scalar();
+            println!("bias_gelu kernel max abs diff ({dtype:?}): {diff}");
+            // x magnitudes reach ~9 where BF16 half-ulp is 0.03125.
+            let tol = if dtype == DType::BF16 { 0.06 } else { 0.001 };
+            assert!(diff < tol, "bias_gelu {dtype:?} diff: {diff}");
         }
     }
 }

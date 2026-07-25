@@ -556,42 +556,7 @@ pub trait FusedMlpBackend: Backend {
     /// * `mlp`: NaFlexMlp module (cached weights are used by fast backends)
     /// * returns: `[batch, seq, out_features]`
     fn fused_mlp(x: FloatTensor<Self>, mlp: &super::modules::NaFlexMlp<Self>) -> FloatTensor<Self> {
-        let fc1_weight = match mlp.fc1.weight.val().into_primitive() {
-            TensorPrimitive::Float(t) => t,
-            _ => unreachable!("fc1 weight is a float tensor"),
-        };
-        let fc1_bias = mlp
-            .fc1
-            .bias
-            .as_ref()
-            .map(|b| match b.val().into_primitive() {
-                TensorPrimitive::Float(t) => t,
-                _ => unreachable!("fc1 bias is a float tensor"),
-            });
-        let fc2_weight = match mlp.fc2.weight.val().into_primitive() {
-            TensorPrimitive::Float(t) => t,
-            _ => unreachable!("fc2 weight is a float tensor"),
-        };
-        let fc2_bias = mlp
-            .fc2
-            .bias
-            .as_ref()
-            .map(|b| match b.val().into_primitive() {
-                TensorPrimitive::Float(t) => t,
-                _ => unreachable!("fc2 bias is a float tensor"),
-            });
-        match fused_mlp_fallback_tensor(
-            Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x)),
-            Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(fc1_weight)),
-            fc1_bias.map(|b| Tensor::<Self, 1>::from_primitive(TensorPrimitive::Float(b))),
-            Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(fc2_weight)),
-            fc2_bias.map(|b| Tensor::<Self, 1>::from_primitive(TensorPrimitive::Float(b))),
-        )
-        .into_primitive()
-        {
-            TensorPrimitive::Float(tensor) => tensor,
-            _ => unreachable!("fused_mlp returns a float tensor"),
-        }
+        fused_mlp_fallback_module(x, mlp)
     }
 
     /// Compute `residual + fc2(gelu(fc1(layer_norm(x, norm))))` as a single dispatch.
@@ -661,6 +626,49 @@ pub fn fused_norm_mlp<B: FusedMlpBackend>(
         norm,
         mlp,
     )))
+}
+
+/// Generic fallback implementation using Burn's high-level tensor API.
+fn fused_mlp_fallback_module<B: Backend>(
+    x: FloatTensor<B>,
+    mlp: &super::modules::NaFlexMlp<B>,
+) -> FloatTensor<B> {
+    let fc1_weight = match mlp.fc1.weight.val().into_primitive() {
+        TensorPrimitive::Float(t) => t,
+        _ => unreachable!("fc1 weight is a float tensor"),
+    };
+    let fc1_bias = mlp
+        .fc1
+        .bias
+        .as_ref()
+        .map(|b| match b.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fc1 bias is a float tensor"),
+        });
+    let fc2_weight = match mlp.fc2.weight.val().into_primitive() {
+        TensorPrimitive::Float(t) => t,
+        _ => unreachable!("fc2 weight is a float tensor"),
+    };
+    let fc2_bias = mlp
+        .fc2
+        .bias
+        .as_ref()
+        .map(|b| match b.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fc2 bias is a float tensor"),
+        });
+    match fused_mlp_fallback_tensor(
+        Tensor::<B, 3>::from_primitive(TensorPrimitive::Float(x)),
+        Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(fc1_weight)),
+        fc1_bias.map(|b| Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(b))),
+        Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(fc2_weight)),
+        fc2_bias.map(|b| Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(b))),
+    )
+    .into_primitive()
+    {
+        TensorPrimitive::Float(tensor) => tensor,
+        _ => unreachable!("fused_mlp returns a float tensor"),
+    }
 }
 
 /// Generic fallback implementation using Burn's high-level tensor API.
@@ -932,7 +940,62 @@ impl FusedMlpBackend for burn::backend::flex::Flex {}
 impl FusedMlpBackend for burn::backend::Wgpu {}
 
 #[cfg(feature = "burn-cuda")]
-impl FusedMlpBackend for burn::backend::Cuda {}
+impl FusedMlpBackend for burn::backend::Cuda {
+    fn fused_mlp(x: FloatTensor<Self>, mlp: &super::modules::NaFlexMlp<Self>) -> FloatTensor<Self> {
+        if !gpu_kernels::fused_gelu_enabled() || mlp.fc1.bias.is_none() {
+            return fused_mlp_fallback_module(x, mlp);
+        }
+        use cubecl::cuda::CudaRuntime;
+
+        // fc1 GEMM (tensor cores) -> custom fused bias+GELU kernel ->
+        // fc2 GEMM + bias (generic).
+        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        let [_, _, k] = x_t.dims();
+
+        let fc1_w = match mlp.fc1.weight.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fc1 weight is a float tensor"),
+        };
+        let fc1_b = match mlp.fc1.bias.as_ref().unwrap().val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fc1 bias is a float tensor"),
+        };
+        let fc2_w = match mlp.fc2.weight.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fc2 weight is a float tensor"),
+        };
+        let hidden = mlp.fc1.weight.dims()[1];
+
+        let h = Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(fc1_w));
+        let h = x_t.matmul(h.reshape([1, k, hidden]));
+        let h = match h.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("fc1 output is a float tensor"),
+        };
+        let h = gpu_kernels::gpu_bias_gelu::<CudaRuntime>(&h, &fc1_b);
+
+        let w2 = Tensor::<Self, 2>::from_primitive(TensorPrimitive::Float(fc2_w));
+        let out_features = w2.dims()[1];
+        let out = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(h))
+            .matmul(w2.reshape([1, hidden, out_features]));
+        let out = match mlp.fc2.bias.as_ref() {
+            Some(b) => {
+                let b_t = Tensor::<Self, 1>::from_primitive(TensorPrimitive::Float(
+                    match b.val().into_primitive() {
+                        TensorPrimitive::Float(t) => t,
+                        _ => unreachable!("fc2 bias is a float tensor"),
+                    },
+                ));
+                out + b_t.reshape([1, 1, out_features])
+            }
+            None => out,
+        };
+        match out.into_primitive() {
+            TensorPrimitive::Float(tensor) => tensor,
+            _ => unreachable!("fused_mlp returns a float tensor"),
+        }
+    }
+}
 
 #[cfg(not(any(feature = "burn-candle", feature = "burn-flex")))]
 impl FusedMlpBackend for burn::backend::NdArray {}
