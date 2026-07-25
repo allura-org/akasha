@@ -345,6 +345,46 @@ pub async fn delete_values_for_config(pool: &SqlitePool, searchable_config_id: i
     Ok(rows)
 }
 
+/// Map an output kind to the `media_files` JSON column holding its per-source
+/// predictions.
+fn prediction_column(kind: &str) -> Result<&'static str> {
+    match kind {
+        "tags" => Ok("tags_json"),
+        "description" => Ok("descriptions_json"),
+        "classification" => Ok("classifications_json"),
+        other => anyhow::bail!("unknown prediction output kind: {other}"),
+    }
+}
+
+/// Return the subset of `media_ids` that already have predictions stored for
+/// the given source (model/config name) and output kind. Used to skip
+/// re-processing items when "overwrite" is disabled.
+pub async fn media_ids_with_predictions(
+    pool: &SqlitePool,
+    kind: &str,
+    source: &str,
+    media_ids: &[i64],
+) -> Result<Vec<i64>> {
+    if media_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The column name comes from the fixed match above, never from user input.
+    let column = prediction_column(kind)?;
+    let sql = format!(
+        "SELECT m.id FROM media_files m
+         WHERE m.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?1))
+           AND EXISTS (SELECT 1 FROM json_each(m.{column}) je WHERE je.key = ?2)
+         ORDER BY m.id"
+    );
+    let ids_json = serde_json::to_string(media_ids)?;
+    let rows: Vec<(i64,)> = sqlx::query_as(&sql)
+        .bind(ids_json)
+        .bind(source)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
+}
+
 /// Read the current `[[models]]` registry and upsert a `searchable_configs`
 /// row for each output kind declared by each model. Any existing rows that are
 /// no longer present in the registry are disabled (not deleted) so their values
@@ -870,6 +910,74 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count.0, 0);
+    }
+
+    #[tokio::test]
+    async fn media_ids_with_predictions_filters_by_source_and_kind() {
+        let pool = setup_pool().await;
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            let id = crate::db::media::upsert(
+                &pool,
+                fid,
+                name,
+                &format!("/tmp/{name}"),
+                "hash",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("cat".to_string(), 0.9f32);
+        update_tags_json(&pool, ids[0], "wd-vit", tags.clone())
+            .await
+            .unwrap();
+        update_tags_json(&pool, ids[1], "other-model", tags)
+            .await
+            .unwrap();
+        update_description_json(&pool, ids[2], "wd-vit", "a cat")
+            .await
+            .unwrap();
+
+        // Only ids[0] has tags from "wd-vit".
+        let with_tags = media_ids_with_predictions(&pool, "tags", "wd-vit", &ids)
+            .await
+            .unwrap();
+        assert_eq!(with_tags, vec![ids[0]]);
+
+        // Only ids[2] has a description from "wd-vit".
+        let with_desc = media_ids_with_predictions(&pool, "description", "wd-vit", &ids)
+            .await
+            .unwrap();
+        assert_eq!(with_desc, vec![ids[2]]);
+
+        // No classifications yet.
+        let with_class = media_ids_with_predictions(&pool, "classification", "wd-vit", &ids)
+            .await
+            .unwrap();
+        assert!(with_class.is_empty());
+
+        // Unknown kinds and empty inputs are handled.
+        assert!(media_ids_with_predictions(&pool, "bogus", "wd-vit", &ids)
+            .await
+            .is_err());
+        assert!(media_ids_with_predictions(&pool, "tags", "wd-vit", &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

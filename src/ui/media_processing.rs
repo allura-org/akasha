@@ -2,7 +2,7 @@ use eframe::egui;
 
 use crate::config::{Config, ModelConfig};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaProcessingTarget {
     Single(i64),
     Folder(i64, bool),
@@ -30,6 +30,24 @@ pub struct MediaProcessingAction {
     pub output_kind: String,
     pub model_name: String,
     pub overwrite: bool,
+}
+
+/// The enqueue-relevant selection shown in the window. Reported back to the
+/// app each frame so it can compute an `EnqueuePreview` for the current
+/// target/selection combination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewQuery {
+    pub source_name: String,
+    pub output_kind: String,
+    pub overwrite: bool,
+}
+
+/// How many items a "Go" click would enqueue vs. skip with the current
+/// selection, computed asynchronously by the app.
+#[derive(Debug, Clone, Copy)]
+pub struct EnqueuePreview {
+    pub total: usize,
+    pub already_processed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +97,12 @@ pub fn show(
     running: bool,
     toggle: &mut bool,
     clear: &mut bool,
+    preview: Option<EnqueuePreview>,
+    preview_query: &mut Option<PreviewQuery>,
 ) -> Option<MediaProcessingAction> {
     let mut action = None;
     let mut close = false;
+    *preview_query = None;
 
     egui::Window::new("Media Processing")
         .open(open)
@@ -226,6 +247,29 @@ pub fn show(
                 ctx.memory_mut(|mem| {
                     mem.data.insert_persisted(egui::Id::new(overwrite_key), overwrite);
                 });
+
+                if target.is_some() {
+                    *preview_query = Some(PreviewQuery {
+                        source_name: models[selected].name.clone(),
+                        output_kind: sub_tab.output_kind().to_string(),
+                        overwrite,
+                    });
+                    match preview {
+                        Some(p) if overwrite => {
+                            ui.label(format!("{} item(s) will be enqueued.", p.total));
+                        }
+                        Some(p) => {
+                            let enqueued = p.total.saturating_sub(p.already_processed);
+                            ui.label(format!(
+                                "{} item(s) will be enqueued; {} already have predictions and will be skipped.",
+                                enqueued, p.already_processed
+                            ));
+                        }
+                        None => {
+                            ui.label("Counting items…");
+                        }
+                    }
+                }
 
                 ui.add_space(16.0);
                 let can_go = target.is_some();

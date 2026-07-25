@@ -33,6 +33,13 @@ pub enum ToastLevel {
     Error,
 }
 
+/// Identifies a Media Processing enqueue preview request: the target plus the
+/// model/kind/overwrite selection shown in the window.
+type PreviewKey = (
+    crate::ui::media_processing::MediaProcessingTarget,
+    crate::ui::media_processing::PreviewQuery,
+);
+
 pub struct AkashaApp {
     pub config: Config,
     pub pool: Arc<SqlitePool>,
@@ -57,6 +64,23 @@ pub struct AkashaApp {
     pub jobs_count_tx: std::sync::mpsc::Sender<usize>,
     pub search_worker_running: Arc<AtomicBool>,
 
+    /// Enqueue preview for the Media Processing window: the last selection the
+    /// window reported, the latest computed preview, and the channel async
+    /// preview tasks report back on.
+    mp_last_query: Option<PreviewKey>,
+    mp_preview: Option<(
+        PreviewKey,
+        crate::ui::media_processing::EnqueuePreview,
+    )>,
+    mp_preview_tx: std::sync::mpsc::Sender<(
+        PreviewKey,
+        crate::ui::media_processing::EnqueuePreview,
+    )>,
+    mp_preview_rx: std::sync::mpsc::Receiver<(
+        PreviewKey,
+        crate::ui::media_processing::EnqueuePreview,
+    )>,
+
     pub media_refresh_in_flight: bool,
     pub last_refresh: std::time::Instant,
 
@@ -79,6 +103,30 @@ pub struct AkashaApp {
     pub fps_accum_time: f32,
     pub fps_accum_frames: u32,
     pub fps_current: f32,
+}
+
+/// Resolve a media processing target to the list of present media ids it
+/// covers. Shared by job enqueueing and the enqueue preview.
+async fn resolve_media_processing_target(
+    pool: &SqlitePool,
+    target: &crate::ui::media_processing::MediaProcessingTarget,
+) -> anyhow::Result<Vec<i64>> {
+    use crate::ui::media_processing::MediaProcessingTarget;
+    match target {
+        MediaProcessingTarget::Single(id) => Ok(vec![*id]),
+        MediaProcessingTarget::Folder(folder_id, recursive) => {
+            let summaries = if *recursive {
+                db::media::list_summaries_by_folder_recursive(pool, *folder_id).await?
+            } else {
+                db::media::list_summaries_by_folder(pool, *folder_id).await?
+            };
+            Ok(summaries
+                .into_iter()
+                .filter(|m| m.is_present)
+                .map(|m| m.id)
+                .collect())
+        }
+    }
 }
 
 impl AkashaApp {
@@ -124,6 +172,10 @@ impl AkashaApp {
         let (media_tx, media_rx) = std::sync::mpsc::channel::<(u64, bool, Result<Vec<db::media::MediaSummary>, String>)>();
         let (folders_tx, folders_rx) = std::sync::mpsc::channel::<Result<Vec<db::folder::Folder>, String>>();
         let (jobs_count_tx, jobs_count_rx) = std::sync::mpsc::channel::<usize>();
+        let (mp_preview_tx, mp_preview_rx) = std::sync::mpsc::channel::<(
+            PreviewKey,
+            crate::ui::media_processing::EnqueuePreview,
+        )>();
         let (properties_tx, properties_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Background ticker: report pending/running job count every few seconds.
@@ -274,6 +326,10 @@ impl AkashaApp {
             jobs_count_rx,
             jobs_count_tx,
             search_worker_running: Arc::clone(&search_worker_running),
+            mp_last_query: None,
+            mp_preview: None,
+            mp_preview_tx,
+            mp_preview_rx,
             media_refresh_in_flight: false,
             last_refresh: std::time::Instant::now(),
             viewer_open: false,
@@ -908,8 +964,6 @@ impl AkashaApp {
     }
 
     fn enqueue_media_processing_jobs(&self, action: crate::ui::media_processing::MediaProcessingAction) {
-        use crate::ui::media_processing::MediaProcessingTarget;
-
         let job_kind = match action.output_kind.as_str() {
             "tags" => "tagger",
             "description" => "visionlanguage",
@@ -938,23 +992,32 @@ impl AkashaApp {
                 }
             };
 
-            let media_ids: Vec<i64> = match action.target {
-                MediaProcessingTarget::Single(id) => vec![id],
-                MediaProcessingTarget::Folder(folder_id, recursive) => {
-                    let result = if recursive {
-                        db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
-                    } else {
-                        db::media::list_summaries_by_folder(&pool, folder_id).await
-                    };
-                    match result {
-                        Ok(summaries) => summaries.into_iter().filter(|m| m.is_present).map(|m| m.id).collect(),
-                        Err(e) => {
-                            tracing::warn!("Failed to resolve media processing target: {e}");
-                            return;
-                        }
+            let media_ids: Vec<i64> = match resolve_media_processing_target(&pool, &action.target).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!("Failed to resolve media processing target: {e}");
+                    return;
+                }
+            };
+
+            // Unless overwriting, skip items that already have predictions from
+            // this source so we don't process the same items multiple times.
+            let total = media_ids.len();
+            let media_ids = if action.overwrite {
+                media_ids
+            } else {
+                match db::searchable::media_ids_with_predictions(&pool, &action.output_kind, &config.name, &media_ids).await {
+                    Ok(done) => {
+                        let done: HashSet<i64> = done.into_iter().collect();
+                        media_ids.into_iter().filter(|id| !done.contains(id)).collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to check existing predictions, enqueueing all: {e}");
+                        media_ids
                     }
                 }
             };
+            let skipped = total - media_ids.len();
 
             let params = serde_json::json!({
                 "model_name": action.model_name,
@@ -969,7 +1032,14 @@ impl AkashaApp {
                 }
             }
 
-            tracing::info!("Enqueued {} {} jobs for model {}", enqueued, job_kind, action.model_name);
+            if skipped > 0 {
+                tracing::info!(
+                    "Enqueued {} {} jobs for model {} ({} skipped, already have predictions)",
+                    enqueued, job_kind, action.model_name, skipped
+                );
+            } else {
+                tracing::info!("Enqueued {} {} jobs for model {}", enqueued, job_kind, action.model_name);
+            }
 
             // Refresh the current folder view so any status changes are visible.
             if let Some(folder_id) = selected_folder_id {
@@ -1384,6 +1454,20 @@ impl eframe::App for AkashaApp {
         if self.browser.media_processing_open {
             let mut toggle_queue = false;
             let mut clear_queue = false;
+
+            // Collect any enqueue previews that finished since the last frame.
+            while let Ok((key, preview)) = self.mp_preview_rx.try_recv() {
+                self.mp_preview = Some((key, preview));
+            }
+
+            // Only show a preview computed for the selection the window last
+            // reported; otherwise it shows a "counting" placeholder.
+            let preview = match (&self.mp_last_query, &self.mp_preview) {
+                (Some(q), Some((answered, p))) if q == answered => Some(*p),
+                _ => None,
+            };
+
+            let mut preview_query = None;
             if let Some(action) = crate::ui::media_processing::show(
                 ctx,
                 &mut self.browser.media_processing_open,
@@ -1393,9 +1477,56 @@ impl eframe::App for AkashaApp {
                 self.search_worker_running.load(Ordering::Relaxed),
                 &mut toggle_queue,
                 &mut clear_queue,
+                preview,
+                &mut preview_query,
             ) {
                 self.push_toast("Enqueuing media processing jobs…".to_string(), ToastLevel::Info);
                 self.enqueue_media_processing_jobs(action);
+            }
+
+            // When the target/selection changed, compute a fresh preview.
+            let current_key: Option<PreviewKey> =
+                match (self.browser.media_processing_target.clone(), preview_query) {
+                    (Some(t), Some(q)) => Some((t, q)),
+                    _ => None,
+                };
+            if current_key != self.mp_last_query {
+                let already_answered = matches!(&self.mp_preview, Some((answered, _)) if Some(answered) == current_key.as_ref());
+                self.mp_last_query = current_key.clone();
+                if let Some(key) = current_key {
+                    if !already_answered {
+                        let pool = Arc::clone(&self.pool);
+                        let tx = self.mp_preview_tx.clone();
+                        self.rt.spawn(async move {
+                            let result = async {
+                                let media_ids = resolve_media_processing_target(&pool, &key.0).await?;
+                                let already_processed = if key.1.overwrite {
+                                    0
+                                } else {
+                                    db::searchable::media_ids_with_predictions(
+                                        &pool,
+                                        &key.1.output_kind,
+                                        &key.1.source_name,
+                                        &media_ids,
+                                    )
+                                    .await?
+                                    .len()
+                                };
+                                Ok::<_, anyhow::Error>(crate::ui::media_processing::EnqueuePreview {
+                                    total: media_ids.len(),
+                                    already_processed,
+                                })
+                            }
+                            .await;
+                            match result {
+                                Ok(p) => {
+                                    let _ = tx.send((key, p));
+                                }
+                                Err(e) => tracing::warn!("Failed to compute enqueue preview: {e}"),
+                            }
+                        });
+                    }
+                }
             }
             if toggle_queue {
                 let now_running = !self.search_worker_running.load(Ordering::Relaxed);
