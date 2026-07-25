@@ -655,11 +655,68 @@ impl FusedNaFlexBlockBackend for burn::backend::Cuda {
     ) -> FloatTensor<Self> {
         // Generic tensor-op path. Note: this must NOT call `block.forward`
         // (that dispatches back to this trait method and recurses forever).
-        let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+        if !super::gpu_kernels::fused_ln_enabled() {
+            let x_t = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(x));
+            let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
+            let attn = block.attn.forward(block.norm1.forward(x_t.clone()), mask_t);
+            let x_t = x_t + attn;
+            let out = x_t.clone() + block.mlp.forward(block.norm2.forward(x_t));
+            return match out.into_primitive() {
+                TensorPrimitive::Float(tensor) => tensor,
+                _ => unreachable!("NaFlexBlock returns a float tensor"),
+            };
+        }
+
+        // Fused-kernel path: LayerNorms (and the post-attention residual add)
+        // run as single custom CubeCL kernels; attention and the MLP stay on
+        // generic burn ops (their GEMMs already hit tensor cores).
+        use cubecl::cuda::CudaRuntime;
+
+        let norm1_gamma = match block.norm1.gamma.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("norm1 gamma is a float tensor"),
+        };
+        let norm1_beta = block.norm1.beta.as_ref().map(|b| match b.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("norm1 beta is a float tensor"),
+        });
+        let normed1 = super::gpu_kernels::gpu_layernorm::<CudaRuntime>(
+            &x,
+            &norm1_gamma,
+            norm1_beta.as_ref(),
+            super::gpu_kernels::LN_EPS,
+        );
+
         let mask_t = mask.map(|m| Tensor::<Self, 4, Bool>::from_primitive(m));
-        let attn = block.attn.forward(block.norm1.forward(x_t.clone()), mask_t);
-        let x_t = x_t + attn;
-        let out = x_t.clone() + block.mlp.forward(block.norm2.forward(x_t));
+        let attn = block.attn.forward(
+            Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(normed1)),
+            mask_t,
+        );
+        let attn = match attn.into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("NaFlexAttn returns a float tensor"),
+        };
+
+        let norm2_gamma = match block.norm2.gamma.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("norm2 gamma is a float tensor"),
+        };
+        let norm2_beta = block.norm2.beta.as_ref().map(|b| match b.val().into_primitive() {
+            TensorPrimitive::Float(t) => t,
+            _ => unreachable!("norm2 beta is a float tensor"),
+        });
+        let (post_attn, normed2) = super::gpu_kernels::gpu_add_layernorm::<CudaRuntime>(
+            &x,
+            &attn,
+            &norm2_gamma,
+            norm2_beta.as_ref(),
+            super::gpu_kernels::LN_EPS,
+        );
+
+        let out = Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(post_attn))
+            + block.mlp.forward(Tensor::<Self, 3>::from_primitive(TensorPrimitive::Float(
+                normed2,
+            )));
         match out.into_primitive() {
             TensorPrimitive::Float(tensor) => tensor,
             _ => unreachable!("NaFlexBlock returns a float tensor"),

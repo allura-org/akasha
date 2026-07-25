@@ -55,6 +55,8 @@ use burn::backend::flex::FlexDevice;
 // file stays focused and easier to navigate.
 mod attention;
 pub mod bf16_gemm;
+#[cfg(feature = "gpu-kernels")]
+pub(crate) mod gpu_kernels;
 mod hydra_mid;
 mod hydra_pool;
 mod mlp_glu;

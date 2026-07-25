@@ -19,8 +19,12 @@ burn-openblas = ["burn", "burn/openblas"]
 # GPU builds enable fusion (fused elementwise chains). Autotune was measured
 # SLOWER for Hydra (~0.22 s/img vs ~0.16) and adds a ~90 s un-cached warmup on
 # first inference, so it stays off.
-burn-wgpu = ["burn", "burn/wgpu", "burn/cubecl", "burn/fusion"]
-burn-cuda = ["burn", "burn/cuda", "burn/cubecl", "burn/fusion"]
+# GPU kernel deps: custom fused CubeCL kernels (layer norm, GELU, ...) are
+# registered as burn-fusion custom ops; they JIT onto the same CubeCL runtime
+# burn already uses and are vendor-portable (pure cubecl abstractions).
+burn-wgpu = ["burn", "burn/wgpu", "burn/cubecl", "burn/fusion", "gpu-kernels"]
+burn-cuda = ["burn", "burn/cuda", "burn/cubecl", "burn/fusion", "gpu-kernels"]
+gpu-kernels = ["dep:burn-fusion", "dep:burn-ir", "dep:burn-cubecl", "dep:cubecl"]
 cuda = ["candle", "candle-core/cuda", "mistralrs?/cuda"]
 
 [dependencies]
@@ -117,6 +121,16 @@ gemm = { version = "0.18", optional = true }
 rayon = { version = "1", optional = true }
 wide = { version = "0.7", optional = true }
 bytemuck = { version = "1", optional = true }
+# Custom CubeCL kernels on GPU backends (see the gpu-kernels feature above).
+# Versions must stay in lockstep with burn 0.21's own burn-* deps, and
+# default-features MUST stay off: burn-cubecl's default features include
+# `autotune`, which feature-unification would enable globally (measured
+# slower, and it re-tunes GEMMs per shape, breaking batch/single numerical
+# parity).
+burn-fusion = { version = "0.21", default-features = false, optional = true }
+burn-ir = { version = "0.21", default-features = false, optional = true }
+burn-cubecl = { version = "0.21", default-features = false, optional = true }
+cubecl = { version = "0.10", default-features = false, optional = true }
 
 # mistral.rs local inference (optional)
 mistralrs = { version = "0.8.1", optional = true }
