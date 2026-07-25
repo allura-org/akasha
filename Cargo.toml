@@ -16,8 +16,11 @@ burn = ["dep:burn", "dep:faer", "dep:gemm", "dep:rayon", "dep:safetensors", "dep
 burn-flex = ["burn", "burn/flex"]
 burn-candle = ["burn", "burn/candle"]
 burn-openblas = ["burn", "burn/openblas"]
-burn-wgpu = ["burn", "burn/wgpu", "burn/cubecl"]
-burn-cuda = ["burn", "burn/cuda", "burn/cubecl"]
+# GPU builds enable fusion (fused elementwise chains). Autotune was measured
+# SLOWER for Hydra (~0.22 s/img vs ~0.16) and adds a ~90 s un-cached warmup on
+# first inference, so it stays off.
+burn-wgpu = ["burn", "burn/wgpu", "burn/cubecl", "burn/fusion"]
+burn-cuda = ["burn", "burn/cuda", "burn/cubecl", "burn/fusion"]
 cuda = ["candle", "candle-core/cuda", "mistralrs?/cuda"]
 
 [dependencies]

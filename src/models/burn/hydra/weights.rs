@@ -19,6 +19,12 @@ use super::modules::{
     NaFlexAttn, NaFlexBlock, NaFlexMlp,
 };
 
+/// Host-side F32 weight caches (and the packed copies derived from them) only
+/// feed the CPU fused kernels; CubeCL GPU builds never read them. Skipping
+/// them saves several GB of host RAM and a device→host sync per weight at
+/// load time.
+const NEED_HOST_CACHES: bool = !cfg!(any(feature = "burn-cuda", feature = "burn-wgpu"));
+
 /// Load Hydra-3.5 from a safetensors checkpoint.
 pub fn load_hydra<
     B: FusedGluBackend
@@ -74,7 +80,7 @@ pub fn load_hydra<
 
     // Pack BF16 weights for the bf16 GEMM kernels only when the runtime gate
     // is active; otherwise the packed copies (~0.5 GB) would be wasted memory.
-    let use_bf16 = super::fused_ops::bf16_gemm::use_bf16_gemm();
+    let use_bf16 = NEED_HOST_CACHES && super::fused_ops::bf16_gemm::use_bf16_gemm();
 
     let mut blocks = Vec::with_capacity(27);
     for i in 0..27 {
@@ -129,10 +135,17 @@ pub fn load_hydra<
                 assert_eq!(fc1_hidden, fc1_hidden2);
                 let fc1_w_bf16 = pack_bf16_w(&fc1_w_cache, k, fc1_hidden, use_bf16);
                 let fc2_w_bf16 = pack_bf16_w(&fc2_w_cache, fc1_hidden, n, use_bf16);
-                let fc1_w_packed = pack_mlp_fc1_w(&fc1_w_cache, k, fc1_hidden);
-                let fc2_w_packed = pack_mlp_fc2_w(&fc2_w_cache, fc1_hidden, n);
-                let fc1_b_packed = fc1_b_cache.clone();
-                let fc2_b_packed = fc2_b_cache.clone();
+                let fc1_w_packed = NEED_HOST_CACHES.then(|| {
+                    crate::models::burn::hydra::fused_ops::PackedMlpWeights {
+                        fc1_w: pack_mlp_fc1_w(&fc1_w_cache, k, fc1_hidden),
+                        fc1_b: fc1_b_cache.clone(),
+                        fc2_w: pack_mlp_fc2_w(&fc2_w_cache, fc1_hidden, n),
+                        fc2_b: fc2_b_cache.clone(),
+                        k,
+                        hidden: fc1_hidden,
+                        n,
+                    }
+                });
                 NaFlexMlp {
                     fc1,
                     fc2,
@@ -140,15 +153,7 @@ pub fn load_hydra<
                     fc1_b_cache,
                     fc2_w_cache,
                     fc2_b_cache,
-                    fc1_w_packed: Some(crate::models::burn::hydra::fused_ops::PackedMlpWeights {
-                        fc1_w: fc1_w_packed,
-                        fc1_b: fc1_b_packed,
-                        fc2_w: fc2_w_packed,
-                        fc2_b: fc2_b_packed,
-                        k,
-                        hidden: fc1_hidden,
-                        n,
-                    }),
+                    fc1_w_packed,
                     fc1_w_bf16,
                     fc2_w_bf16,
                 }
@@ -158,12 +163,14 @@ pub fn load_hydra<
 
     let pool_ff_glu_w = get("attn_pool.ff.proj_in.weight")?;
     let [pool_ff_glu_out2, pool_ff_glu_in] = pool_ff_glu_w.dims();
-    let pool_ff_glu_w_cache = {
+    let pool_ff_glu_w_cache = if NEED_HOST_CACHES {
         let data = pool_ff_glu_w.to_data();
         let slice = data
             .as_slice::<f32>()
             .expect("pool ff glu weight is contiguous F32");
         transpose_row_major(slice, pool_ff_glu_out2, pool_ff_glu_in)
+    } else {
+        Vec::new()
     };
     let (pool_ff_proj_out, pool_ff_proj_out_w_cache, pool_ff_proj_out_b_cache) =
         load_linear_cached(&get("attn_pool.ff.proj_out.weight")?, None, device);
@@ -181,14 +188,16 @@ pub fn load_hydra<
         pool_ff_n,
         use_bf16,
     );
-    let pool_ff_glu_packed = crate::models::burn::hydra::fused_ops::PackedGluWeights {
-        glu_w: pack_glu_w(&pool_ff_glu_w_cache, pool_ff_glu_in, pool_ff_glu_out2),
-        proj_w: pack_proj_w(&pool_ff_proj_out_w_cache, pool_ff_hidden, pool_ff_n),
-        proj_b: pool_ff_proj_out_b_cache.clone(),
-        k: pool_ff_glu_in,
-        hidden: pool_ff_hidden,
-        n: pool_ff_n,
-    };
+    let pool_ff_glu_packed = NEED_HOST_CACHES.then(|| {
+        crate::models::burn::hydra::fused_ops::PackedGluWeights {
+            glu_w: pack_glu_w(&pool_ff_glu_w_cache, pool_ff_glu_in, pool_ff_glu_out2),
+            proj_w: pack_proj_w(&pool_ff_proj_out_w_cache, pool_ff_hidden, pool_ff_n),
+            proj_b: pool_ff_proj_out_b_cache.clone(),
+            k: pool_ff_glu_in,
+            hidden: pool_ff_hidden,
+            n: pool_ff_n,
+        }
+    });
 
     let (mid_q_proj, mid_q_proj_w_cache, mid_q_proj_b_cache) =
         load_linear_cached(&get("attn_pool.mid_blocks.0.q_proj.weight")?, None, device);
@@ -196,12 +205,14 @@ pub fn load_hydra<
         load_linear_cached(&get("attn_pool.mid_blocks.0.o_proj.weight")?, None, device);
     let mid_ff_glu_w = get("attn_pool.mid_blocks.0.ff.proj_in.weight")?;
     let [mid_ff_glu_out2, mid_ff_glu_in] = mid_ff_glu_w.dims();
-    let mid_ff_glu_w_cache = {
+    let mid_ff_glu_w_cache = if NEED_HOST_CACHES {
         let data = mid_ff_glu_w.to_data();
         let slice = data
             .as_slice::<f32>()
             .expect("mid ff glu weight is contiguous F32");
         transpose_row_major(slice, mid_ff_glu_out2, mid_ff_glu_in)
+    } else {
+        Vec::new()
     };
     let (mid_ff_proj_out, mid_ff_proj_out_w_cache, mid_ff_proj_out_b_cache) = load_linear_cached(
         &get("attn_pool.mid_blocks.0.ff.proj_out.weight")?,
@@ -218,14 +229,16 @@ pub fn load_hydra<
     );
     let mid_ff_proj_out_w_bf16 =
         pack_bf16_w(&mid_ff_proj_out_w_cache, mid_ff_hidden, mid_ff_n, use_bf16);
-    let mid_ff_glu_packed = crate::models::burn::hydra::fused_ops::PackedGluWeights {
-        glu_w: pack_glu_w(&mid_ff_glu_w_cache, mid_ff_glu_in, mid_ff_glu_out2),
-        proj_w: pack_proj_w(&mid_ff_proj_out_w_cache, mid_ff_hidden, mid_ff_n),
-        proj_b: mid_ff_proj_out_b_cache.clone(),
-        k: mid_ff_glu_in,
-        hidden: mid_ff_hidden,
-        n: mid_ff_n,
-    };
+    let mid_ff_glu_packed = NEED_HOST_CACHES.then(|| {
+        crate::models::burn::hydra::fused_ops::PackedGluWeights {
+            glu_w: pack_glu_w(&mid_ff_glu_w_cache, mid_ff_glu_in, mid_ff_glu_out2),
+            proj_w: pack_proj_w(&mid_ff_proj_out_w_cache, mid_ff_hidden, mid_ff_n),
+            proj_b: mid_ff_proj_out_b_cache.clone(),
+            k: mid_ff_glu_in,
+            hidden: mid_ff_hidden,
+            n: mid_ff_n,
+        }
+    });
 
     let (kv, kv_w_cache, kv_b_cache) =
         load_linear_cached(&get("attn_pool.kv.weight")?, None, device);
@@ -247,7 +260,7 @@ pub fn load_hydra<
             glu_w_cache: pool_ff_glu_w_cache,
             proj_out_w_cache: pool_ff_proj_out_w_cache,
             proj_out_b_cache: pool_ff_proj_out_b_cache,
-            glu_w_packed: Some(pool_ff_glu_packed),
+            glu_w_packed: pool_ff_glu_packed,
             glu_w_bf16: pool_ff_glu_w_bf16,
             proj_out_w_bf16: pool_ff_proj_out_w_bf16,
         },
@@ -262,7 +275,7 @@ pub fn load_hydra<
                 glu_w_cache: mid_ff_glu_w_cache,
                 proj_out_w_cache: mid_ff_proj_out_w_cache,
                 proj_out_b_cache: mid_ff_proj_out_b_cache,
-                glu_w_packed: Some(mid_ff_glu_packed),
+                glu_w_packed: mid_ff_glu_packed,
                 glu_w_bf16: mid_ff_glu_w_bf16,
                 proj_out_w_bf16: mid_ff_proj_out_w_bf16,
             },
@@ -325,7 +338,8 @@ fn pack_bf16_w(w: &[f32], k: usize, n: usize, enabled: bool) -> Option<PackedBf1
 
 /// Load a `Linear` module plus contiguous F32 weight/bias caches for the fused
 /// kernels. The cached weight is already transposed to Burn's row-major
-/// `[in_features, out_features]` layout.
+/// `[in_features, out_features]` layout. The caches are only built when
+/// `NEED_HOST_CACHES` (CPU backends); GPU builds get empty caches.
 fn load_linear_cached<B: Backend>(
     weight: &Tensor<B, 2>,
     bias: Option<&Tensor<B, 1>>,
@@ -340,18 +354,24 @@ fn load_linear_cached<B: Backend>(
     let weight_t = weight.clone().transpose();
     linear.weight = Param::from_tensor(weight_t);
 
-    let weight_cache = {
+    let weight_cache = if NEED_HOST_CACHES {
         let data = weight.to_data();
         let slice = data.as_slice::<f32>().expect("weight is contiguous F32");
         transpose_row_major(slice, out_features, in_features)
+    } else {
+        Vec::new()
     };
 
-    let bias_cache = bias.map(|b| {
-        let data = b.to_data();
-        data.as_slice::<f32>()
-            .expect("bias is contiguous F32")
-            .to_vec()
-    });
+    let bias_cache = if NEED_HOST_CACHES {
+        bias.map(|b| {
+            let data = b.to_data();
+            data.as_slice::<f32>()
+                .expect("bias is contiguous F32")
+                .to_vec()
+        })
+    } else {
+        None
+    };
 
     if let Some(bias) = bias {
         linear.bias = Some(Param::from_tensor(bias.clone()));

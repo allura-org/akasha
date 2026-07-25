@@ -26,6 +26,7 @@ pub fn preprocess(
     pos_embed: &Array4<f32>,
     max_seq_len: usize,
     background: [u8; 3],
+    pos_embed_cache: &mut std::collections::HashMap<(usize, usize), Array2<f32>>,
 ) -> Result<PreprocessedImage> {
     let icc_profile = image::ImageReader::open(image_path)
         .ok()
@@ -73,8 +74,18 @@ pub fn preprocess(
     let mut valid = Array2::<bool>::from_elem((1, max_seq_len), false);
     valid.slice_mut(s![0, ..n_valid]).fill(true);
 
-    let pos_embed_padded = interpolate_pos_embed(pos_embed, grid_h, grid_w, max_seq_len)
-        .context("failed to interpolate position embedding")?;
+    // The interpolated position embedding depends only on the patch grid
+    // size, which the resize search quantizes to a handful of distinct values
+    // across a collection — cache it instead of re-interpolating per image.
+    let pos_embed_padded = match pos_embed_cache.get(&(grid_h, grid_w)) {
+        Some(cached) => cached.clone(),
+        None => {
+            let interpolated = interpolate_pos_embed(pos_embed, grid_h, grid_w, max_seq_len)
+                .context("failed to interpolate position embedding")?;
+            pos_embed_cache.insert((grid_h, grid_w), interpolated.clone());
+            interpolated
+        }
+    };
 
     // Normalize to [-1, 1].
     patches_padded /= 127.5;

@@ -21,8 +21,14 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use ndarray::Array4;
 
-// F32 is used for the CPU spike regardless of backend; BF16 is slow on the
-// Flex CPU path and the NdArray backend does not implement BF16 at all.
+// Compute dtype. CubeCL CUDA runs BF16: the checkpoint is natively BF16 (so
+// the conversion is exact) and BF16 GEMMs hit the tensor-core path (~4x the
+// FP32 rate on RTX-class GPUs) with half the memory traffic. CPU backends
+// stay F32 — BF16 is slow on the Flex CPU path and the NdArray backend does
+// not implement BF16 at all. wgpu stays F32 until BF16 is validated there.
+#[cfg(feature = "burn-cuda")]
+const MODEL_DTYPE: DType = DType::BF16;
+#[cfg(not(feature = "burn-cuda"))]
 const MODEL_DTYPE: DType = DType::F32;
 
 use crate::config::ModelConfig;
@@ -52,6 +58,11 @@ pub struct HydraModel<B: Backend> {
     /// so the large pool/FF buffers (~0.5 GB) are allocated and page-faulted
     /// once per model instead of once per image.
     workspace: std::sync::Mutex<fused_ops::BlockWorkspace>,
+    /// Interpolated position embeddings keyed by patch grid `(h, w)`. Grid
+    /// sizes are quantized by the resize search, so a whole collection hits a
+    /// handful of buckets; caching skips a scalar ~1.2M-element bilinear
+    /// interpolation per image.
+    pos_embed_cache: std::sync::Mutex<HashMap<(usize, usize), ndarray::Array2<f32>>>,
     _phantom: std::marker::PhantomData<B>,
 }
 
@@ -112,6 +123,7 @@ impl<
             max_batch_size,
             background,
             workspace: std::sync::Mutex::new(fused_ops::BlockWorkspace::new()),
+            pos_embed_cache: std::sync::Mutex::new(HashMap::new()),
             _phantom: std::marker::PhantomData,
         })
     }
@@ -143,11 +155,23 @@ impl<
         anyhow::ensure!(n > 0, "infer_logits_batch: empty batch");
 
         let mut pres = Vec::with_capacity(n);
-        for path in image_paths {
-            pres.push(
-                preprocess(path, &self.pos_embed, self.max_seq_len, self.background)
+        {
+            let mut pos_cache = self
+                .pos_embed_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for path in image_paths {
+                pres.push(
+                    preprocess(
+                        path,
+                        &self.pos_embed,
+                        self.max_seq_len,
+                        self.background,
+                        &mut pos_cache,
+                    )
                     .with_context(|| format!("failed to preprocess image: {}", path.display()))?,
-            );
+                );
+            }
         }
         let t_pre = t0.elapsed();
 
@@ -157,14 +181,17 @@ impl<
         let mut patches_flat = Vec::with_capacity(n * seq * 768);
         let mut pos_flat = Vec::with_capacity(n * seq * 1152);
         let mut valid_raw = Vec::with_capacity(n * seq);
+        let mut n_valids = Vec::with_capacity(n);
         let mut all_valid = true;
         for pre in pres {
             patches_flat.extend(pre.patches.into_raw_vec_and_offset().0);
             pos_flat.extend(pre.pos_embed.into_raw_vec_and_offset().0);
             let valid = pre.valid.into_raw_vec_and_offset().0;
-            if valid.iter().any(|&b| !b) {
+            let n_valid = valid.iter().filter(|&&b| b).count();
+            if n_valid < seq {
                 all_valid = false;
             }
+            n_valids.push(n_valid);
             valid_raw.extend(valid.into_iter().map(|b| if b { 1i32 } else { 0i32 }));
         }
 
@@ -199,7 +226,7 @@ impl<
             // inconsistent behind — only buffers to reuse.
             let mut workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
             self.model
-                .forward_with_workspace(patches, pos_embed, mask, &mut workspace)
+                .forward_with_workspace(patches, pos_embed, mask, Some(&n_valids), &mut workspace)
         };
         let t_forward = t1.elapsed();
 
@@ -327,7 +354,9 @@ mod tests {
     #[test]
     #[ignore = "manual: VRAM growth investigation"]
     fn hydra_burn_vram_loop() {
-        let _ = tracing_subscriber::fmt::try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
         let device = <crate::models::burn::BurnDevice as Default>::default();
         let cfg = ModelConfig {
             name: "hydra-3.5".into(),
@@ -455,7 +484,9 @@ mod tests {
     #[test]
     #[ignore = "manual: requires Hydra-3.5 safetensors"]
     fn hydra_burn_runs() {
-        let _ = tracing_subscriber::fmt::try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
         let device = <crate::models::burn::BurnDevice as Default>::default();
         let cfg = ModelConfig {
             name: "hydra-3.5".into(),
@@ -604,7 +635,9 @@ mod tests {
     #[test]
     #[ignore = "manual: requires Hydra-3.5 safetensors"]
     fn hydra_burn_batch_matches_single() {
-        let _ = tracing_subscriber::fmt::try_init();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
         let device = <crate::models::burn::BurnDevice as Default>::default();
         let cfg = ModelConfig {
             name: "hydra-3.5".into(),
@@ -653,6 +686,11 @@ mod tests {
         let t_batch = t_batch0.elapsed();
 
         assert_eq!(batch.len(), singles.len());
+        // BF16 GPU runs tile GEMMs differently at different batch/seq shapes
+        // (e.g. trimmed vs padded seq), so accumulation order — and the last
+        // ~0.3% of probability — varies with batch composition. F32 runs use
+        // identical kernels for identical rows and match far more tightly.
+        let tol: f32 = if MODEL_DTYPE == DType::F32 { 1e-3 } else { 1e-2 };
         for (img, (s, b)) in img_paths.iter().zip(singles.iter().zip(batch.iter())) {
             assert_eq!(s.len(), b.len(), "logits length mismatch on {img:?}");
             let mut max_prob = 0.0f32;
@@ -663,7 +701,7 @@ mod tests {
             }
             eprintln!("{img:?}: batch-vs-single max abs prob diff {max_prob:.6}");
             assert!(
-                max_prob < 1e-3,
+                max_prob < tol,
                 "batch vs single mismatch on {img:?}: {max_prob}"
             );
         }
@@ -703,7 +741,7 @@ mod tests {
                 max_prob = max_prob.max((px - py).abs());
             }
             assert!(
-                max_prob < 1e-3,
+                max_prob < tol,
                 "ragged batch item {i} mismatch: {max_prob}"
             );
         }

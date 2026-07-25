@@ -71,17 +71,22 @@ impl<
         mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 2> {
         let mut workspace = BlockWorkspace::new();
-        self.forward_with_workspace(patches, pos_embed, mask, &mut workspace)
+        self.forward_with_workspace(patches, pos_embed, mask, None, &mut workspace)
     }
 
     /// Forward pass with a caller-provided workspace. Keeping the workspace
     /// alive across calls avoids re-allocating (and page-faulting) the large
     //  pool/FF scratch buffers on every image.
+    ///
+    /// `n_valids`: per-item valid patch counts, when known on the host from
+    /// preprocessing. Passing them avoids a device readback (full GPU sync)
+    /// of the mask in the middle of the forward pass.
     pub fn forward_with_workspace(
         &self,
         patches: Tensor<B, 3>,
         pos_embed: Tensor<B, 3>,
         mask: Option<Tensor<B, 2, Bool>>,
+        n_valids: Option<&[usize]>,
         mut workspace: &mut BlockWorkspace,
     ) -> Tensor<B, 2> {
         let t0 = Instant::now();
@@ -94,39 +99,57 @@ impl<
         // Determine per-item valid patch counts. Hydra pads each image to
         // `max_seq_len` with a contiguous suffix of invalid positions, so the
         // valid prefix length per item is all we need. The batch is sliced to
-        // the max count before the pool, and a key-padding mask keeps shorter
-        // items unaffected past their own valid prefix.
-        let n_valids: Vec<usize> = mask
-            .as_ref()
-            .map(|m| {
-                // CubeCL backends store bools as u8/u32 rather than native
-                // bools, so normalize the readback before slicing.
-                let data = m
-                    .clone()
-                    .to_data()
-                    .convert_dtype(DType::Bool(BoolStore::Native));
-                let slice = data.as_slice::<bool>().expect("mask is contiguous bool");
-                (0..batch)
-                    .map(|b| slice[b * seq..(b + 1) * seq].iter().filter(|&&v| v).count())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![seq; batch]);
+        // the max count before the block loop, and a key-padding mask keeps
+        // shorter items unaffected past their own valid prefix.
+        let n_valids: Vec<usize> = match n_valids {
+            Some(v) => {
+                debug_assert_eq!(v.len(), batch);
+                v.to_vec()
+            }
+            None => mask
+                .as_ref()
+                .map(|m| {
+                    // CubeCL backends store bools as u8/u32 rather than native
+                    // bools, so normalize the readback before slicing.
+                    let data = m
+                        .clone()
+                        .to_data()
+                        .convert_dtype(DType::Bool(BoolStore::Native));
+                    let slice = data.as_slice::<bool>().expect("mask is contiguous bool");
+                    (0..batch)
+                        .map(|b| slice[b * seq..(b + 1) * seq].iter().filter(|&&v| v).count())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![seq; batch]),
+        };
         let max_valid = n_valids.iter().copied().max().unwrap_or(seq);
+        let ragged = n_valids.iter().any(|&v| v < max_valid);
+
+        // Trim padded patches before the block loop: the blocks would
+        // otherwise burn FLOPs on positions that are masked out anyway and
+        // sliced off before the pool. Padded positions only ever attend as
+        // masked-out keys, so dropping them does not change the outputs at
+        // valid positions. When no item is shorter than the slice, the mask
+        // becomes all-attend and is dropped entirely.
+        let hidden = x.dims()[2];
+        if max_valid < seq {
+            x = x.slice([0..batch, 0..max_valid, 0..hidden]);
+        }
+        let seq_eff = max_valid;
 
         // Burn's attention treats `true` as "mask out"; our mask semantics are
         // `true` = attend, so invert the mask.
-        let attn_mask: Option<Tensor<B, 4, Bool>> =
-            mask.map(|m| m.reshape([batch, 1, 1, seq]).bool_not());
-
-        // Key-padding mask for the pool, sliced to `max_valid`. Only needed
-        // when some item is shorter than the slice; an all-attend mask would
-        // just slow the pool down.
-        let pool_mask: Option<Tensor<B, 4, Bool>> = match &attn_mask {
-            Some(m) if n_valids.iter().any(|&v| v < max_valid) => {
-                Some(m.clone().slice([0..batch, 0..1, 0..1, 0..max_valid]))
-            }
+        let attn_mask: Option<Tensor<B, 4, Bool>> = match mask {
+            Some(m) if ragged => Some(
+                m.reshape([batch, 1, 1, seq])
+                    .bool_not()
+                    .slice([0..batch, 0..1, 0..1, 0..max_valid]),
+            ),
             _ => None,
         };
+
+        // Key-padding mask for the pool; same slice as the block mask.
+        let pool_mask = attn_mask.clone();
 
         let t1 = Instant::now();
         // For F32 backends with a real buffer fast path (Candle), run all
@@ -141,8 +164,8 @@ impl<
             let x_slice = x_data
                 .as_slice::<f32>()
                 .expect("Hydra block input is contiguous F32");
-            let mut buf_a = vec![0.0f32; batch * seq * hidden];
-            let mut buf_b = vec![0.0f32; batch * seq * hidden];
+            let mut buf_a = vec![0.0f32; batch * seq_eff * hidden];
+            let mut buf_b = vec![0.0f32; batch * seq_eff * hidden];
             buf_a.copy_from_slice(x_slice);
 
             let attn_mask_prim = attn_mask.map(|m| m.into_primitive());
@@ -160,7 +183,7 @@ impl<
                     attn_mask_prim.clone(),
                     &mut workspace,
                     batch,
-                    seq,
+                    seq_eff,
                     hidden,
                 );
             }
@@ -171,7 +194,7 @@ impl<
                 &buf_b
             };
             x = Tensor::<B, 1>::from_data(final_buf.as_slice(), (&x_device, DType::F32))
-                .reshape([batch, seq, hidden]);
+                .reshape([batch, seq_eff, hidden]);
         } else {
             for block in &self.blocks {
                 x = block.forward(x, attn_mask.clone(), &mut workspace);
@@ -182,13 +205,6 @@ impl<
         let t2 = Instant::now();
         x = self.norm.forward(x);
         let t_norm = t2.elapsed();
-
-        // Slice to the longest valid prefix before the pool. Padded positions
-        // are masked out of attention anyway, so dropping them avoids wasted
-        // work in the large kv projection and cross-attention without changing
-        // semantics.
-        let hidden = x.dims()[2];
-        let mut x = x.slice([0..batch, 0..max_valid, 0..hidden]);
 
         let t3 = Instant::now();
         x = self.attn_pool.forward(x, pool_mask, &mut workspace);
