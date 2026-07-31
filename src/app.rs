@@ -693,6 +693,8 @@ impl AkashaApp {
             self.media_refresh_in_flight = false;
             match result {
                 Ok(items) => {
+                    let t_ui = std::time::Instant::now();
+                    let n_items = items.len();
                     // Hide media belonging to folders that were filtered out of the
                     // tree (excluded paths, unreachable roots), and hide missing
                     // files — their rows stay in the DB so metadata survives, but
@@ -724,6 +726,12 @@ impl AkashaApp {
                         self.browser.search_active = false;
                         self.browser.scan_status = format!("{} images", self.browser.media_summaries.len());
                     }
+                    tracing::info!(
+                        is_search,
+                        items = n_items,
+                        elapsed_ms = t_ui.elapsed().as_millis(),
+                        "app: media results applied"
+                    );
                 }
                 Err(e) => {
                     self.browser.scan_status = format!("Failed to load media: {e}");

@@ -78,9 +78,13 @@ pub async fn list_summaries_by_folder(
     folder_id: i64,
 ) -> anyhow::Result<Vec<MediaSummary>> {
     let mut summaries = Vec::new();
+    // INDEXED BY: forces the idx_media_summary covering-index scan. The
+    // planner otherwise probes the fat media_files rows (tags_json makes
+    // them several KB each) per row — at collection scale that is the
+    // difference between ~1s and ~40s per folder load.
     let mut stream = sqlx::query_as::<_, MediaSummaryRow>(
         "SELECT id, folder_id, relative_path, absolute_path, blake3_hash, width, height, format, file_size, created_at, modified_at, is_present, missing_since
-         FROM media_files
+         FROM media_files INDEXED BY idx_media_summary
          WHERE folder_id = ?1
          ORDER BY id"
     )
@@ -99,6 +103,7 @@ pub async fn list_summaries_by_folder_recursive(
     folder_id: i64,
 ) -> anyhow::Result<Vec<MediaSummary>> {
     let mut summaries = Vec::new();
+    // See the INDEXED BY note on list_summaries_by_folder.
     let mut stream = sqlx::query_as::<_, MediaSummaryRow>(
         "WITH RECURSIVE subtree(id) AS (
             SELECT ?1
@@ -106,7 +111,7 @@ pub async fn list_summaries_by_folder_recursive(
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
          )
          SELECT m.id, m.folder_id, m.relative_path, m.absolute_path, m.blake3_hash, m.width, m.height, m.format, m.file_size, m.created_at, m.modified_at, m.is_present, m.missing_since
-         FROM media_files m
+         FROM media_files m INDEXED BY idx_media_summary
          JOIN subtree s ON m.folder_id = s.id
          ORDER BY m.id"
     )
@@ -121,19 +126,43 @@ pub async fn list_summaries_by_folder_recursive(
 }
 
 /// Load `MediaSummary` rows for a set of media file IDs, scoped to a folder.
-///
-/// `ids_json` should be a JSON array of integers, e.g. `[1, 2, 3]`.
 pub async fn search_summaries(
     pool: &SqlitePool,
     folder_id: i64,
     recursive: bool,
-    ids_json: &str,
+    ids: &[i64],
 ) -> anyhow::Result<Vec<MediaSummary>> {
-    let mut summaries = Vec::new();
+    // sqlx's bundled SQLite (3.46) plans the recursive id-filter join as a
+    // subtree_folders × ids nested loop of index probes — billions of probes
+    // at collection scale, i.e. the query never finishes. Sidestep the
+    // planner entirely for large id sets: scan the subtree through the
+    // covering index (already ~1-2s, see list_summaries_by_folder_recursive)
+    // and filter in Rust. Small id sets keep the cheap rowid-probe SQL path.
+    const RUST_FILTER_THRESHOLD: usize = 1000;
+    if recursive && ids.len() >= RUST_FILTER_THRESHOLD {
+        let t_start = std::time::Instant::now();
+        tracing::info!(ids = ids.len(), "search_summaries: subtree scan + rust filter");
+        let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
+        let mut summaries = list_summaries_by_folder_recursive(pool, folder_id).await?;
+        summaries.retain(|s| id_set.contains(&s.id));
+        tracing::info!(
+            rows = summaries.len(),
+            elapsed_ms = t_start.elapsed().as_millis(),
+            "search_summaries: done"
+        );
+        return Ok(summaries);
+    }
 
+    let mut summaries = Vec::new();
+    let ids_json = serde_json::to_string(ids)?;
+    let t_start = std::time::Instant::now();
+    tracing::info!(ids = ids.len(), "search_summaries: start");
+
+    // Recursive + few ids: rowid probes with a subtree membership check.
+    // Non-recursive: single-folder probe, safe at any id count; INDEXED BY
+    // keeps it on the covering index.
     let sql = if recursive {
-        r#"
-        WITH RECURSIVE subtree(id) AS (
+        "WITH RECURSIVE subtree(id) AS (
             SELECT ?1
             UNION ALL
             SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
@@ -143,19 +172,18 @@ pub async fn search_summaries(
         FROM media_files m
         JOIN subtree s ON m.folder_id = s.id
         WHERE m.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))
-        ORDER BY m.id
-        "#
+        ORDER BY m.id"
+        .to_string()
     } else {
-        r#"
-        SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
-               width, height, format, file_size, created_at, modified_at, is_present, missing_since
-        FROM media_files
-        WHERE folder_id = ?1 AND id IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))
-        ORDER BY id
-        "#
+        "SELECT id, folder_id, relative_path, absolute_path, blake3_hash,
+                width, height, format, file_size, created_at, modified_at, is_present, missing_since
+         FROM media_files INDEXED BY idx_media_summary
+         WHERE folder_id = ?1 AND id IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))
+         ORDER BY id"
+        .to_string()
     };
 
-    let mut stream = sqlx::query_as::<_, MediaSummaryRow>(sql)
+    let mut stream = sqlx::query_as::<_, MediaSummaryRow>(&sql)
         .bind(folder_id)
         .bind(ids_json)
         .fetch(pool);
@@ -163,6 +191,12 @@ pub async fn search_summaries(
     while let Some(row) = stream.try_next().await? {
         summaries.push(into_summary(row));
     }
+
+    tracing::info!(
+        rows = summaries.len(),
+        elapsed_ms = t_start.elapsed().as_millis(),
+        "search_summaries: done"
+    );
 
     Ok(summaries)
 }
@@ -270,16 +304,6 @@ pub async fn delete_by_path(
     .await?;
 
     if let Some(id) = media_id {
-        // FTS rowids mirror searchable_tags.rowid / media_files.id; delete
-        // through the docid index instead of scanning the UNINDEXED columns.
-        sqlx::query(
-            "DELETE FROM searchable_tags_fts WHERE rowid IN (
-                 SELECT rowid FROM searchable_tags WHERE media_file_id = ?1
-             )"
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
         sqlx::query("DELETE FROM searchable_text_fts WHERE rowid = ?1")
             .bind(id)
             .execute(&mut *tx)
@@ -500,13 +524,6 @@ pub async fn delete_missing(pool: &SqlitePool) -> anyhow::Result<(u64, u64)> {
     // removed by the folder cascade below).
     const MISSING_MEDIA: &str =
         "SELECT id FROM media_files WHERE is_present = 0 OR folder_id IN (SELECT id FROM folders WHERE is_present = 0)";
-    sqlx::query(&format!(
-        "DELETE FROM searchable_tags_fts WHERE rowid IN (
-             SELECT rowid FROM searchable_tags WHERE media_file_id IN ({MISSING_MEDIA})
-         )"
-    ))
-    .execute(&mut *tx)
-    .await?;
     sqlx::query(&format!(
         "DELETE FROM searchable_text_fts WHERE rowid IN ({MISSING_MEDIA})"
     ))
@@ -865,5 +882,70 @@ mod tests {
         );
         assert!(props.classifications.is_empty());
         assert!(props.embeddings.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod live_hydration_bench {
+    /// Reproduce the app's exact hydration path through sqlx (bundled SQLite)
+    /// against the real database. Run with:
+    ///   AKASHA_LIVE_DB=~/.local/share/akasha/akasha.db \
+    ///   cargo test --release live_hydration -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn live_hydration_explain_and_time() {
+        let db = std::env::var("AKASHA_LIVE_DB").expect("AKASHA_LIVE_DB");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(db)
+                    .read_only(true)
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+            )
+            .await
+            .unwrap();
+
+        let version: (String,) = sqlx::query_as("SELECT sqlite_version()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        println!("sqlx bundled sqlite version: {}", version.0);
+
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT media_file_id FROM searchable_tags WHERE tag IN ('solo','solo_focus')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        println!("ids: {}", ids.len());
+
+        let ids_json = serde_json::to_string(&ids).unwrap();
+        let sql = "WITH RECURSIVE subtree(id) AS (
+                SELECT ?1 UNION ALL
+                SELECT folders.id FROM folders JOIN subtree ON folders.parent_id = subtree.id
+            )
+            SELECT m.id FROM media_files m INDEXED BY idx_media_summary
+            JOIN subtree s ON m.folder_id = s.id
+            WHERE m.id IN (SELECT CAST(value AS INTEGER) FROM json_each(?2))
+            ORDER BY m.id";
+        let plan: Vec<(i64, i64, i64, String)> =
+            sqlx::query_as(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .bind(2i64)
+                .bind(&ids_json)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for row in &plan {
+            println!("plan: {} {} {} {}", row.0, row.1, row.2, row.3);
+        }
+
+        let t = std::time::Instant::now();
+        let summaries = super::search_summaries(&pool, 2, true, &ids).await.unwrap();
+        println!(
+            "search_summaries: {} rows in {:.2}s",
+            summaries.len(),
+            t.elapsed().as_secs_f64()
+        );
     }
 }

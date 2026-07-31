@@ -45,15 +45,23 @@ impl SearchEngine {
         }
 
         // Run each enabled Searchable and aggregate scores per media file.
+        let search_start = std::time::Instant::now();
         let mut scores: HashMap<i64, f32> = HashMap::new();
         for searchable in self.registry.iter() {
             if !enabled_names.contains(searchable.name()) {
                 continue;
             }
 
+            let t = std::time::Instant::now();
             let contributions = searchable
                 .search(pool, folder_id, recursive, &query.text)
                 .await?;
+            tracing::info!(
+                searchable = searchable.name(),
+                hits = contributions.len(),
+                elapsed_ms = t.elapsed().as_millis(),
+                "SearchEngine: searchable completed"
+            );
             for (id, contribution) in contributions {
                 *scores.entry(id).or_insert(0.0) += contribution;
             }
@@ -64,9 +72,16 @@ impl SearchEngine {
         }
 
         // Hydrate matching IDs into MediaSummary rows, still scoped to the folder.
+        let t = std::time::Instant::now();
         let ids: Vec<i64> = scores.keys().copied().collect();
-        let ids_json = serde_json::to_string(&ids)?;
-        let summaries = media::search_summaries(pool, folder_id, recursive, &ids_json).await?;
+        let summaries = media::search_summaries(pool, folder_id, recursive, &ids).await?;
+        tracing::info!(
+            ids = ids.len(),
+            hydrated = summaries.len(),
+            elapsed_ms = t.elapsed().as_millis(),
+            total_ms = search_start.elapsed().as_millis(),
+            "SearchEngine: hydration completed"
+        );
 
         // Combine summaries with their scores and sort.
         let mut hits: Vec<SearchHit> = summaries
