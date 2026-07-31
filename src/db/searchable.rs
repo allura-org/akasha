@@ -154,21 +154,7 @@ pub async fn update_tags_json(
         .execute(&mut *tx)
         .await?;
 
-    // Mirror into searchable_tags. The FTS5 side table's rowid mirrors
-    // searchable_tags.rowid, so its rows are deleted through the FTS docid
-    // index — filtering on the UNINDEXED media_file_id/source columns would
-    // scan the whole FTS table. The FTS delete must run while the
-    // searchable_tags rows it mirrors still exist.
-    sqlx::query(
-        "DELETE FROM searchable_tags_fts WHERE rowid IN (
-             SELECT rowid FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2
-         )"
-    )
-    .bind(media_file_id)
-    .bind(source)
-    .execute(&mut *tx)
-    .await?;
-
+    // Mirror into searchable_tags.
     sqlx::query("DELETE FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2")
         .bind(media_file_id)
         .bind(source)
@@ -176,27 +162,23 @@ pub async fn update_tags_json(
         .await?;
 
     for (tag, score) in tags {
-        let tag_rowid: i64 = sqlx::query_scalar(
+        sqlx::query(
             "INSERT INTO searchable_tags (media_file_id, source, tag, score)
-             VALUES (?1, ?2, ?3, ?4) RETURNING rowid"
+             VALUES (?1, ?2, ?3, ?4)"
         )
         .bind(media_file_id)
         .bind(source)
         .bind(tag.as_str())
         .bind(score)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO searchable_tags_fts (rowid, tag, media_file_id, source)
-             VALUES (?1, ?2, ?3, ?4)"
-        )
-        .bind(tag_rowid)
-        .bind(tag.as_str())
-        .bind(media_file_id)
-        .bind(source)
         .execute(&mut *tx)
         .await?;
+
+        // Keep the distinct-tag lexicon current (see migration 024). Stale
+        // entries are harmless: they match nothing in the aggregation.
+        sqlx::query("INSERT OR IGNORE INTO searchable_tag_lexicon (tag) VALUES (?1)")
+            .bind(tag.as_str())
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
@@ -260,18 +242,6 @@ pub async fn delete_tags_for_source(
     source: &str,
 ) -> Result<()> {
     let mut tx = crate::db::ImmediateTx::begin(pool).await?;
-
-    // FTS rows are keyed by searchable_tags.rowid; delete them while the
-    // searchable_tags rows they mirror still exist (see update_tags_json).
-    sqlx::query(
-        "DELETE FROM searchable_tags_fts WHERE rowid IN (
-             SELECT rowid FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2
-         )"
-    )
-    .bind(media_file_id)
-    .bind(source)
-    .execute(&mut *tx)
-    .await?;
 
     sqlx::query("DELETE FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2")
         .bind(media_file_id)
@@ -893,25 +863,15 @@ mod tests {
                 .unwrap();
         assert_eq!(count.0, 1);
 
-        let fts_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2"
+        let tag_row: (String, String) = sqlx::query_as(
+            "SELECT tag, source FROM searchable_tags WHERE media_file_id = ?1"
         )
         .bind(mid)
-        .bind("wd-vit")
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(fts_count.0, 1);
-
-        let fts_tag: (String,) = sqlx::query_as(
-            "SELECT tag FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2"
-        )
-        .bind(mid)
-        .bind("wd-vit")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(fts_tag.0, "cat");
+        assert_eq!(tag_row.0, "cat");
+        assert_eq!(tag_row.1, "wd-vit");
     }
 
     #[tokio::test]
@@ -984,14 +944,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 0);
-
-        let fts_count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM searchable_tags_fts WHERE media_file_id = ?1")
-                .bind(mid)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(fts_count.0, 0);
     }
 
     #[tokio::test]

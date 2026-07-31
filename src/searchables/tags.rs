@@ -1,31 +1,25 @@
 use anyhow::Result;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 
 use super::{Searchable, SearchableKind};
 
-/// Escape a single token into a quoted FTS5 phrase.
-fn fts5_phrase(token: &str) -> String {
-    let escaped = token.replace('"', "\"\"");
-    format!("\"{}\"", escaped)
-}
-
-/// Build an FTS5 `MATCH` expression that matches any of the supplied tokens.
-fn fts5_match_expr(tokens: &[String]) -> String {
-    tokens
-        .iter()
-        .map(|t| fts5_phrase(t))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+/// Escape LIKE metacharacters so a token matches literally.
+fn like_escape(token: &str) -> String {
+    token.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
 }
 
 /// Built-in Searchable that matches tags stored in `searchable_tags`.
 ///
 /// The query is split on whitespace into lowercase tokens. Each matching tag
 /// contributes `1.0` to the score, so files matching more tokens rank higher.
-/// Tokens of three or more characters use the FTS5 trigram side table for
-/// substring matches; shorter tokens fall back to exact matches in
-/// `searchable_tags`.
+/// Tokens of three or more characters match substrings; shorter tokens match
+/// whole tags only (LIKE is case-insensitive for ASCII).
+///
+/// Substring resolution runs against the materialized distinct-tag lexicon
+/// (`searchable_tag_lexicon`, a few MB), not the full tag table: milliseconds
+/// per token regardless of cache state, versus tens of seconds of doclist I/O
+/// for the trigram FTS side table (dropped in migration 022) or seconds for
+/// a LIKE scan of the full covering index.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TagsSearchable;
 
@@ -46,87 +40,75 @@ impl Searchable for TagsSearchable {
         recursive: bool,
         query: &str,
     ) -> Result<Vec<(i64, f32)>> {
-        let tokens: Vec<String> = query
+        let patterns: Vec<String> = query
             .split_whitespace()
             .map(|t| t.to_lowercase())
             .filter(|t| !t.is_empty())
+            .map(|t| {
+                let escaped = like_escape(&t);
+                if t.chars().count() >= 3 {
+                    format!("%{escaped}%")
+                } else {
+                    escaped
+                }
+            })
             .collect();
-        if tokens.is_empty() {
+        if patterns.is_empty() {
             return Ok(Vec::new());
         }
 
-        let (short, long): (Vec<_>, Vec<_>) = tokens.into_iter().partition(|t| t.len() < 3);
+        let folder_param = patterns.len() + 1;
+        let like_conditions = patterns
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("tag LIKE ?{} ESCAPE '\\'", i + 1))
+            .collect::<Vec<_>>()
+            .join(" OR ");
 
-        let mut scores: HashMap<i64, f32> = HashMap::new();
+        // The CROSS JOIN + INDEXED BY forces the planner to drive from the
+        // (tiny) matching tag list into the (tag, media_file_id) covering
+        // index; left to itself it iterates every media file in the subtree
+        // instead (~4x slower at collection scale).
+        let sql = if recursive {
+            format!(
+                "WITH RECURSIVE subtree(id) AS (
+                     SELECT ?{folder_param} UNION ALL
+                     SELECT f.id FROM folders f JOIN subtree s ON f.parent_id = s.id
+                 ),
+                 matching_tags(tag) AS (
+                     SELECT tag FROM searchable_tag_lexicon WHERE {like_conditions}
+                 )
+                 SELECT t.media_file_id, COUNT(*) AS matches
+                 FROM matching_tags mt
+                 CROSS JOIN searchable_tags t INDEXED BY idx_searchable_tags_tag_media
+                 WHERE t.tag = mt.tag
+                   AND t.media_file_id IN (
+                       SELECT m.id FROM media_files m JOIN subtree s ON m.folder_id = s.id
+                   )
+                 GROUP BY t.media_file_id"
+            )
+        } else {
+            format!(
+                "WITH matching_tags(tag) AS (
+                     SELECT tag FROM searchable_tag_lexicon WHERE {like_conditions}
+                 )
+                 SELECT t.media_file_id, COUNT(*) AS matches
+                 FROM matching_tags mt
+                 CROSS JOIN searchable_tags t INDEXED BY idx_searchable_tags_tag_media
+                 WHERE t.tag = mt.tag
+                   AND t.media_file_id IN (
+                       SELECT m.id FROM media_files m WHERE m.folder_id = ?{folder_param}
+                   )
+                 GROUP BY t.media_file_id"
+            )
+        };
 
-        if !long.is_empty() {
-            let match_expr = fts5_match_expr(&long);
-            let sql = if recursive {
-                "SELECT fts.media_file_id, COUNT(*) AS matches
-                 FROM searchable_tags_fts fts
-                 JOIN media_files m ON m.id = fts.media_file_id
-                 JOIN folders f ON f.id = m.folder_id
-                 WHERE fts.tag MATCH ?1
-                   AND (f.id = ?2 OR f.path LIKE (SELECT path || '/%' FROM folders WHERE id = ?2))
-                 GROUP BY fts.media_file_id"
-            } else {
-                "SELECT fts.media_file_id, COUNT(*) AS matches
-                 FROM searchable_tags_fts fts
-                 JOIN media_files m ON m.id = fts.media_file_id
-                 WHERE m.folder_id = ?2 AND fts.tag MATCH ?1
-                 GROUP BY fts.media_file_id"
-            };
-
-            let rows: Vec<(i64, i64)> = sqlx::query_as(&sql)
-                .bind(&match_expr)
-                .bind(folder_id)
-                .fetch_all(pool)
-                .await?;
-
-            for (id, matches) in rows {
-                *scores.entry(id).or_insert(0.0) += matches as f32;
-            }
+        let mut q = sqlx::query_as::<_, (i64, i64)>(&sql);
+        for pattern in &patterns {
+            q = q.bind(pattern);
         }
-
-        if !short.is_empty() {
-            let placeholders: Vec<String> = short
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 2))
-                .collect();
-            let sql = if recursive {
-                format!(
-                    "SELECT t.media_file_id, COUNT(*) AS matches
-                     FROM searchable_tags t
-                     JOIN media_files m ON m.id = t.media_file_id
-                     JOIN folders f ON f.id = m.folder_id
-                     WHERE (f.id = ?1 OR f.path LIKE (SELECT path || '/%' FROM folders WHERE id = ?1))
-                       AND LOWER(t.tag) IN ({})
-                     GROUP BY t.media_file_id",
-                    placeholders.join(",")
-                )
-            } else {
-                format!(
-                    "SELECT t.media_file_id, COUNT(*) AS matches
-                     FROM searchable_tags t
-                     JOIN media_files m ON m.id = t.media_file_id
-                     WHERE m.folder_id = ?1 AND LOWER(t.tag) IN ({})
-                     GROUP BY t.media_file_id",
-                    placeholders.join(",")
-                )
-            };
-
-            let mut q = sqlx::query_as::<_, (i64, i64)>(&sql).bind(folder_id);
-            for token in &short {
-                q = q.bind(token);
-            }
-            let rows = q.fetch_all(pool).await?;
-            for (id, matches) in rows {
-                *scores.entry(id).or_insert(0.0) += matches as f32;
-            }
-        }
-
-        Ok(scores.into_iter().collect())
+        let rows = q.bind(folder_id).fetch_all(pool).await?;
+        Ok(rows.into_iter().map(|(id, n)| (id, n as f32)).collect())
     }
 }
 
