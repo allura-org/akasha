@@ -178,7 +178,7 @@ Migrations live in `migrations/` and are embedded at compile time.
 - `missing_since` (datetime) — set to `CURRENT_TIMESTAMP` when `is_present` becomes `0`
 - `created_at`
 - Unique on `(folder_id, relative_path)`
-- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at), `idx_media_summary` (covering index for lightweight grid queries), `idx_media_present` (folder_id, is_present)
+- Indexes: `idx_media_hash` (blake3_hash), `idx_media_folder` (folder_id), `idx_media_modified_at` (modified_at), `idx_media_summary` (covers **all** MediaSummary columns — grid queries must use `INDEXED BY idx_media_summary`; without the hint the planner falls back to rowid probes against the tags_json-fat table, ~40s vs ~1.5s at 500k rows), `idx_media_present` (folder_id, is_present)
 
 ### `searchable_configs`
 - `id`, `name` (unique), `kind` (`text` | `tags` | `vector` | `classification`)
@@ -330,8 +330,10 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - Inference jobs must be triggered manually from the Media Processing window or context menus; they are not enqueued automatically on scan/import.
 - Remote backend currently uploads the full raw image without resize/compress; image preprocessing for remote endpoints is deferred.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
-- Tags and descriptions are now backed by FTS5 (trigram for tags, `searchable_text_fts` for descriptions). Sidecar text search is still deferred.
-- FTS rowid invariants (must be maintained by any code writing these tables): `searchable_tags_fts.rowid` mirrors `searchable_tags.rowid`, and `searchable_text_fts.rowid` is the `media_file_id`. Always delete FTS rows through these rowids — filtering on the UNINDEXED `media_file_id`/`source` columns is a full scan of the FTS table (measured ~190 ms at 2.3M rows) and was the cause of a progressive inference slowdown.
+- Tags search uses the `idx_searchable_tags_tag_media` covering index on `searchable_tags` (substring resolution against the distinct lexicon via LIKE, then tag-driven aggregation); the old trigram `searchable_tags_fts` was dropped in migration 022 — trigram doclist scans measured 9-45s per common tag at 2.7M rows, versus ~1-5s for the LIKE + covering-index path. Descriptions remain backed by FTS5 (`searchable_text_fts`). Sidecar text search is still deferred.
+- `searchable_text_fts.rowid` is the `media_file_id`; always delete through the rowid — filtering on the UNINDEXED `media_file_id`/`source` columns is a full scan of the FTS table.
+- The tags search query uses `CROSS JOIN` + `INDEXED BY` to force the planner to drive from the matching-tag list into the covering index; the natural plan iterates every media file in the subtree instead (~4x slower).
+- **Planner trap:** sqlx bundles SQLite 3.46, which can plan `media.id IN (SELECT ... json_each(...))` joined with the recursive subtree CTE as a subtree_folders × ids nested loop of index probes — billions of probes at collection scale, i.e. the query spins forever while the system sqlite3 CLI (newer SQLite) answers in ~1s. Never trust CLI-only plan verification for queries in that shape. `search_summaries` avoids it by filtering large recursive id sets in Rust after the covering-index subtree scan (`RUST_FILTER_THRESHOLD`); do not reintroduce big `json_each` id filters joined against the subtree CTE.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
 - Cross-root file moves appear as a Remove + Create pair; no move deduplication.
 - Missing files (`is_present = 0`) are hidden from the grid and search results (filtered in `poll_media_events`); their rows and metadata stay in the DB and can be purged via DB Management.
