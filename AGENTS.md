@@ -12,7 +12,7 @@ Akasha is a Linux-native, database-backed image gallery desktop application writ
 - **Language:** Rust (edition 2024)
 - **Platform:** Linux desktop (optimized for desktops, not homelabs or servers)
 - **Architecture:** Single-threaded GUI (eframe/egui) with a multi-threaded Tokio runtime for async I/O and database work
-- **Database:** SQLite (WAL mode, 5s busy timeout), managed via `sqlx` with embedded migrations
+- **Database:** SQLite (WAL mode, `synchronous=NORMAL`, 5s busy timeout), managed via `sqlx` with embedded migrations
 - **Config format:** TOML, human-readable, stored in XDG directories
 
 ### Key Goals (from `concept.md`)
@@ -85,7 +85,7 @@ cargo test
   - Install on Debian/Ubuntu: `sudo apt install libheif-dev libde265-dev`
   - Build with the feature: `cargo build --features hevc`
   - This feature is **excluded from default builds** for license reasons and is only included in the dedicated HEVC binary.
-- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; `libwebp` is built from source and linked statically, so no system `libwebp-dev`/`libwebp-devel` is required.
+- `simd-thumbnails` — Enables SIMD-optimized thumbnail generation via `fast_image_resize` (AVX2/NEON) and `libwebp`. Enabled by default; `libwebp` is built from source and linked statically, so no system `libwebp-dev`/`libwebp-devel` is required. The same `fast_image_resize` dependency also accelerates Hydra's Lanczos3 preprocess resize (roughly halves preprocessing cost on 20+ MP images); set `AKASHA_HYDRA_SCALAR_RESIZE=1` to force the scalar `image`-crate path for bit-comparable reruns.
 - `mistralrs` (optional) — Enables local VLM inference via `mistral.rs`. Uses a statically vendored OpenSSL on Linux.
 - `burn` (optional) — Enables the native Burn deep-learning backend and the Hydra-3.5 tagging model implemented in Burn. Pulls in `faer`, `gemm`, `rayon`, `wide`, and `bytemuck`.
   - `burn-candle` — Runs the Burn Hydra model on Candle (F32 + AVX512-BF16 `VDPBF16PS` GEMM kernels for weight-static linears; fastest CPU path, ~1.3 s/image on a Ryzen 7950X).
@@ -109,7 +109,7 @@ cargo test
 8. Changed files are written to the DB in **batches of 500** wrapped in explicit transactions, rather than one implicit transaction per file.
 9. Send `ScanEvent::Complete("Existing data loaded", 0)` if nothing needs scanning.
 10. Start the filesystem watcher (`watcher::spawn`) for every configured folder. Watcher events are ignored while a manual scan is in flight to avoid races.
-11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`. The worker drains the queue within each 5s tick, chunks claimed jobs by each model's `max_batch_size()` (batched inference where supported), and calls `Model::release_memory()` when the queue drains so GPU memory pools return to baseline. Jobs are **not** enqueued automatically on scan/import; inference is triggered manually via the UI.
+11. Start the background Searchables worker (`SearchWorker`) polling `job_queue`. The worker drains the queue within each 5s tick, chunks claimed jobs by each model's `max_batch_size()` (batched inference where supported), and keeps ~8 images' worth of chunk tasks in flight (`PIPELINE_TARGET_IMAGES` in `worker.rs`) so disk reads/decodes overlap the GPU forward — only the forwards are serialized, by the model's workspace mutex. Pipeline depth matters most for large images: decode+Lanczos3-resize of a 30 MP image costs ~600 ms vs ~95 ms for the forward, so shallow pipelines starve the GPU on high-res folders. It calls `Model::release_memory()` when the queue drains so GPU memory pools return to baseline. Jobs are **not** enqueued automatically on scan/import; inference is triggered manually via the UI.
 
 ---
 
@@ -127,7 +127,7 @@ src/
   watcher.rs     — Filesystem watcher using `notify-debouncer-full`; emits batched Create/Modify/Remove events to `app.rs`
   theme.rs       — Custom flat egui theme
   db/
-    mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations
+    mod.rs       — `init_pool()` creates SQLite pool (WAL mode) and runs migrations; `ImmediateTx` (`BEGIN IMMEDIATE`, rolls back on drop) for write transactions that must not fail with `SQLITE_BUSY_SNAPSHOT` under concurrent writers
     folder.rs    — Folder CRUD: `list_all`, `list_roots`, `list_children`, `get_by_path`, `get_or_create`, `insert`, `update_scan_complete`, `update_scan_complete_recursive`, `list_subtree`, `mark_missing`, `mark_missing_by_path`, `mark_present_with_ancestors`
     media.rs     — Media file CRUD: `MediaFile` (full record), `MediaSummary` (lightweight grid record), `list_by_folder`, `list_by_folder_recursive`, `list_summaries_by_folder` (streaming), `count_by_folder`, `get_by_id`, `list_page_by_folder`, `upsert`, `mark_missing`, `mark_missing_by_path`, `mark_present_by_path`, `delete_missing`, `delete_by_path`, `search_summaries`
     searchable.rs — Searchable config/value CRUD and generic `job_queue` helpers
@@ -199,7 +199,8 @@ Migrations live in `migrations/` and are embedded at compile time.
 - `params_json` — job-specific JSON (e.g. `{"model_name":"wd14"}`)
 - `status` (`pending` | `running` | `done` | `failed`), `attempts`, `error`
 - `created_at`, `updated_at`
-- Index: `idx_job_queue_pending`
+- Indexes: `idx_job_queue_pending` (status scans/counts), `idx_job_queue_dedup` (enqueue dedup lookup; without it bulk enqueue is O(n²)), `idx_job_queue_claim` (partial, `WHERE status='pending'`; serves claims in `(searchable_config_id, created_at)` order — `claim_pending_jobs` uses `INDEXED BY` because the planner will not pick it voluntarily)
+- Bulk enqueues commit in chunks of 4096 rows (`enqueue_jobs`) so collection-scale enqueues don't hold the write lock long enough to starve the worker's claims
 
 ### Notes
 - `exclude` and `include` are stored as JSON strings and deserialized via `serde_json`.
@@ -330,6 +331,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 - Remote backend currently uploads the full raw image without resize/compress; image preprocessing for remote endpoints is deferred.
 - Vector search backend (`sqlite-vec` / HNSW) is not yet chosen or implemented.
 - Tags and descriptions are now backed by FTS5 (trigram for tags, `searchable_text_fts` for descriptions). Sidecar text search is still deferred.
+- FTS rowid invariants (must be maintained by any code writing these tables): `searchable_tags_fts.rowid` mirrors `searchable_tags.rowid`, and `searchable_text_fts.rowid` is the `media_file_id`. Always delete FTS rows through these rowids — filtering on the UNINDEXED `media_file_id`/`source` columns is a full scan of the FTS table (measured ~190 ms at 2.3M rows) and was the cause of a progressive inference slowdown.
 - Watcher config is loaded once at startup; editing `config.toml` requires a restart to update watched imports.
 - Cross-root file moves appear as a Remove + Create pair; no move deduplication.
 - Missing files (`is_present = 0`) are hidden from the grid and search results (filtered in `poll_media_events`); their rows and metadata stay in the DB and can be purged via DB Management.
@@ -367,7 +369,7 @@ The full original plan (database evaluation, Searchables trait definition, exten
 | `src/models/burn/hydra/fused_ops/hydra_pool.rs` | Fused HydraPool fast path |
 | `src/models/burn/hydra/fused_ops/hydra_mid.rs` | Fused HydraMidBlock fast path |
 | `src/models/burn/hydra/weights.rs` | Safetensors weight loading and cached contiguous weight buffers |
-| `src/models/burn/hydra/image.rs` | Image preprocessing for Hydra (patches, positional embeddings) |
+| `src/models/burn/hydra/image.rs` | Image preprocessing for Hydra (patches, positional embeddings, Lanczos3 resize — SIMD via `fast_image_resize` under `simd-thumbnails`, scalar `image`-crate fallback; FIR deviates from scalar by ≤16/255 on sparse ringing pixels, max ~0.12 logit, i.e. a few near-threshold tag flips per image) |
 | `src/models/burn/kernels.rs` | Portable SIMD elementwise kernels (softmax, layer/RMS norm, GELU, GLU) |
 | `src/searchables/mod.rs` | `Searchable` trait, kinds, and registry |
 | `src/searchables/engine.rs` | Search orchestration and score aggregation |
