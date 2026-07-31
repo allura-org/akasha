@@ -206,80 +206,109 @@ impl SearchWorker {
         // Split the config group into inference chunks sized to what the model
         // says it can handle without blowing up memory.
         //
-        // The loop is pipelined one chunk ahead: the next chunk's inference
-        // (path resolution, CPU preprocess, GPU forward) is spawned *before*
-        // this chunk's results are written, so the GPU never idles behind DB
-        // commits. The model's internal workspace mutex serializes the actual
-        // forwards, so at most one extra chunk's worth of tensors is in
-        // flight.
+        // The loop keeps several chunk tasks in flight: each task does its
+        // own path resolution, disk read, decode, and CPU preprocess before
+        // the model's internal workspace mutex serializes just the GPU
+        // forwards. Decode/resize of large (20+ MP) images costs hundreds of
+        // ms per image — an order of magnitude more than the forward — so the
+        // pipeline must run several images deep to keep the GPU fed. The
+        // target is ~8 images in flight regardless of the model's batch size.
+        const PIPELINE_TARGET_IMAGES: usize = 8;
+        let pipeline_depth = (PIPELINE_TARGET_IMAGES / max_batch).max(2);
         let chunks: Vec<&[crate::db::searchable::JobRow]> = jobs.chunks(max_batch).collect();
-        let mut pending: Option<
+        let mut pending: std::collections::VecDeque<(
+            usize,
             tokio::task::JoinHandle<anyhow::Result<Vec<crate::models::ModelOutput>>>,
-        > = None;
+        )> = std::collections::VecDeque::new();
+        let mut spawn_next = 0usize;
+        let group_start = std::time::Instant::now();
+        let mut total_infer = Duration::ZERO;
+        let mut total_write = Duration::ZERO;
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            let handle = match pending.take() {
-                Some(h) => Some(h),
-                None => match self.spawn_chunk_infer(chunk, model.clone()).await {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "SearchWorker: chunk preprocessing failed");
-                        self.fail_chunk(chunk, &e).await;
-                        None
-                    }
-                },
-            };
-
-            // Kick off the next chunk before awaiting this chunk's results.
-            let next = match chunks.get(i + 1) {
-                Some(next_chunk) => match self.spawn_chunk_infer(next_chunk, model.clone()).await
+        while spawn_next < chunks.len() || !pending.is_empty() {
+            while spawn_next < chunks.len() && pending.len() < pipeline_depth {
+                match self
+                    .spawn_chunk_infer(chunks[spawn_next], model.clone())
+                    .await
                 {
-                    Ok(h) => Some(h),
+                    Ok(h) => pending.push_back((spawn_next, h)),
                     Err(e) => {
                         tracing::warn!(error = %e, "SearchWorker: chunk preprocessing failed");
-                        self.fail_chunk(next_chunk, &e).await;
-                        None
+                        self.fail_chunk(chunks[spawn_next], &e).await;
                     }
-                },
-                None => None,
-            };
+                }
+                spawn_next += 1;
+            }
 
-            let Some(handle) = handle else {
-                pending = next;
-                continue;
+            let Some((i, handle)) = pending.pop_front() else {
+                break;
             };
+            let chunk = chunks[i];
 
+            let t_infer = std::time::Instant::now();
             let outputs = match handle.await {
                 Ok(Ok(outputs)) => outputs,
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, chunk_size = chunk.len(), "SearchWorker: inference chunk failed");
                     self.fail_chunk(chunk, &e).await;
-                    pending = next;
                     continue;
                 }
                 Err(e) => {
                     let e = anyhow::anyhow!("inference task panicked: {e}");
                     tracing::warn!(error = %e, chunk_size = chunk.len(), "SearchWorker: inference chunk failed");
                     self.fail_chunk(chunk, &e).await;
-                    pending = next;
                     continue;
                 }
             };
+            total_infer += t_infer.elapsed();
 
-            if let Err(e) = self
-                .write_chunk_results(chunk, outputs, &cfg, &model_config)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    chunk_size = chunk.len(),
-                    "SearchWorker: writing chunk results failed"
-                );
-                self.fail_chunk(chunk, &e).await;
+            // A lock-contended write is transient; retry with backoff instead
+            // of instantly failing the chunk (which used to discard good
+            // inference results and permanently fail the jobs).
+            let t_write = std::time::Instant::now();
+            let mut write_attempts = 0;
+            loop {
+                match self
+                    .write_chunk_results(chunk, outputs.clone(), &cfg, &model_config)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(e) if write_attempts < 3 && is_database_locked(&e) => {
+                        write_attempts += 1;
+                        let backoff = Duration::from_millis(100 << write_attempts);
+                        tracing::warn!(
+                            error = %e,
+                            chunk_size = chunk.len(),
+                            attempt = write_attempts,
+                            "SearchWorker: chunk write blocked by database lock; retrying"
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            chunk_size = chunk.len(),
+                            "SearchWorker: writing chunk results failed"
+                        );
+                        self.fail_chunk(chunk, &e).await;
+                        break;
+                    }
+                }
             }
-
-            pending = next;
+            total_write += t_write.elapsed();
         }
+
+        // Per-group phase split: infer-await is time waiting on chunk tasks
+        // (GPU forward + that chunk's own read/decode/preprocess, overlapped
+        // PIPELINE_DEPTH deep), write is result persistence, and the remainder
+        // of the group wall time is claim/spawn overhead.
+        tracing::info!(
+            group_size = jobs.len(),
+            wall_ms = group_start.elapsed().as_millis(),
+            infer_await_ms = total_infer.as_millis(),
+            write_ms = total_write.as_millis(),
+            "SearchWorker: job group timing"
+        );
 
         Ok(())
     }
@@ -397,6 +426,19 @@ impl SearchWorker {
 
         Ok(())
     }
+}
+
+/// True if the error chain contains a SQLite "database is locked" failure
+/// (`SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`), which is transient contention
+/// worth retrying rather than a real job failure.
+fn is_database_locked(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .map(|d| d.message().contains("database is locked"))
+            .unwrap_or(false)
+    })
 }
 
 /// Reorder claimed jobs so jobs sharing the same `searchable_config_id` are

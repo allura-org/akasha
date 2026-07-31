@@ -154,24 +154,22 @@ impl<
         let n = image_paths.len();
         anyhow::ensure!(n > 0, "infer_logits_batch: empty batch");
 
+        // Preprocess (read/decode/resize/patchify) runs unlocked so pipelined
+        // inference tasks overlap their CPU-side work; the pos-embed cache
+        // locks itself per lookup, and only the forward below is serialized
+        // (by the workspace mutex).
         let mut pres = Vec::with_capacity(n);
-        {
-            let mut pos_cache = self
-                .pos_embed_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for path in image_paths {
-                pres.push(
-                    preprocess(
-                        path,
-                        &self.pos_embed,
-                        self.max_seq_len,
-                        self.background,
-                        &mut pos_cache,
-                    )
-                    .with_context(|| format!("failed to preprocess image: {}", path.display()))?,
-                );
-            }
+        for path in image_paths {
+            pres.push(
+                preprocess(
+                    path,
+                    &self.pos_embed,
+                    self.max_seq_len,
+                    self.background,
+                    &self.pos_embed_cache,
+                )
+                .with_context(|| format!("failed to preprocess image: {}", path.display()))?,
+            );
         }
         let t_pre = t0.elapsed();
 
@@ -858,4 +856,244 @@ fn load_pos_embed(path: &Path) -> Result<Array4<f32>> {
     };
 
     Array4::from_shape_vec((1, 16, 16, 1152), data).context("failed to build pos_embed array")
+}
+
+/// Throwaway phase-timing bench for the worker pipeline. Run with:
+///   AKASHA_HYDRA_BENCH_LIST=<file with image paths, one per line> \
+///   AKASHA_HYDRA_MODEL=<path to hydra-3.5.safetensors> \
+///   cargo test --release --features burn-cuda hydra_pipeline_bench -- --ignored --nocapture
+#[cfg(all(test, feature = "burn-cuda"))]
+mod pipeline_bench {
+    use super::*;
+    use crate::config::{ModelConfig, ModelKind, ModelTagsOptions};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    type Cuda = burn::backend::Cuda;
+
+    fn report(name: &str, mut times: Vec<std::time::Duration>) {
+        times.sort();
+        let n = times.len();
+        let sum: f64 = times.iter().map(|t| t.as_secs_f64()).sum();
+        let pct = |p: usize| times[(n * p / 100).min(n - 1)].as_secs_f64() * 1000.0;
+        println!(
+            "{name}: n={n} mean={:.1}ms p50={:.1}ms p90={:.1}ms p99={:.1}ms => {:.2}/s",
+            sum / n as f64 * 1000.0,
+            pct(50),
+            pct(90),
+            pct(99),
+            n as f64 / sum
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn hydra_pipeline_bench() {
+        let list = std::env::var("AKASHA_HYDRA_BENCH_LIST").expect("AKASHA_HYDRA_BENCH_LIST");
+        let model_path = std::env::var("AKASHA_HYDRA_MODEL").expect("AKASHA_HYDRA_MODEL");
+        let paths: Vec<PathBuf> = std::fs::read_to_string(list)
+            .unwrap()
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+        println!("benching {} images", paths.len());
+
+        let config = ModelConfig {
+            name: "hydra-3.5".into(),
+            kind: ModelKind::Local,
+            backend: Some("burn".into()),
+            path: Some(model_path),
+            base_url: None,
+            model_id: None,
+            api_key: None,
+            tags: Some(ModelTagsOptions::default()),
+            description: None,
+            classification: None,
+            remote: None,
+            onnx: None,
+            jtp3: None,
+            burn: None,
+        };
+        let model = HydraModel::<Cuda>::load(&config, Default::default()).unwrap();
+
+        // Phase 1: preprocess only, sequential.
+        let mut pre_times = Vec::new();
+        for p in &paths {
+            let t = Instant::now();
+            preprocess(
+                p,
+                &model.pos_embed,
+                model.max_seq_len,
+                model.background,
+                &model.pos_embed_cache,
+            )
+            .unwrap();
+            pre_times.push(t.elapsed());
+        }
+        report("preprocess(seq)", pre_times);
+
+        // Warm up the forward path (kernel autotune-free, but first-run
+        // module loads and workspace allocation still apply).
+        for p in paths.iter().take(8) {
+            model.infer_logits(p).unwrap();
+        }
+
+        // Phase 2: full infer (preprocess + H2D + forward + readback), sequential.
+        let mut infer_times = Vec::new();
+        for p in &paths {
+            let t = Instant::now();
+            model.infer_logits(p).unwrap();
+            infer_times.push(t.elapsed());
+        }
+        report("infer(seq)", infer_times);
+
+        // Phase 3: 4 threads sharing the model, mimicking PIPELINE_DEPTH=4.
+        let model = Arc::new(model);
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            for chunk in paths.chunks((paths.len() + 3) / 4) {
+                let m = model.clone();
+                s.spawn(move || {
+                    for p in chunk {
+                        m.infer_logits(p).unwrap();
+                    }
+                });
+            }
+        });
+        let wall = t0.elapsed().as_secs_f64();
+        println!(
+            "infer(4 threads): {:.1}s wall for {} images => {:.2}/s",
+            wall,
+            paths.len(),
+            paths.len() as f64 / wall
+        );
+
+        // Phase 4/5: tokio spawn_blocking pipeline mirroring the SearchWorker
+        // loop (depth 4, one image per task), with and without real DB writes.
+        async fn run_pipeline(
+            model: Arc<HydraModel<Cuda>>,
+            jobs: &[(i64, PathBuf)],
+            pool: Option<&sqlx::SqlitePool>,
+        ) -> f64 {
+            const DEPTH: usize = 8;
+            let mut pending: std::collections::VecDeque<(
+                i64,
+                tokio::task::JoinHandle<anyhow::Result<crate::models::ModelOutput>>,
+            )> = std::collections::VecDeque::new();
+            let mut next = 0usize;
+            let t0 = Instant::now();
+            while next < jobs.len() || !pending.is_empty() {
+                while next < jobs.len() && pending.len() < DEPTH {
+                    let (id, path) = &jobs[next];
+                    let m = model.clone();
+                    let p = path.clone();
+                    pending.push_back((*id, tokio::task::spawn_blocking(move || m.infer(&p))));
+                    next += 1;
+                }
+                let (id, handle) = pending.pop_front().unwrap();
+                let out = handle.await.unwrap().unwrap();
+                if let Some(pool) = pool {
+                    if let crate::models::ModelOutput::Tags(tags) = out {
+                        crate::db::searchable::update_tags_json(pool, id, "hydra-3.5", tags)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            t0.elapsed().as_secs_f64()
+        }
+
+        let jobs: Vec<(i64, PathBuf)> = std::fs::read_to_string(
+            std::env::var("AKASHA_HYDRA_BENCH_JOBS").expect("AKASHA_HYDRA_BENCH_JOBS"),
+        )
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let (id, path) = l.split_once('|').unwrap();
+            (id.parse().unwrap(), PathBuf::from(path))
+        })
+        .collect();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tokio_only_s, tokio_db_s) = rt.block_on(async {
+            let t_no_db = run_pipeline(model.clone(), &jobs, None).await;
+
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect_with(
+                    sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(
+                            std::env::var("AKASHA_HYDRA_BENCH_DB").expect("AKASHA_HYDRA_BENCH_DB"),
+                        )
+                        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+                        .busy_timeout(std::time::Duration::from_secs(5)),
+                )
+                .await
+                .unwrap();
+            let t_db = run_pipeline(model.clone(), &jobs, Some(&pool)).await;
+            (t_no_db, t_db)
+        });
+        println!(
+            "tokio pipeline (no DB): {:.1}s => {:.2}/s",
+            tokio_only_s,
+            jobs.len() as f64 / tokio_only_s
+        );
+        println!(
+            "tokio pipeline (+ real tag writes): {:.1}s => {:.2}/s",
+            tokio_db_s,
+            jobs.len() as f64 / tokio_db_s
+        );
+
+        // Phase 6: A/B the SIMD resize path against the scalar reference at
+        // the model level — logit deltas and above-threshold tag-set changes.
+        // A same-path control (FIR twice) separates forward nondeterminism
+        // from genuine resize-induced differences.
+        let mut max_logit_diff_resize = 0f32;
+        let mut max_logit_diff_control = 0f32;
+        let mut tag_diff_resize = 0usize;
+        let mut tag_diff_control = 0usize;
+        let mut compared = 0usize;
+        let above = |logits: &[f32], threshold: f32| -> std::collections::HashSet<usize> {
+            logits
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| 1.0 / (1.0 + (-v).exp()) >= threshold)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let set_diff = |a: &std::collections::HashSet<usize>, b: &std::collections::HashSet<usize>| {
+            a.symmetric_difference(b).count()
+        };
+        for p in paths.iter().take(16) {
+            let fir1 = model.infer_logits(p).unwrap();
+            let fir2 = model.infer_logits(p).unwrap();
+            // SAFETY: single-threaded test; no concurrent env readers.
+            unsafe { std::env::set_var("AKASHA_HYDRA_SCALAR_RESIZE", "1") };
+            let scalar = model.infer_logits(p).unwrap();
+            // SAFETY: single-threaded test; no concurrent env readers.
+            unsafe { std::env::remove_var("AKASHA_HYDRA_SCALAR_RESIZE") };
+
+            let d_control = fir1
+                .iter()
+                .zip(fir2.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let d_resize = fir1
+                .iter()
+                .zip(scalar.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            max_logit_diff_control = max_logit_diff_control.max(d_control);
+            max_logit_diff_resize = max_logit_diff_resize.max(d_resize);
+            tag_diff_control += set_diff(&above(&fir1, model.threshold), &above(&fir2, model.threshold));
+            tag_diff_resize += set_diff(&above(&fir1, model.threshold), &above(&scalar, model.threshold));
+            compared += 1;
+        }
+        println!(
+            "resize A/B ({} imgs): control max|dlogit|={:.4} ({} tags flipped total), \
+             resize-vs-scalar max|dlogit|={:.4} ({} tags flipped total)",
+            compared, max_logit_diff_control, tag_diff_control, max_logit_diff_resize, tag_diff_resize
+        );
+    }
 }

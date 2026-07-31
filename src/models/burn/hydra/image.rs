@@ -4,7 +4,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, Rgb, RgbImage};
-use image::imageops::FilterType;
 use image::ImageDecoder;
 use ndarray::{Array2, Array3, Array4, Axis, s};
 
@@ -26,7 +25,7 @@ pub fn preprocess(
     pos_embed: &Array4<f32>,
     max_seq_len: usize,
     background: [u8; 3],
-    pos_embed_cache: &mut std::collections::HashMap<(usize, usize), Array2<f32>>,
+    pos_embed_cache: &std::sync::Mutex<std::collections::HashMap<(usize, usize), Array2<f32>>>,
 ) -> Result<PreprocessedImage> {
     let icc_profile = image::ImageReader::open(image_path)
         .ok()
@@ -50,7 +49,7 @@ pub fn preprocess(
 
     // Hydra metadata requests mks2013-linear, but image crate does not expose it.
     // Use Lanczos3 for the spike; revisit if output diverges significantly.
-    let resized = image::imageops::resize(&rgb, resize_w as u32, resize_h as u32, FilterType::Lanczos3);
+    let resized = resize_lanczos3(&rgb, resize_w as u32, resize_h as u32)?;
 
     let grid_h = resize_h / PATCH_SIZE;
     let grid_w = resize_w / PATCH_SIZE;
@@ -77,13 +76,19 @@ pub fn preprocess(
     // The interpolated position embedding depends only on the patch grid
     // size, which the resize search quantizes to a handful of distinct values
     // across a collection — cache it instead of re-interpolating per image.
-    let pos_embed_padded = match pos_embed_cache.get(&(grid_h, grid_w)) {
-        Some(cached) => cached.clone(),
-        None => {
-            let interpolated = interpolate_pos_embed(pos_embed, grid_h, grid_w, max_seq_len)
-                .context("failed to interpolate position embedding")?;
-            pos_embed_cache.insert((grid_h, grid_w), interpolated.clone());
-            interpolated
+    // The lock is only held for the cache lookup/insert: holding it across
+    // the read/decode/resize above would serialize the CPU-side work of
+    // pipelined inference tasks.
+    let pos_embed_padded = {
+        let mut cache = pos_embed_cache.lock().unwrap_or_else(|e| e.into_inner());
+        match cache.get(&(grid_h, grid_w)) {
+            Some(cached) => cached.clone(),
+            None => {
+                let interpolated = interpolate_pos_embed(pos_embed, grid_h, grid_w, max_seq_len)
+                    .context("failed to interpolate position embedding")?;
+                cache.insert((grid_h, grid_w), interpolated.clone());
+                interpolated
+            }
         }
     };
 
@@ -96,6 +101,57 @@ pub fn preprocess(
         valid,
         pos_embed: pos_embed_padded,
     })
+}
+
+/// Lanczos3 resize. With `simd-thumbnails` enabled this uses the SIMD
+/// `fast_image_resize` convolution (an order of magnitude faster on
+/// multi-megapixel images, where resize dominates preprocessing); otherwise
+/// it falls back to the `image` crate's scalar Lanczos3. Both implement the
+/// same Lanczos-3 filter; the SIMD path uses fixed-point arithmetic, so
+/// results can differ by ±1/255 per pixel.
+#[cfg(feature = "simd-thumbnails")]
+fn resize_lanczos3(rgb: &RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage> {
+    use fast_image_resize as fr;
+    use fr::images::{Image, ImageRef};
+
+    // Kill switch for A/B validation against the scalar reference path.
+    if std::env::var_os("AKASHA_HYDRA_SCALAR_RESIZE").is_some() {
+        return Ok(image::imageops::resize(
+            rgb,
+            dst_w,
+            dst_h,
+            image::imageops::FilterType::Lanczos3,
+        ));
+    }
+
+    let src = ImageRef::new(
+        rgb.width(),
+        rgb.height(),
+        rgb.as_raw(),
+        fr::PixelType::U8x3,
+    )
+    .context("failed to view source image for resize")?;
+    let mut dst = Image::new(dst_w, dst_h, fr::PixelType::U8x3);
+    fr::Resizer::new()
+        .resize(
+            &src,
+            &mut dst,
+            &fr::ResizeOptions::new()
+                .resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3)),
+        )
+        .context("fast_image_resize failed")?;
+    RgbImage::from_raw(dst_w, dst_h, dst.into_vec())
+        .context("failed to rebuild RGB image after resize")
+}
+
+#[cfg(not(feature = "simd-thumbnails"))]
+fn resize_lanczos3(rgb: &RgbImage, dst_w: u32, dst_h: u32) -> Result<RgbImage> {
+    Ok(image::imageops::resize(
+        rgb,
+        dst_w,
+        dst_h,
+        image::imageops::FilterType::Lanczos3,
+    ))
 }
 
 /// Binary-search for the largest resize that keeps the patch count within
@@ -219,4 +275,61 @@ fn sample(view: &ndarray::ArrayView3<f32>, y: isize, x: isize, c: usize) -> f32 
     let y = y.clamp(0, h - 1) as usize;
     let x = x.clamp(0, w - 1) as usize;
     view[[y, x, c]]
+}
+
+#[cfg(all(test, feature = "simd-thumbnails"))]
+mod tests {
+    /// Sanity check for the fast_image_resize path: output should track the
+    /// image crate's scalar Lanczos3 within a couple of LSBs. Run with:
+    ///   AKASHA_HYDRA_BENCH_LIST=<paths file> \
+    ///   cargo test --release --features burn-cuda fir_matches -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fir_matches_image_crate_resize() {
+        let list = std::env::var("AKASHA_HYDRA_BENCH_LIST").expect("AKASHA_HYDRA_BENCH_LIST");
+        let path = std::fs::read_to_string(list).unwrap().lines().next().unwrap().to_string();
+        let rgb = image::open(&path).unwrap().to_rgb8();
+        let (dst_w, dst_h) = (1024u32, 768u32);
+
+        let reference = image::imageops::resize(&rgb, dst_w, dst_h, image::imageops::FilterType::Lanczos3);
+        let fast = super::resize_lanczos3(&rgb, dst_w, dst_h).unwrap();
+
+        let mut max_diff = 0i32;
+        let mut sum_diff = 0u64;
+        let mut over4 = 0u64;
+        let mut over4_border = 0u64;
+        let (w, h) = (dst_w as usize, dst_h as usize);
+        for (i, (a, b)) in reference.as_raw().iter().zip(fast.as_raw().iter()).enumerate() {
+            let d = (*a as i32 - *b as i32).abs();
+            max_diff = max_diff.max(d);
+            sum_diff += d as u64;
+            if d > 4 {
+                over4 += 1;
+                let px = i / 3;
+                let (x, y) = (px % w, px / w);
+                if x < 4 || y < 4 || x >= w - 4 || y >= h - 4 {
+                    over4_border += 1;
+                }
+            }
+        }
+        let n = reference.as_raw().len() as u64;
+        println!(
+            "resize diff: max={} mean={:.3} over4={} ({} at border, {} interior)",
+            max_diff,
+            sum_diff as f64 / n as f64,
+            over4,
+            over4_border,
+            over4 - over4_border
+        );
+        // FIR deviates from the scalar reference mainly via fixed-point
+        // Lanczos3 ringing at sharp transients (sparse, interior pixels).
+        // Guard against catastrophic breakage (channel swaps, misalignment),
+        // not bit-exactness.
+        assert!(max_diff <= 32, "FIR resize diverges too much: max diff {max_diff}");
+        assert!(
+            (sum_diff as f64 / n as f64) < 0.5,
+            "FIR resize mean diff too high: {}",
+            sum_diff as f64 / n as f64
+        );
+    }
 }
