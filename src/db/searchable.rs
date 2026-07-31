@@ -132,7 +132,7 @@ pub async fn update_tags_json(
     source: &str,
     tags: std::collections::HashMap<String, f32>,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::ImmediateTx::begin(pool).await?;
 
     // Read existing tags_json, update the source entry.
     let existing: Option<String> = sqlx::query_scalar(
@@ -154,35 +154,44 @@ pub async fn update_tags_json(
         .execute(&mut *tx)
         .await?;
 
-    // Mirror into searchable_tags.
+    // Mirror into searchable_tags. The FTS5 side table's rowid mirrors
+    // searchable_tags.rowid, so its rows are deleted through the FTS docid
+    // index — filtering on the UNINDEXED media_file_id/source columns would
+    // scan the whole FTS table. The FTS delete must run while the
+    // searchable_tags rows it mirrors still exist.
+    sqlx::query(
+        "DELETE FROM searchable_tags_fts WHERE rowid IN (
+             SELECT rowid FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2
+         )"
+    )
+    .bind(media_file_id)
+    .bind(source)
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query("DELETE FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2")
         .bind(media_file_id)
         .bind(source)
         .execute(&mut *tx)
         .await?;
 
-    // Keep the FTS5 trigram side table in sync with searchable_tags.
-    sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2")
-        .bind(media_file_id)
-        .bind(source)
-        .execute(&mut *tx)
-        .await?;
-
     for (tag, score) in tags {
-        sqlx::query(
+        let tag_rowid: i64 = sqlx::query_scalar(
             "INSERT INTO searchable_tags (media_file_id, source, tag, score)
-             VALUES (?1, ?2, ?3, ?4)"
+             VALUES (?1, ?2, ?3, ?4) RETURNING rowid"
         )
         .bind(media_file_id)
         .bind(source)
         .bind(tag.as_str())
         .bind(score)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
         sqlx::query(
-            "INSERT INTO searchable_tags_fts (tag, media_file_id, source) VALUES (?1, ?2, ?3)"
+            "INSERT INTO searchable_tags_fts (rowid, tag, media_file_id, source)
+             VALUES (?1, ?2, ?3, ?4)"
         )
+        .bind(tag_rowid)
         .bind(tag.as_str())
         .bind(media_file_id)
         .bind(source)
@@ -203,7 +212,7 @@ pub async fn update_description_json(
     source: &str,
     description: &str,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::ImmediateTx::begin(pool).await?;
 
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT descriptions_json FROM media_files WHERE id = ?1"
@@ -250,15 +259,21 @@ pub async fn delete_tags_for_source(
     media_file_id: i64,
     source: &str,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::ImmediateTx::begin(pool).await?;
+
+    // FTS rows are keyed by searchable_tags.rowid; delete them while the
+    // searchable_tags rows they mirror still exist (see update_tags_json).
+    sqlx::query(
+        "DELETE FROM searchable_tags_fts WHERE rowid IN (
+             SELECT rowid FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2
+         )"
+    )
+    .bind(media_file_id)
+    .bind(source)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query("DELETE FROM searchable_tags WHERE media_file_id = ?1 AND source = ?2")
-        .bind(media_file_id)
-        .bind(source)
-        .execute(&mut *tx)
-        .await?;
-
-    sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1 AND source = ?2")
         .bind(media_file_id)
         .bind(source)
         .execute(&mut *tx)
@@ -294,9 +309,12 @@ pub async fn delete_description_for_source(
     media_file_id: i64,
     source: &str,
 ) -> Result<()> {
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::db::ImmediateTx::begin(pool).await?;
 
-    sqlx::query("DELETE FROM searchable_text_fts WHERE media_file_id = ?1 AND source = ?2")
+    // searchable_text_fts.rowid is the media_file_id (see
+    // update_description_json); delete through the docid index rather than
+    // scanning the whole FTS table on the UNINDEXED columns.
+    sqlx::query("DELETE FROM searchable_text_fts WHERE rowid = ?1 AND source = ?2")
         .bind(media_file_id)
         .bind(source)
         .execute(&mut *tx)
@@ -558,16 +576,67 @@ pub async fn enqueue_job(
     Ok(id)
 }
 
+/// Enqueue the same job for many media files, committing in chunks.
+///
+/// Enqueueing one row per transaction turns a bulk enqueue into thousands of
+/// separate writer-lock acquisitions and WAL commits that starve concurrent
+/// writers (notably the SearchWorker). A single transaction for the whole
+/// batch has the opposite problem: at collection scale (hundreds of thousands
+/// of jobs) it holds the write lock for tens of seconds and the worker's
+/// claims time out. Chunked transactions hold the lock for a few ms at a
+/// time, let the worker interleave, and fill the queue progressively.
+/// Existing pending duplicates are skipped. Returns the number of jobs
+/// actually inserted.
+pub async fn enqueue_jobs(
+    pool: &SqlitePool,
+    media_file_ids: &[i64],
+    job_kind: &str,
+    params_json: &str,
+    searchable_config_id: Option<i64>,
+) -> Result<usize> {
+    /// Rows committed per transaction; see the doc comment above.
+    const ENQUEUE_CHUNK: usize = 4096;
+
+    let mut enqueued = 0usize;
+    for chunk in media_file_ids.chunks(ENQUEUE_CHUNK) {
+        let mut tx = crate::db::ImmediateTx::begin(pool).await?;
+        for media_file_id in chunk {
+            enqueued += sqlx::query(
+                "INSERT INTO job_queue (media_file_id, searchable_config_id, job_kind, params_json, status, attempts)
+                 SELECT ?1, ?2, ?3, ?4, 'pending', 0
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM job_queue
+                     WHERE media_file_id = ?1 AND job_kind = ?3 AND params_json = ?4
+                       AND searchable_config_id IS ?2 AND status = 'pending'
+                 )"
+            )
+            .bind(media_file_id)
+            .bind(searchable_config_id)
+            .bind(job_kind)
+            .bind(params_json)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected() as usize;
+        }
+        tx.commit().await?;
+    }
+    Ok(enqueued)
+}
+
 /// Claim the next batch of pending jobs for media files that are still present.
 /// Jobs for missing files are left pending; they will be retried automatically
 /// if the file reappears, or dropped when the record is purged.
+///
+/// INDEXED BY is deliberate: the planner will not pick the partial claim
+/// index on its own, and the fallback plan sorts the entire pending queue
+/// (which becomes seconds per claim at collection scale) on every batch.
 pub async fn claim_pending_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<JobRow>> {
     let rows = sqlx::query_as::<_, JobRow>(
         "UPDATE job_queue
          SET status = 'running', updated_at = CURRENT_TIMESTAMP
          WHERE id IN (
              SELECT j.id
-             FROM job_queue j
+             FROM job_queue j INDEXED BY idx_job_queue_claim
              JOIN media_files m ON m.id = j.media_file_id
              WHERE j.status = 'pending' AND m.is_present = 1
              ORDER BY j.searchable_config_id, j.created_at
@@ -706,8 +775,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_config_round_trip() {
+    async fn enqueue_jobs_bulk_inserts_and_skips_duplicates() {
         let pool = setup_pool().await;
+
+        let fid = crate::db::folder::insert(
+            &pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable",
+        )
+        .await
+        .unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            let id = crate::db::media::upsert(
+                &pool,
+                fid,
+                name,
+                &format!("/tmp/root/{name}"),
+                "hash",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+
+        let params = r#"{"model_name":"wd14"}"#;
+        let n = enqueue_jobs(&pool, &ids, "tagger", params, None)
+            .await
+            .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(count_pending_jobs(&pool).await.unwrap(), 3);
+
+        // Re-enqueueing the same batch is a no-op.
+        let n = enqueue_jobs(&pool, &ids, "tagger", params, None)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(count_pending_jobs(&pool).await.unwrap(), 3);
+
+        // Empty input is a no-op.
+        assert_eq!(
+            enqueue_jobs(&pool, &[], "tagger", params, None)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_config_round_trip() {        let pool = setup_pool().await;
 
         let id1 = upsert_config(
             &pool,

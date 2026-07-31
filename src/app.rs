@@ -1048,13 +1048,13 @@ impl AkashaApp {
                 "overwrite": action.overwrite,
             })
             .to_string();
-            let mut enqueued = 0usize;
-            for media_id in media_ids {
-                match db::searchable::enqueue_job(&pool, media_id, job_kind, &params, Some(config.id)).await {
-                    Ok(_) => enqueued += 1,
-                    Err(e) => tracing::warn!("Failed to enqueue job for media {}: {e}", media_id),
+            let enqueued = match db::searchable::enqueue_jobs(&pool, &media_ids, job_kind, &params, Some(config.id)).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("Failed to enqueue {job_kind} jobs for model {}: {e}", action.model_name);
+                    0
                 }
-            }
+            };
 
             if skipped > 0 {
                 tracing::info!(

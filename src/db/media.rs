@@ -270,11 +270,17 @@ pub async fn delete_by_path(
     .await?;
 
     if let Some(id) = media_id {
-        sqlx::query("DELETE FROM searchable_tags_fts WHERE media_file_id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM searchable_text_fts WHERE media_file_id = ?1")
+        // FTS rowids mirror searchable_tags.rowid / media_files.id; delete
+        // through the docid index instead of scanning the UNINDEXED columns.
+        sqlx::query(
+            "DELETE FROM searchable_tags_fts WHERE rowid IN (
+                 SELECT rowid FROM searchable_tags WHERE media_file_id = ?1
+             )"
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM searchable_text_fts WHERE rowid = ?1")
             .bind(id)
             .execute(&mut *tx)
             .await?;
@@ -495,12 +501,14 @@ pub async fn delete_missing(pool: &SqlitePool) -> anyhow::Result<(u64, u64)> {
     const MISSING_MEDIA: &str =
         "SELECT id FROM media_files WHERE is_present = 0 OR folder_id IN (SELECT id FROM folders WHERE is_present = 0)";
     sqlx::query(&format!(
-        "DELETE FROM searchable_tags_fts WHERE media_file_id IN ({MISSING_MEDIA})"
+        "DELETE FROM searchable_tags_fts WHERE rowid IN (
+             SELECT rowid FROM searchable_tags WHERE media_file_id IN ({MISSING_MEDIA})
+         )"
     ))
     .execute(&mut *tx)
     .await?;
     sqlx::query(&format!(
-        "DELETE FROM searchable_text_fts WHERE media_file_id IN ({MISSING_MEDIA})"
+        "DELETE FROM searchable_text_fts WHERE rowid IN ({MISSING_MEDIA})"
     ))
     .execute(&mut *tx)
     .await?;
