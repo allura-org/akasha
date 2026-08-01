@@ -213,6 +213,7 @@ Migrations live in `migrations/` and are embedded at compile time.
 - Missing files: rows with `is_present = 0` are preserved in `media_files` so metadata (hashes, Searchable values, embeddings, etc.) survives temporary unavailability. Any bulk operation or background job that touches media rows must skip `is_present = 0` records (the thumbnail queue, viewer, and `claim_pending_jobs` already do this). A thumbnail that fails with ENOENT also marks the row missing, which covers files deleted while the app was closed.
 - Missing folders: the same preservation philosophy applies to `folders` (`is_present = 0`). The scanner reconciles every folder row in the scanned subtree against disk at the end of a scan (vanished → folder + its media marked missing; reappeared → restored and flagged for rescan), and the watcher marks removed directory paths missing via `db::folder::mark_missing_by_path`. Missing folders are hidden from the tree at display time (`poll_folders_events`); "Clear missing records" purges them (cascade-deleting their subfolders and media, with explicit FTS cleanup) along with missing media.
 - Excluded folders: import `exclude`/`include` filters are enforced at display time only — `poll_folders_events` hides rejected folders from the tree and `poll_media_events` hides their media from the grid/search — without deleting DB rows, so removing a filter later restores everything (tags, metadata) as-is. Failed thumbnails are tracked in `BrowserPanel::failed_thumbnails` and not retried until the next media refresh.
+- Display-time dedup: the toolbar "Dedup" toggle (`ui.dedupe_by_hash`, default off) collapses grid/search tiles sharing a `blake3_hash` to the lowest-id representative via `HashDeduper` in `db/media.rs`, applied during summary streaming in `list_summaries_by_folder*`/`search_summaries` (never in SQL — see the 3.46 planner trap; never cross-library — grouping is scoped to the current view's result set; search filters to the result set *before* deduping so a lower-id duplicate outside the results can't suppress one inside). Rows are never merged. The properties panel shows an "Also at" alias list from an on-demand `idx_media_hash` lookup. Bulk operations (AI enqueue target resolution) always pass `dedupe = false` — they act on rows, not tiles.
 - The bare-minimum Searchable is `filename` (kind `text`), seeded by migration `008_seed_filename_searchable.sql`.
 
 ---
@@ -228,6 +229,7 @@ Cache path: `~/.cache/akasha/`
 [ui]
 theme = "dark"
 show_advanced_media_properties = false
+dedupe_by_hash = false    # Toolbar "Dedup" toggle: one tile per unique blake3_hash
 
 [thumbnails]
 thumbnail_size = 512

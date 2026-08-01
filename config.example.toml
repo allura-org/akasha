@@ -38,6 +38,11 @@ scroll_speed = 1.0
 viewer_default_scale_mode = "smallest"
 sort_key = "filename"
 sort_order = "ascending"
+dedupe_by_hash = false
+# Collapse tiles sharing identical content (blake3 hash) to one tile per unique
+# content, in the grid and in search results. Presentation only — database rows
+# are never merged, and grouping applies within the current view only. Toggle
+# per session from the toolbar ("Dedup" button); this is the persisted default.
 
 [remote]
 # Default HTTP endpoints for remote models. Per-model overrides are supported via
