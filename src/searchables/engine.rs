@@ -24,6 +24,8 @@ impl SearchEngine {
     }
 
     /// Execute a search query within the requested folder scope.
+    /// `dedupe` collapses results sharing a content hash to one tile
+    /// (see `media::HashDeduper`).
     ///
     /// Returns an empty vector if the query has no text or no enabled Searchables.
     pub async fn execute(
@@ -32,6 +34,7 @@ impl SearchEngine {
         folder_id: i64,
         recursive: bool,
         query: &SearchQuery,
+        dedupe: bool,
     ) -> Result<Vec<SearchHit>> {
         if query.is_empty() {
             return Ok(Vec::new());
@@ -74,7 +77,7 @@ impl SearchEngine {
         // Hydrate matching IDs into MediaSummary rows, still scoped to the folder.
         let t = std::time::Instant::now();
         let ids: Vec<i64> = scores.keys().copied().collect();
-        let summaries = media::search_summaries(pool, folder_id, recursive, &ids).await?;
+        let summaries = media::search_summaries(pool, folder_id, recursive, &ids, dedupe).await?;
         tracing::info!(
             ids = ids.len(),
             hydrated = summaries.len(),
@@ -142,7 +145,7 @@ mod tests {
             text: "bar".into(),
             enabled_searchables: vec!["filename".into()],
         };
-        let hits = engine.execute(&pool, fid, false, &query).await.unwrap();
+        let hits = engine.execute(&pool, fid, false, &query, false).await.unwrap();
 
         assert_eq!(hits.len(), 1);
         assert!(hits[0].media_summary.relative_path.contains("bar"));
@@ -218,7 +221,7 @@ mod tests {
             text: "x".into(),
             enabled_searchables: vec!["alpha".into(), "beta".into()],
         };
-        let hits = engine.execute(&pool, fid, false, &query).await.unwrap();
+        let hits = engine.execute(&pool, fid, false, &query, false).await.unwrap();
 
         assert_eq!(hits.len(), 2);
         assert!(hits[0].score >= hits[1].score);
@@ -266,7 +269,7 @@ mod tests {
             text: "cat".into(),
             enabled_searchables: vec!["tags".into(), "descriptions".into()],
         };
-        let hits = engine.execute(&pool, fid, false, &query).await.unwrap();
+        let hits = engine.execute(&pool, fid, false, &query, false).await.unwrap();
 
         let by_id: std::collections::HashMap<i64, f32> = hits
             .into_iter()

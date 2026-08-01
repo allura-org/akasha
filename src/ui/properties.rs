@@ -125,6 +125,18 @@ fn show_general(ui: &mut egui::Ui, data: &PropertiesData, advanced: bool) {
     ui.label(format!("Present: {}", if m.is_present { "yes" } else { "no" }));
     ui.label(format!("Hash: {}", m.blake3_hash));
 
+    if !data.also_at.is_empty() {
+        ui.separator();
+        ui.label(format!("Also at ({} other {}):", data.also_at.len(), if data.also_at.len() == 1 { "copy" } else { "copies" }));
+        for (_id, path) in &data.also_at {
+            ui.add(
+                egui::TextEdit::singleline(&mut path.clone())
+                    .desired_width(f32::INFINITY)
+                    .interactive(false),
+            );
+        }
+    }
+
     if advanced {
         ui.separator();
         ui.heading("Advanced");

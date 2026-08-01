@@ -35,6 +35,7 @@ pub struct BrowserActions {
     pub open_properties: Option<i64>,
     pub sort_key_changed: Option<SortKey>,
     pub sort_order_changed: Option<SortOrder>,
+    pub dedupe_toggled: bool,
     pub search_changed: Option<SearchQuery>,
     pub clear_missing_requested: bool,
 }
@@ -68,6 +69,8 @@ pub struct BrowserPanel {
     pub folder_filter: String,
     pub sort_key: SortKey,
     pub sort_order: SortOrder,
+    /// Display-time dedup: one tile per unique content hash.
+    pub dedupe_by_hash: bool,
     pub search_query: String,
     pub search_active: bool,
     pub search_available_names: Vec<String>,
@@ -133,6 +136,7 @@ impl BrowserPanel {
             folder_filter: String::new(),
             sort_key,
             sort_order,
+            dedupe_by_hash: false,
             search_query: String::new(),
             search_active: false,
             search_available_names: Vec::new(),
@@ -283,6 +287,7 @@ impl BrowserPanel {
             open_properties: None,
             sort_key_changed: None,
             sort_order_changed: None,
+            dedupe_toggled: false,
             search_changed: None,
             clear_missing_requested: false,
         };
@@ -374,6 +379,16 @@ impl BrowserPanel {
                         if ui.button(self.sort_order.label()).clicked() {
                             self.sort_order = self.sort_order.toggle();
                             actions.sort_order_changed = Some(self.sort_order);
+                        }
+
+                        // Display-time dedup: one tile per unique content hash.
+                        if ui
+                            .selectable_label(self.dedupe_by_hash, "Dedup")
+                            .on_hover_text("Collapse tiles sharing identical content (blake3 hash) to one tile.\nPresentation only — database rows are never merged.")
+                            .clicked()
+                        {
+                            self.dedupe_by_hash = !self.dedupe_by_hash;
+                            actions.dedupe_toggled = true;
                         }
 
                         ui.label(&self.scan_status);

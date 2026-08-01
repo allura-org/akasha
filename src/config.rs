@@ -107,6 +107,10 @@ pub struct UiConfig {
     pub show_advanced_media_properties: bool,
     #[serde(default)]
     pub show_fps_counter: bool,
+    /// Collapse grid/search tiles sharing a blake3_hash to one tile per
+    /// unique content (presentation only; rows are never merged).
+    #[serde(default)]
+    pub dedupe_by_hash: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +428,7 @@ impl Default for UiConfig {
             sort_order: SortOrder::Ascending,
             show_advanced_media_properties: false,
             show_fps_counter: false,
+            dedupe_by_hash: false,
         }
     }
 }

@@ -29,6 +29,8 @@ pub struct PropertiesData {
     pub descriptions: HashMap<String, String>,
     pub classifications: HashMap<String, Vec<String>>,
     pub embeddings: Vec<String>,
+    /// Other media rows sharing this file's content hash (`id`, `absolute_path`).
+    pub also_at: Vec<(i64, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,54 @@ pub struct MediaSummary {
     pub missing_since: Option<chrono::NaiveDateTime>,
     /// Populated when this summary is the result of a search query.
     pub search_score: Option<f32>,
+}
+
+/// Streaming display-time dedup by content hash. Presentation-only: rows
+/// are never merged in the database, and grouping applies only within the
+/// current view's result set, never cross-library.
+///
+/// Keep-first-seen over an id-ordered stream yields the lowest-id
+/// representative per hash. v1 deliberately has no symlink preference —
+/// tracking "came via symlink" at hydration time isn't cheap, and the
+/// brief accepts lowest-id alone.
+///
+/// Keys are the first 64 bits of the blake3 hex (already a cryptographic
+/// hash, so the truncation is uniform; collisions across ~10^6 items are
+/// negligible), avoiding a String clone per row.
+pub struct HashDeduper {
+    seen: std::collections::HashSet<u64>,
+}
+
+impl HashDeduper {
+    pub fn new() -> Self {
+        Self { seen: std::collections::HashSet::new() }
+    }
+
+    /// True if this is the first row seen with its content hash.
+    pub fn keep(&mut self, blake3_hash: &str) -> bool {
+        self.seen.insert(hash_key(blake3_hash))
+    }
+}
+
+impl Default for HashDeduper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn hash_key(blake3_hash: &str) -> u64 {
+    blake3_hash
+        .get(..16)
+        .and_then(|prefix| u64::from_str_radix(prefix, 16).ok())
+        .unwrap_or_else(|| {
+            // Not a hex blake3 string (tests, legacy rows): fold the whole
+            // string instead.
+            let mut h = 0xcbf29ce484222325u64;
+            for b in blake3_hash.as_bytes() {
+                h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+            }
+            h
+        })
 }
 
 pub async fn count_by_folder(pool: &SqlitePool, folder_id: i64) -> anyhow::Result<i64> {
@@ -76,8 +126,10 @@ pub async fn count_by_folder_recursive(pool: &SqlitePool, folder_id: i64) -> any
 pub async fn list_summaries_by_folder(
     pool: &SqlitePool,
     folder_id: i64,
+    dedupe: bool,
 ) -> anyhow::Result<Vec<MediaSummary>> {
     let mut summaries = Vec::new();
+    let mut deduper = dedupe.then(HashDeduper::new);
     // INDEXED BY: forces the idx_media_summary covering-index scan. The
     // planner otherwise probes the fat media_files rows (tags_json makes
     // them several KB each) per row — at collection scale that is the
@@ -92,7 +144,13 @@ pub async fn list_summaries_by_folder(
     .fetch(pool);
 
     while let Some(row) = stream.try_next().await? {
-        summaries.push(into_summary(row));
+        let summary = into_summary(row);
+        if let Some(d) = deduper.as_mut() {
+            if !d.keep(&summary.blake3_hash) {
+                continue;
+            }
+        }
+        summaries.push(summary);
     }
 
     Ok(summaries)
@@ -101,8 +159,10 @@ pub async fn list_summaries_by_folder(
 pub async fn list_summaries_by_folder_recursive(
     pool: &SqlitePool,
     folder_id: i64,
+    dedupe: bool,
 ) -> anyhow::Result<Vec<MediaSummary>> {
     let mut summaries = Vec::new();
+    let mut deduper = dedupe.then(HashDeduper::new);
     // See the INDEXED BY note on list_summaries_by_folder.
     let mut stream = sqlx::query_as::<_, MediaSummaryRow>(
         "WITH RECURSIVE subtree(id) AS (
@@ -119,18 +179,27 @@ pub async fn list_summaries_by_folder_recursive(
     .fetch(pool);
 
     while let Some(row) = stream.try_next().await? {
-        summaries.push(into_summary(row));
+        let summary = into_summary(row);
+        if let Some(d) = deduper.as_mut() {
+            if !d.keep(&summary.blake3_hash) {
+                continue;
+            }
+        }
+        summaries.push(summary);
     }
 
     Ok(summaries)
 }
 
 /// Load `MediaSummary` rows for a set of media file IDs, scoped to a folder.
+/// `dedupe` collapses rows sharing a content hash to their lowest-id
+/// representative (see HashDeduper); grouping is scoped to this result set.
 pub async fn search_summaries(
     pool: &SqlitePool,
     folder_id: i64,
     recursive: bool,
     ids: &[i64],
+    dedupe: bool,
 ) -> anyhow::Result<Vec<MediaSummary>> {
     // sqlx's bundled SQLite (3.46) plans the recursive id-filter join as a
     // subtree_folders × ids nested loop of index probes — billions of probes
@@ -143,8 +212,14 @@ pub async fn search_summaries(
         let t_start = std::time::Instant::now();
         tracing::info!(ids = ids.len(), "search_summaries: subtree scan + rust filter");
         let id_set: std::collections::HashSet<i64> = ids.iter().copied().collect();
-        let mut summaries = list_summaries_by_folder_recursive(pool, folder_id).await?;
+        // Order matters: filter to the result set first, then dedupe, so a
+        // lower-id duplicate outside the results can't suppress one inside.
+        let mut summaries = list_summaries_by_folder_recursive(pool, folder_id, false).await?;
         summaries.retain(|s| id_set.contains(&s.id));
+        if dedupe {
+            let mut d = HashDeduper::new();
+            summaries.retain(|s| d.keep(&s.blake3_hash));
+        }
         tracing::info!(
             rows = summaries.len(),
             elapsed_ms = t_start.elapsed().as_millis(),
@@ -154,6 +229,7 @@ pub async fn search_summaries(
     }
 
     let mut summaries = Vec::new();
+    let mut deduper = dedupe.then(HashDeduper::new);
     let ids_json = serde_json::to_string(ids)?;
     let t_start = std::time::Instant::now();
     tracing::info!(ids = ids.len(), "search_summaries: start");
@@ -189,7 +265,13 @@ pub async fn search_summaries(
         .fetch(pool);
 
     while let Some(row) = stream.try_next().await? {
-        summaries.push(into_summary(row));
+        let summary = into_summary(row);
+        if let Some(d) = deduper.as_mut() {
+            if !d.keep(&summary.blake3_hash) {
+                continue;
+            }
+        }
+        summaries.push(summary);
     }
 
     tracing::info!(
@@ -258,6 +340,18 @@ pub async fn get_properties_data(
     let classifications: HashMap<String, Vec<String>> = HashMap::new();
     let embeddings: Vec<String> = Vec::new();
 
+    // Other rows sharing the same content (display-time dedup context).
+    // Indexed lookup via idx_media_hash; only runs when the panel opens.
+    let also_at: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, absolute_path FROM media_files
+         WHERE blake3_hash = ?1 AND is_present = 1 AND id != ?2
+         ORDER BY id"
+    )
+    .bind(&media.blake3_hash)
+    .bind(media_file_id)
+    .fetch_all(pool)
+    .await?;
+
     Ok(PropertiesData {
         media,
         folder_path,
@@ -265,6 +359,7 @@ pub async fn get_properties_data(
         descriptions,
         classifications,
         embeddings,
+        also_at,
     })
 }
 
@@ -807,6 +902,58 @@ mod tests {
         assert!(all[0].missing_since.is_none());
     }
 
+    #[test]
+    fn hash_deduper_keeps_first_seen_per_hash() {
+        let mut d = HashDeduper::new();
+        // Distinct hashes all pass on first sight.
+        assert!(d.keep("aaaabbbbccccdddd0000111122223333444455556666777788889999aaaabbbbccccdddd"));
+        assert!(d.keep("bbbbccccdddd0000111122223333444455556666777788889999aaaabbbbccccddddaaaa"));
+        // Duplicates are dropped, repeatedly.
+        assert!(!d.keep("aaaabbbbccccdddd0000111122223333444455556666777788889999aaaabbbbccccdddd"));
+        assert!(!d.keep("aaaabbbbccccdddd0000111122223333444455556666777788889999aaaabbbbccccdddd"));
+        // Hashes sharing only a 64-bit-prefix-safe suffix still dedupe on the full prefix.
+        assert!(!d.keep("aaaabbbbccccdddd9999888877776666555544443333222211110000ffffeeeeddddcccc"));
+    }
+
+    #[test]
+    fn hash_deduper_handles_non_hex_and_short_hashes() {
+        let mut d = HashDeduper::new();
+        assert!(d.keep("hash1")); // legacy non-hex value from tests/imports
+        assert!(!d.keep("hash1"));
+        assert!(d.keep("hash2"));
+        assert!(d.keep("")); // empty hashes group together
+        assert!(!d.keep(""));
+    }
+
+    #[tokio::test]
+    async fn search_summaries_dedupes_within_result_set() {
+        let pool = setup_pool().await;
+        let fid = folder::insert(&pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+        // Two rows with identical content, one with different content.
+        let dup1 = upsert(&pool, fid, "a.jpg", "/tmp/root/a.jpg", "samehash", None, None, None, None, None)
+            .await
+            .unwrap();
+        let dup2 = upsert(&pool, fid, "b.jpg", "/tmp/root/b.jpg", "samehash", None, None, None, None, None)
+            .await
+            .unwrap();
+        let other = upsert(&pool, fid, "c.jpg", "/tmp/root/c.jpg", "otherhash", None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let ids = vec![dup1, dup2, other];
+        let plain = search_summaries(&pool, fid, false, &ids, false).await.unwrap();
+        assert_eq!(plain.len(), 3);
+
+        let grouped = search_summaries(&pool, fid, false, &ids, true).await.unwrap();
+        assert_eq!(grouped.len(), 2);
+        // Lowest-id representative wins.
+        assert!(grouped.iter().any(|s| s.id == dup1));
+        assert!(!grouped.iter().any(|s| s.id == dup2));
+        assert!(grouped.iter().any(|s| s.id == other));
+    }
+
     #[tokio::test]
     async fn delete_missing_purges_missing_folders_and_their_media() {
         let pool = setup_pool().await;
@@ -986,11 +1133,25 @@ mod live_hydration_bench {
         }
 
         let t = std::time::Instant::now();
-        let summaries = super::search_summaries(&pool, 2, true, &ids).await.unwrap();
+        let summaries = super::search_summaries(&pool, 2, true, &ids, false).await.unwrap();
         println!(
             "search_summaries: {} rows in {:.2}s",
             summaries.len(),
             t.elapsed().as_secs_f64()
         );
+
+        // Display-time dedup smoke: grouped view must be no larger, contain
+        // only unique content hashes, and stay non-empty.
+        let t = std::time::Instant::now();
+        let deduped = super::search_summaries(&pool, 2, true, &ids, true).await.unwrap();
+        println!(
+            "search_summaries (deduped): {} rows in {:.2}s",
+            deduped.len(),
+            t.elapsed().as_secs_f64()
+        );
+        assert!(deduped.len() <= summaries.len());
+        assert!(!deduped.is_empty());
+        let mut d = super::HashDeduper::new();
+        assert!(deduped.iter().all(|s| d.keep(&s.blake3_hash)));
     }
 }

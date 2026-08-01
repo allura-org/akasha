@@ -115,10 +115,11 @@ async fn resolve_media_processing_target(
     match target {
         MediaProcessingTarget::Single(id) => Ok(vec![*id]),
         MediaProcessingTarget::Folder(folder_id, recursive) => {
+            // Bulk operations act on rows, not tiles — never dedupe here.
             let summaries = if *recursive {
-                db::media::list_summaries_by_folder_recursive(pool, *folder_id).await?
+                db::media::list_summaries_by_folder_recursive(pool, *folder_id, false).await?
             } else {
-                db::media::list_summaries_by_folder(pool, *folder_id).await?
+                db::media::list_summaries_by_folder(pool, *folder_id, false).await?
             };
             Ok(summaries
                 .into_iter()
@@ -351,6 +352,7 @@ impl AkashaApp {
             fps_accum_frames: 0,
             fps_current: 0.0,
         };
+        app.browser.dedupe_by_hash = app.config.ui.dedupe_by_hash;
 
         for (message, level) in startup_toasts {
             app.push_toast(message, level);
@@ -549,6 +551,7 @@ impl AkashaApp {
         let folders_tx = self.folders_tx.clone();
         let epoch = self.browser.media_epoch;
         let selected_folder_id = self.browser.selected_folder_id;
+        let dedupe = self.config.ui.dedupe_by_hash;
 
         self.rt.spawn(async move {
             let mut upserted = 0usize;
@@ -631,7 +634,7 @@ impl AkashaApp {
                 // If the currently selected folder was affected, refresh its media list.
                 if let Some(selected) = selected_folder_id {
                     if affected_folder_ids.contains(&selected) {
-                        let result = db::media::list_summaries_by_folder_recursive(&pool, selected).await;
+                        let result = db::media::list_summaries_by_folder_recursive(&pool, selected, dedupe).await;
                         let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));
                     }
                 }
@@ -652,6 +655,7 @@ impl AkashaApp {
         let pool = Arc::clone(&self.pool);
         let tx = self.media_tx.clone();
         let engine = self.search_engine.clone();
+        let dedupe = self.config.ui.dedupe_by_hash;
 
         self.browser.clear_for_refresh(true);
         self.media_refresh_in_flight = true;
@@ -659,7 +663,7 @@ impl AkashaApp {
 
         self.rt.spawn(async move {
             let result = engine
-                .execute(&pool, folder_id, true, &query)
+                .execute(&pool, folder_id, true, &query, dedupe)
                 .await;
             let summaries: Result<Vec<db::media::MediaSummary>, String> = result.map(|hits| {
                 hits.into_iter()
@@ -693,8 +697,9 @@ impl AkashaApp {
 
         self.media_refresh_in_flight = true;
         let epoch = self.browser.media_epoch;
+        let dedupe = self.config.ui.dedupe_by_hash;
         self.rt.spawn(async move {
-            let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await;
+            let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id, dedupe).await;
             let _ = tx.send((epoch, false, result.map_err(|e| e.to_string())));
         });
     }
@@ -1027,6 +1032,7 @@ impl AkashaApp {
         let media_tx = self.media_tx.clone();
         let epoch = self.browser.media_epoch;
         let selected_folder_id = self.browser.selected_folder_id;
+        let dedupe = self.config.ui.dedupe_by_hash;
 
         self.rt.spawn(async move {
             let config = match db::searchable::get_config_by_name_kind(&pool, &action.source_name, &action.output_kind).await {
@@ -1092,7 +1098,7 @@ impl AkashaApp {
 
             // Refresh the current folder view so any status changes are visible.
             if let Some(folder_id) = selected_folder_id {
-                let _ = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await
+                let _ = db::media::list_summaries_by_folder_recursive(&pool, folder_id, dedupe).await
                     .map(|result| media_tx.send((epoch, false, Ok(result))));
             }
         });
@@ -1375,12 +1381,13 @@ impl eframe::App for AkashaApp {
             let media_tx = self.media_tx.clone();
             let epoch = self.browser.media_epoch;
             let selected_folder_id = self.browser.selected_folder_id;
+            let dedupe = self.config.ui.dedupe_by_hash;
             self.rt.spawn(async move {
                 match db::media::delete_missing(&pool).await {
                     Ok((media, folders)) => {
                         tracing::info!("Cleared {} missing media records and {} missing folders", media, folders);
                         if let Some(folder_id) = selected_folder_id {
-                            let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id).await;
+                            let result = db::media::list_summaries_by_folder_recursive(&pool, folder_id, dedupe).await;
                             let _ = media_tx.send((epoch, false, result.map_err(|e| e.to_string())));
                         }
                     }
@@ -1414,6 +1421,22 @@ impl eframe::App for AkashaApp {
             self.config.ui.sort_order = order;
             if let Err(e) = self.config.save() {
                 self.push_toast(format!("Failed to save config: {e}"), ToastLevel::Error);
+            }
+        }
+        if actions.dedupe_toggled {
+            self.config.ui.dedupe_by_hash = self.browser.dedupe_by_hash;
+            if let Err(e) = self.config.save() {
+                self.push_toast(format!("Failed to save config: {e}"), ToastLevel::Error);
+            }
+            // Reload the current view with the new grouping.
+            if self.browser.search_active {
+                let query = SearchQuery {
+                    text: self.browser.search_query.clone(),
+                    enabled_searchables: self.browser.search_enabled_names.iter().cloned().collect(),
+                };
+                self.refresh_search_async(query);
+            } else {
+                self.refresh_media_async(true);
             }
         }
 
