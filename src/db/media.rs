@@ -451,10 +451,28 @@ pub async fn upsert(
     Ok(id)
 }
 
-/// Mark every file in `folder_id` that is not in `existing_paths` as missing.
-/// Existing metadata is preserved so it can be restored if the file reappears.
+/// Reconcile a folder's media rows against the paths seen during a scan:
+/// rows not seen are marked missing (metadata preserved, so they can be
+/// restored if the file reappears), and rows that were previously marked
+/// missing but are present on disk again are restored.
+/// The restore matters for unchanged files — the scanner's mtime/size fast
+/// path skips their upsert, so without this they would stay missing forever
+/// (e.g. a symlink whose dedupe scope changed between scans).
 pub async fn mark_missing(pool: &SqlitePool, folder_id: i64, existing_paths: &[String]) -> anyhow::Result<u64> {
     let paths_json = serde_json::to_string(existing_paths)?;
+
+    sqlx::query(
+        "UPDATE media_files
+         SET is_present = 1, missing_since = NULL
+         WHERE folder_id = ?1
+           AND is_present = 0
+           AND relative_path IN (SELECT value FROM json_each(?2))"
+    )
+    .bind(folder_id)
+    .bind(&paths_json)
+    .execute(pool)
+    .await?;
+
     let result = sqlx::query(
         "UPDATE media_files
          SET is_present = 0, missing_since = CURRENT_TIMESTAMP
@@ -760,6 +778,33 @@ mod tests {
         let all = list_by_folder(&pool, fid).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].relative_path, "present.jpg");
+    }
+
+    #[tokio::test]
+    async fn mark_missing_reconciles_and_restores_seen_rows() {
+        let pool = setup_pool().await;
+        let fid = folder::insert(&pool, None, "/tmp/root", true, false, &[], &[], None, None, "disable")
+            .await
+            .unwrap();
+        upsert(
+            &pool, fid, "link.jpg", "/tmp/root/link.jpg", "hash1",
+            None, None, None, None, None,
+        )
+        .await
+        .unwrap();
+
+        // Not seen in a scan: marked missing.
+        let marked = mark_missing(&pool, fid, &[]).await.unwrap();
+        assert_eq!(marked, 1);
+        let all = list_by_folder(&pool, fid).await.unwrap();
+        assert!(!all[0].is_present);
+
+        // Seen again in a later scan: restored to present without an upsert.
+        let marked = mark_missing(&pool, fid, &["link.jpg".to_string()]).await.unwrap();
+        assert_eq!(marked, 0, "nothing left to mark missing");
+        let all = list_by_folder(&pool, fid).await.unwrap();
+        assert!(all[0].is_present);
+        assert!(all[0].missing_since.is_none());
     }
 
     #[tokio::test]
