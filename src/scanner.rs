@@ -67,6 +67,22 @@ pub(crate) fn is_included(path: &Path, patterns: &[String]) -> bool {
     false
 }
 
+/// If `path` is a symlink whose canonical target lies inside one of the
+/// scope roots, return the canonical target (the caller should skip the
+/// link). Returns `None` for non-symlinks, out-of-scope targets, and broken
+/// links (which the normal file checks skip anyway).
+pub fn symlink_in_scope(path: &Path, roots: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    if roots.is_empty() || !path.symlink_metadata().ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).ok()?;
+    target_in_scope(&target, roots).then_some(target)
+}
+
+fn target_in_scope(target: &Path, roots: &[std::path::PathBuf]) -> bool {
+    roots.iter().any(|root| target.starts_with(root))
+}
+
 pub async fn scan_folder(
     pool: &sqlx::SqlitePool,
     root_folder_id: i64,
@@ -74,6 +90,7 @@ pub async fn scan_folder(
     recursive: bool,
     exclude: &[String],
     include: &[String],
+    symlink_roots: &[std::path::PathBuf],
     progress_tx: Option<&std::sync::mpsc::Sender<crate::app::ScanEvent>>,
 ) -> anyhow::Result<usize> {
     info!(
@@ -163,6 +180,25 @@ pub async fn scan_folder(
         };
 
         let path = entry.path();
+
+        // Symlink dedupe: a link whose canonical target lies inside one of
+        // the scope roots is skipped — the target owns the single media row.
+        // The link is deliberately not recorded as seen, so the
+        // reconciliation below marks any previously indexed row for it as
+        // missing. Out-of-scope and broken links fall through to the normal
+        // file handling. Placed before the is_dir branch: Path::is_dir
+        // follows links, which would otherwise register symlinked
+        // directories as real folders.
+        if !symlink_roots.is_empty() && entry.file_type().is_symlink() {
+            if let Some(target) = symlink_in_scope(path, symlink_roots) {
+                debug!(
+                    "Skipping symlink {} -> {}",
+                    path.display(),
+                    target.display()
+                );
+                continue;
+            }
+        }
 
         // Pop directories we've left
         while let Some((top_path, _)) = dir_stack.last() {
@@ -551,5 +587,50 @@ mod tests {
             is_excluded(path, &exclude) || !is_included(path, &include),
             "exclude should win over include"
         );
+    }
+
+    #[test]
+    fn target_in_scope_matches_prefix_roots() {
+        let roots = vec![std::path::PathBuf::from("/import/a")];
+        assert!(target_in_scope(Path::new("/import/a/x.jpg"), &roots));
+        assert!(target_in_scope(Path::new("/import/a/sub/x.jpg"), &roots));
+        assert!(!target_in_scope(Path::new("/import/b/x.jpg"), &roots));
+        assert!(!target_in_scope(Path::new("/elsewhere/x.jpg"), &roots));
+        // Prefix must be component-wise, not string-wise.
+        assert!(!target_in_scope(Path::new("/import/abc/x.jpg"), &roots));
+    }
+
+    #[test]
+    fn symlink_in_scope_skips_only_in_scope_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("import");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+
+        let target = root.join("real.jpg");
+        std::fs::write(&target, b"x").unwrap();
+        let link_in = root.join("sub").join("link.jpg");
+        std::os::unix::fs::symlink(&target, &link_in).unwrap();
+
+        let outside = tmp.path().join("outside.jpg");
+        std::fs::write(&outside, b"x").unwrap();
+        let link_out = root.join("sub").join("outside_link.jpg");
+        std::os::unix::fs::symlink(&outside, &link_out).unwrap();
+
+        let roots = vec![root.clone()];
+
+        // In-scope link resolves and is skipped.
+        assert_eq!(
+            symlink_in_scope(&link_in, &roots).as_deref(),
+            Some(target.as_path())
+        );
+        // Out-of-scope link, the target itself, and a plain file are kept.
+        assert!(symlink_in_scope(&link_out, &roots).is_none());
+        assert!(symlink_in_scope(&target, &roots).is_none());
+        // Empty roots disables the feature entirely.
+        assert!(symlink_in_scope(&link_in, &[]).is_none());
+        // Broken links are left to the normal file checks.
+        let broken = root.join("sub").join("broken.jpg");
+        std::os::unix::fs::symlink(root.join("nope.jpg"), &broken).unwrap();
+        assert!(symlink_in_scope(&broken, &roots).is_none());
     }
 }

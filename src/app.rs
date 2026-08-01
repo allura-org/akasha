@@ -245,6 +245,7 @@ impl AkashaApp {
         } else {
             let rt_clone = Arc::clone(&rt_arc);
             let pool_clone = Arc::clone(&pool_arc);
+            let all_imports = imports_config.clone();
             rt_clone.spawn(async move {
                 for import_cfg in &incomplete_imports {
                     let _ = scan_tx.send(ScanEvent::Started(import_cfg.path.clone()));
@@ -272,6 +273,7 @@ impl AkashaApp {
                                 import_cfg.recursive,
                                 &import_cfg.exclude,
                                 &import_cfg.include,
+                                &symlink_scope_roots(import_cfg, &all_imports),
                                 Some(&scan_tx),
                             )
                             .await
@@ -563,6 +565,21 @@ impl AkashaApp {
 
                 match change.kind {
                     WatcherChangeKind::Upsert => {
+                        // Symlink dedupe: a link whose canonical target is in
+                        // scope is skipped — the target owns the media row.
+                        // Hide any previously indexed row for the link path
+                        // (covers a file later replaced by a symlink).
+                        let skipped_link = find_import(&imports_config, &change.absolute_path)
+                            .and_then(|cfg| {
+                                crate::scanner::symlink_in_scope(
+                                    &change.absolute_path,
+                                    &symlink_scope_roots(cfg, &imports_config),
+                                )
+                            });
+                        if skipped_link.is_some() {
+                            let _ = db::media::mark_missing_by_path(&pool, folder_id, &relative_path).await;
+                            continue;
+                        }
                         match crate::scanner::upsert_one(
                             &pool,
                             folder_id,
@@ -1178,6 +1195,7 @@ impl AkashaApp {
                             import_cfg.recursive,
                             &import_cfg.exclude,
                             &import_cfg.include,
+                            &symlink_scope_roots(import_cfg, &imports_config),
                             Some(&scan_tx),
                         )
                         .await
@@ -1211,6 +1229,37 @@ impl AkashaApp {
 /// Given an absolute path from the watcher, find the configured root folder it belongs to,
 /// ensure the parent folder hierarchy exists in the DB, and return the leaf folder ID and
 /// the file's relative path within that leaf folder.
+/// Canonical import roots in scope for symlink dedupe, per the import's
+/// `symlinks` mode. An empty vec disables dedupe (current behavior).
+/// Canonicalization resolves any symlinks in the import path itself; on
+/// failure the raw path is used.
+fn symlink_scope_roots(
+    import: &ImportConfig,
+    all_imports: &[ImportConfig],
+) -> Vec<std::path::PathBuf> {
+    let canonical = |p: &str| {
+        std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p))
+    };
+    match import.symlinks {
+        crate::config::SymlinkMode::False => Vec::new(),
+        crate::config::SymlinkMode::InTree => vec![canonical(&import.path)],
+        crate::config::SymlinkMode::True => {
+            all_imports.iter().map(|i| canonical(&i.path)).collect()
+        }
+    }
+}
+
+/// Find the import whose path is the longest prefix of `absolute_path`.
+fn find_import<'a>(
+    imports: &'a [ImportConfig],
+    absolute_path: &std::path::Path,
+) -> Option<&'a ImportConfig> {
+    imports
+        .iter()
+        .filter(|cfg| absolute_path.starts_with(&cfg.path))
+        .max_by_key(|cfg| cfg.path.len())
+}
+
 async fn resolve_watched_path(
     pool: &sqlx::SqlitePool,
     imports_config: &[ImportConfig],

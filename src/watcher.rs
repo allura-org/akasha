@@ -197,6 +197,7 @@ mod tests {
             flatten: true,
             exclude: Vec::new(),
             include: Vec::new(),
+            symlinks: crate::config::SymlinkMode::default(),
             thumbnails: crate::config::ImportThumbnailsConfig::default(),
         };
 
@@ -252,6 +253,7 @@ mod tests {
             flatten: true,
             exclude: Vec::new(),
             include: Vec::new(),
+            symlinks: crate::config::SymlinkMode::default(),
             thumbnails: crate::config::ImportThumbnailsConfig::default(),
         };
 

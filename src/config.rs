@@ -350,6 +350,27 @@ pub enum ModelKind {
     Remote,
 }
 
+/// How the scanner handles symlinks inside an import.
+///
+/// `False` (default): symlinks are indexed as regular files (reading through
+/// the link), so a link and its target appear as duplicates.
+/// `InTree`: symlinks whose canonical target lies inside the same import root
+/// are skipped — the target owns the single media row.
+/// `True`: like `InTree`, but the target may live inside any configured
+/// import root (cross-import dedupe).
+/// In both dedupe modes, links with targets outside the scope are still
+/// indexed as regular files, so no content silently disappears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SymlinkMode {
+    #[serde(rename = "true")]
+    True,
+    #[default]
+    #[serde(rename = "false")]
+    False,
+    #[serde(rename = "in-tree", alias = "in_tree")]
+    InTree,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImportConfig {
@@ -362,6 +383,8 @@ pub struct ImportConfig {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub include: Vec<String>,
+    #[serde(default)]
+    pub symlinks: SymlinkMode,
     pub thumbnails: ImportThumbnailsConfig,
 }
 
@@ -432,6 +455,7 @@ impl Default for ImportConfig {
             flatten: false,
             exclude: Vec::new(),
             include: Vec::new(),
+            symlinks: SymlinkMode::default(),
             thumbnails: ImportThumbnailsConfig::default(),
         }
     }

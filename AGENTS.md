@@ -120,7 +120,7 @@ src/
   main.rs        — Entry point, tracing setup, config + DB + runtime bootstrap, eframe launch
   app.rs         — `AkashaApp` implements `eframe::App`; main UI orchestrator (~1000 lines). Uses a two-tier media list: `media_summaries` (lightweight, all items) for the grid + thumbnail queue, and `media_items` (paginated full records, reserved for future detail panels).
   config.rs      — TOML config with XDG paths; `UiConfig`, `ThumbnailsConfig`, `DebugConfig`, `ModelsConfig`, `ImportConfig`
-  scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking
+  scanner.rs     — Directory scanning: walkdir traversal, hashing, dimensions, per-subfolder completion tracking, symlink dedupe (`symlink_in_scope`; in-scope links are skipped so the target owns the media row, and stale link rows are reconciled to missing)
   models/        — Backend-agnostic model plugin interface (`Model`, `Backend`, `BackendRegistry`) plus `CandleBackend`, `RemoteBackend`, `OrtBackend`, and `MistralRsBackend` implementations; `loader.rs` resolves local vs. HuggingFace model sources
   searchables/   — Searchables abstraction: trait, registry, engine, built-in `filename`/`tags`/`description` Searchables, background `SearchWorker`
   thumbnailer.rs — Thumbnail generation, resize, WebP encoding, cache path resolution (global/per-folder/custom, sharded 2-level hash prefix). SIMD pipeline via `fast_image_resize` + `libwebp` when `simd-thumbnails` feature is enabled.
@@ -249,6 +249,9 @@ classify_endpoint = "/classify"
 # flatten = false        # Show import as one folder in the folders pane
 # exclude = []
 # include = []
+# symlinks = "false"     # "false" | "in-tree" | "true" — dedupe symlinks whose
+#                        # canonical target is inside this import ("in-tree")
+#                        # or any import ("true"); target owns the media row
 #
 # [imports.thumbnails]
 # cache_mode = "global"  # "global" | "custom" | "disabled"

@@ -66,6 +66,15 @@ include = []
 # Folders or items to include, *ignoring* everything else. Behaves the same as `exclude`, but `exclude` takes precedence (so you can selectively exclude from included folders, but NOT vice-versa.)
 # Useful for e.g. asset libraries, where you have compatible media in some folders but not others, or for when you have a couple folders that you want to import in the same high-level folder.
 
+symlinks = "false"
+# How to handle symlinks during scans and watcher updates.
+# "false": index symlinked files as regular files (link and target both appear in the gallery).
+# "in-tree": skip symlinks whose canonical target lies inside this import root — the target owns the single media row.
+# "true": like "in-tree", but the target may lie inside any configured import root (cross-import dedupe).
+# In both dedupe modes, links pointing outside the scope are still indexed as regular files, so no content disappears.
+# Takes effect on the next scan after enabling; previously indexed link rows are marked missing (tags preserved)
+# and can be purged via DB Management -> "Clear missing records".
+
 [imports.thumbnails]
 cache_mode = "global"
 # How to cache thumbnails for this import.
