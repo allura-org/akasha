@@ -51,13 +51,19 @@ jobs:
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          # The two matrix legs must not share a cache entry: both runners
+          # report os.type()="Linux", so without an explicit key they race to
+          # save the same cache and the restoring leg can get a foreign
+          # feature set's artifacts (intermittent E0463 "can't find crate").
+          key: ${{ matrix.os }}${{ matrix.suffix }}
 
       - name: Build (release)
         run: |
           if [ -n "${{ matrix.feature-flag }}" ]; then
-            cargo build --release --features ${{ matrix.feature-flag }}
+            cargo build --release --locked --features ${{ matrix.feature-flag }}
           else
-            cargo build --release
+            cargo build --release --locked
           fi
 
       - name: Package binary
